@@ -1042,21 +1042,25 @@ fn reconstruct_golden_memory(
             let mut ok = false;
             if let Ok(gh) = import_with_retry(b, 4 + idx) {
                 if b.mem_map(va, size, 0, gh).is_ok() {
-                    // Sharing the golden's frozen base READ-WRITE across clones
-                    // is only correct when the base is never written post-fork.
-                    // Unsloth writes the embedding via a KERNEL (undetectable by
-                    // the COW path, which only catches explicit mem ops), so at
-                    // N>=3 concurrent clones those writes race on the shared
-                    // physical and corrupt every sibling (loss=nan). Copy-mode
-                    // (the DEFAULT, no --share-weights) is correct at all N.
-                    // SMOLVM_CUDA_SHARE_RO=1 maps read-only so a base write
-                    // faults loudly instead of corrupting silently (diagnostic;
-                    // currently SIGSEGVs on base-writing workloads — the proper
-                    // fix is to private-copy only the written ranges).
-                    let set = if std::env::var("SMOLVM_CUDA_SHARE_RO").as_deref() == Ok("1") {
-                        b.mem_set_access_ro(va, size, device)
-                    } else {
+                    // READ-ONLY by default. A shared chunk is one the golden's
+                    // H2Ds wrote and nothing has touched since (verified at fork
+                    // time), so a clone has no business writing it. Mapping it
+                    // read-write means a post-fork base write — unsloth's
+                    // embedding fixup is a KERNEL write, invisible to the COW
+                    // path, which only sees explicit mem ops — silently races
+                    // across every clone sharing that physical (loss=nan).
+                    // Read-only makes that fail-stop instead: the write faults,
+                    // and since each clone worker owns its context the blast
+                    // radius is that one clone, with the shared bytes intact for
+                    // its siblings. A warmed golden never trips it (its writes
+                    // happen pre-fork, so verification already marked those
+                    // chunks private): measured 8/8 clean, 0 faults, same
+                    // 260-shared/160-private split as read-write.
+                    // SMOLVM_CUDA_SHARE_RO=0 restores read-write sharing.
+                    let set = if std::env::var("SMOLVM_CUDA_SHARE_RO").as_deref() == Ok("0") {
                         b.mem_set_access(va, size, device)
+                    } else {
+                        b.mem_set_access_ro(va, size, device)
                     };
                     if set.is_ok() {
                         ok = true;

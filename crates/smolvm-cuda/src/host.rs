@@ -253,6 +253,13 @@ pub trait Backend: Send {
     ) -> CuResult<()> {
         Err(CUDA_ERROR_NOT_FOUND)
     }
+    /// Content hash of the shared-region bytes a [`Self::memcpy_shm_htod`] of
+    /// `(offset, size)` would upload, over payload subrange `[start, end)`.
+    /// Lets Path 3 record a VERIFIABLE crc for a zero-copy upload so the chunk
+    /// stays eligible for fork weight sharing. Default: source unreachable.
+    fn hash_shm_range(&mut self, _offset: u64, _start: u64, _end: u64) -> Option<u64> {
+        None
+    }
     /// Zero-copy D2H: DMA `size` bytes from `dptr` to shared-region `offset`.
     fn memcpy_shm_dtoh(
         &mut self,
@@ -281,6 +288,13 @@ pub trait Backend: Send {
         _stream: u64,
     ) -> CuResult<()> {
         Err(CUDA_ERROR_NOT_FOUND)
+    }
+    /// Content hash of the guest-RAM bytes a [`Self::memcpy_gpa_htod`] of
+    /// `segments` would upload, over payload subrange `[start, end)` (offsets
+    /// relative to the first segment's first byte). Path 3 uses it to record a
+    /// verifiable crc for a zero-copy upload; see [`Self::hash_shm_range`].
+    fn hash_gpa_range(&mut self, _segments: &[(u64, u64)], _start: u64, _end: u64) -> Option<u64> {
+        None
     }
     /// Zero-copy D2H to guest RAM: DMA from `dptr` and scatter into `segments`.
     fn memcpy_gpa_dtoh(
@@ -566,12 +580,25 @@ fn path3_enabled() -> bool {
     std::env::var_os("SMOLVM_CUDA_FORK_WORKERS").is_some()
 }
 
-/// Path 3 density opt-in: a clone worker SHARES the golden's loaded (weight)
-/// VMM ranges read-only (IPC-import without copy) instead of privately copying
-/// them. Off by default (the proven path privately copies every range —
-/// correct + isolated but N copies of the weights).
+/// Path 3 density: a clone worker SHARES the golden's loaded (weight) VMM
+/// ranges (IPC-import without copy) instead of privately copying them — one
+/// weight set in VRAM for the whole fork pool instead of one per clone.
+///
+/// ON by default: density is the point of a fork pool, and sharing is
+/// self-limiting because only chunks that pass share verification are shared
+/// (`verify_chunk_content`) — a chunk whose device bytes no longer match what
+/// the H2Ds uploaded (i.e. something wrote it, like unsloth's embedding fixup
+/// during the golden's warmup step) is privately copied instead. Set
+/// `SMOLVM_CUDA_FORK_SHARE_WEIGHTS=0` to force the all-private behaviour.
+///
+/// NOTE: verification only sees writes that happened BEFORE the fork, so the
+/// golden must exercise its write path (warm up) before forking — otherwise a
+/// post-fork write to a shared chunk races across clones.
 pub fn path3_share_weights_enabled() -> bool {
-    std::env::var_os("SMOLVM_CUDA_FORK_SHARE_WEIGHTS").is_some()
+    !matches!(
+        std::env::var("SMOLVM_CUDA_FORK_SHARE_WEIGHTS").as_deref(),
+        Ok("0") | Ok("false") | Ok("off")
+    )
 }
 
 /// P0 transport-viability instrumentation. Counts every dispatched CUDA RPC so we
@@ -1468,6 +1495,27 @@ fn xlat_event(h: u64) -> u64 {
 /// chunk it overlaps (see `GoldenLayout.maps`). No-op unless Path 3 is
 /// tracking a golden layout.
 fn mark_loaded_vmm(layout: &LayoutCell, dptr: u64, nbytes: u64, data: Option<&[u8]>) {
+    mark_loaded_vmm_with(layout, dptr, nbytes, |s, e| {
+        data.map_or(0, |d| fnv64(&d[s as usize..e as usize]))
+    })
+}
+
+/// [`mark_loaded_vmm`] for sources the dispatch loop cannot slice directly.
+///
+/// `crc_of(start, end)` hashes the payload subrange `[start, end)` — offsets
+/// relative to the H2D's first byte — and returns 0 when the bytes are
+/// unreachable. The zero-copy paths (shared region / guest RAM) never put the
+/// payload on the socket, but the daemon still READS it to run the DMA, so it
+/// can hash it there. Without this, every zero-copy-uploaded chunk records
+/// crc 0, fails share verification, and gets privately copied into each clone —
+/// silently defeating fork weight sharing (and `SMOLVM_CUDA_ZEROCOPY` is on by
+/// default, so that was every weight chunk of every golden).
+fn mark_loaded_vmm_with(
+    layout: &LayoutCell,
+    dptr: u64,
+    nbytes: u64,
+    mut crc_of: impl FnMut(u64, u64) -> u64,
+) {
     let end = dptr.saturating_add(nbytes);
     let mut g = layout.lock().unwrap();
     for (&base, c) in g.maps.iter_mut() {
@@ -1477,10 +1525,8 @@ fn mark_loaded_vmm(layout: &LayoutCell, dptr: u64, nbytes: u64, data: Option<&[u
         }
         // CRC the PER-CHUNK SLICE of the payload: one H2D spans many chunks,
         // and each chunk must record the hash of its own bytes (crc 0 =
-        // unverifiable → never shared; used when bytes aren't dispatch-visible).
-        let crc = data.map_or(0, |d| {
-            fnv64(&d[(abs_s - dptr) as usize..(abs_e - dptr) as usize])
-        });
+        // unverifiable → never shared).
+        let crc = crc_of(abs_s - dptr, abs_e - dptr);
         let (s, e) = (abs_s - base, abs_e - base);
         // An overlapping re-upload invalidates the prior segment's CRC for its
         // surviving bytes, so overlapped segments are dropped whole
@@ -3807,9 +3853,12 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         } => {
             mark_loaded(&sess.alloc_table, dptr);
             if path3_enabled() {
-                // Bytes not dispatch-visible on this path: coverage recorded but
-                // never verifiable, so the chunk can't be shared (crc = 0).
-                mark_loaded_vmm(&sess.golden_layout, dptr, size, None);
+                // The payload never crosses the socket, but it IS readable in
+                // the shared region — hash it there so the chunk stays
+                // shareable (crc 0 would pin every clone to a private copy).
+                mark_loaded_vmm_with(&sess.golden_layout, dptr, size, |s, e| {
+                    b.hash_shm_range(offset, s, e).unwrap_or(0)
+                });
             }
             b.memcpy_shm_htod(dptr, offset, size, raw_stream(sess, stream)?)
                 .map(|_| Response::Ok)
@@ -3830,7 +3879,10 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             mark_loaded(&sess.alloc_table, dptr);
             if path3_enabled() {
                 let n: u64 = segments.iter().map(|&(_, len)| len).sum();
-                mark_loaded_vmm(&sess.golden_layout, dptr, n, None); // see ShmHtoD
+                // Readable through the guest-RAM mapping the DMA itself uses.
+                mark_loaded_vmm_with(&sess.golden_layout, dptr, n, |s, e| {
+                    b.hash_gpa_range(&segments, s, e).unwrap_or(0)
+                });
             }
             b.memcpy_gpa_htod(dptr, &segments, raw_stream(sess, stream)?)
                 .map(|_| Response::Ok)
@@ -4346,6 +4398,93 @@ mod tests {
     use super::*;
     use crate::client::Client;
     use std::io::{Read, Write};
+
+    fn layout_with_chunk(va: u64, size: u64) -> LayoutCell {
+        let mut g = GoldenLayout::default();
+        g.maps.insert(
+            va,
+            ChunkCover {
+                size,
+                ..ChunkCover::default()
+            },
+        );
+        std::sync::Mutex::new(g)
+    }
+
+    /// A weight chunk uploaded with VERIFIABLE bytes tiles exactly and so is a
+    /// share candidate — this is what lets fork clones import one copy of the
+    /// weights instead of each privately copying them.
+    #[test]
+    fn covered_chunk_with_crc_is_share_candidate() {
+        let layout = layout_with_chunk(0x1000, 4096);
+        mark_loaded_vmm_with(&layout, 0x1000, 4096, |s, e| {
+            fnv64(&vec![7u8; (e - s) as usize])
+        });
+        let g = layout.lock().unwrap();
+        assert!(g.maps[&0x1000].covered_exactly());
+    }
+
+    /// REGRESSION (silent fork-density loss): the zero-copy H2D paths
+    /// (shared region / guest RAM) do not put the payload on the socket. They
+    /// used to record coverage with crc 0, and `covered_exactly` rejects ANY
+    /// zero-crc segment — so every weight chunk of every golden failed share
+    /// verification and was privately copied into each clone, making the fork
+    /// pool use MORE VRAM than running N independent processes. The backends
+    /// now hash the source in place, so this only happens when the bytes are
+    /// genuinely unreachable.
+    #[test]
+    fn chunk_without_crc_is_never_shared() {
+        let layout = layout_with_chunk(0x1000, 4096);
+        mark_loaded_vmm_with(&layout, 0x1000, 4096, |_, _| 0);
+        let g = layout.lock().unwrap();
+        assert!(
+            !g.maps[&0x1000].covered_exactly(),
+            "an unverifiable chunk must stay private"
+        );
+    }
+
+    /// Coverage is recorded per overlapped chunk, each hashing only its own
+    /// slice of the payload, so one H2D spanning several chunks leaves every
+    /// chunk independently verifiable.
+    #[test]
+    fn multi_chunk_upload_hashes_each_chunk_slice() {
+        let mut g = GoldenLayout::default();
+        for va in [0x1000u64, 0x2000] {
+            g.maps.insert(
+                va,
+                ChunkCover {
+                    size: 4096,
+                    ..ChunkCover::default()
+                },
+            );
+        }
+        let layout = std::sync::Mutex::new(g);
+        let mut seen = Vec::new();
+        mark_loaded_vmm_with(&layout, 0x1000, 8192, |s, e| {
+            seen.push((s, e));
+            fnv64(&vec![3u8; (e - s) as usize])
+        });
+        seen.sort_unstable();
+        assert_eq!(seen, vec![(0, 4096), (4096, 8192)]);
+        let g = layout.lock().unwrap();
+        assert!(g.maps[&0x1000].covered_exactly() && g.maps[&0x2000].covered_exactly());
+    }
+
+    /// Sharing is the default (density is the point of a fork pool); only an
+    /// explicit off-switch disables it.
+    #[test]
+    fn weight_sharing_defaults_on() {
+        // Not asserting on a set var: the process env is shared across tests.
+        assert!(matches!(
+            std::env::var("SMOLVM_CUDA_FORK_SHARE_WEIGHTS").as_deref(),
+            Err(_) | Ok(_)
+        ));
+        std::env::remove_var("SMOLVM_CUDA_FORK_SHARE_WEIGHTS");
+        assert!(path3_share_weights_enabled());
+        std::env::set_var("SMOLVM_CUDA_FORK_SHARE_WEIGHTS", "0");
+        assert!(!path3_share_weights_enabled());
+        std::env::remove_var("SMOLVM_CUDA_FORK_SHARE_WEIGHTS");
+    }
 
     // Drive the CPU backend through the full encode→dispatch→decode path.
     #[test]

@@ -770,6 +770,21 @@ impl Backend for GpuBackend {
             ))
         }
     }
+    /// Hash in place from the same shared-region mapping the DMA reads, so a
+    /// zero-copy upload still records a verifiable crc (no extra copy, no
+    /// socket traffic) and its chunk stays eligible for fork weight sharing.
+    #[cfg(target_os = "linux")]
+    fn hash_shm_range(&mut self, offset: u64, start: u64, end: u64) -> Option<u64> {
+        if start >= end {
+            return None;
+        }
+        let region = crate::shm::get_or_create()?;
+        let src = region.checked(offset.checked_add(start)?, end - start)?;
+        // SAFETY: `checked` bounds the range inside the mapped shared region,
+        // which stays mapped for the lifetime of the process.
+        let bytes = unsafe { std::slice::from_raw_parts(src as *const u8, (end - start) as usize) };
+        Some(crate::proto::fnv64(bytes))
+    }
     #[cfg(target_os = "linux")]
     fn memcpy_shm_dtoh(&mut self, offset: u64, dptr: u64, size: u64, stream: u64) -> CuResult<()> {
         self.wait_stream(stream)?;
@@ -911,6 +926,36 @@ impl Backend for GpuBackend {
         let mut g = 0usize;
         unsafe { chk(f(&mut g, &prop, flags))? };
         Ok(g as u64)
+    }
+
+    /// Hash the guest-RAM bytes backing payload subrange `[start, end)` of a
+    /// zero-copy H2D, reading through the very mapping the DMA uses. Called
+    /// once per overlapped VMM chunk, so the temporary is chunk-sized (VMM
+    /// granularity), not payload-sized. `None` (→ crc 0 → chunk stays private)
+    /// whenever any part is unreachable, e.g. a clone served via /proc mem.
+    fn hash_gpa_range(&mut self, segments: &[(u64, u64)], start: u64, end: u64) -> Option<u64> {
+        if start >= end || self.guest_ram.is_empty() {
+            return None;
+        }
+        let mut buf = Vec::with_capacity((end - start) as usize);
+        let mut off = 0u64; // payload offset where the current segment begins
+        for &(gpa, len) in segments {
+            let (seg_s, seg_e) = (off, off + len);
+            off = seg_e;
+            let (a, b) = (start.max(seg_s), end.min(seg_e));
+            if a >= b {
+                continue;
+            }
+            let src = self.gpa_to_host(gpa + (a - seg_s), b - a).ok()?;
+            // SAFETY: gpa_to_host validated [gpa, gpa+len) against a mapped
+            // guest-RAM region, so `src` is readable for `b - a` bytes.
+            buf.extend_from_slice(unsafe {
+                std::slice::from_raw_parts(src as *const u8, (b - a) as usize)
+            });
+        }
+        // A short read means the segments did not cover the range: refuse
+        // rather than record a crc over the wrong bytes.
+        (buf.len() as u64 == end - start).then(|| crate::proto::fnv64(&buf))
     }
 
     fn memcpy_gpa_htod(&mut self, dptr: u64, segments: &[(u64, u64)], stream: u64) -> CuResult<()> {
