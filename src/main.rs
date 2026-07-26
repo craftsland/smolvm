@@ -61,6 +61,13 @@ enum Commands {
         fd: i32,
     },
 
+    /// Internal: own an NVIDIA MPS controller until the CUDA daemon exits
+    #[command(name = "_cuda-mps-supervisor", hide = true)]
+    CudaMpsSupervisor {
+        /// Bidirectional lifecycle fd handed over by the CUDA daemon
+        fd: i32,
+    },
+
     /// Internal: clean up an ephemeral VM after its command exits (not for direct use)
     #[command(name = "_cleanup-ephemeral", hide = true)]
     CleanupEphemeral {
@@ -97,7 +104,10 @@ fn main() {
             .nth(1)
             .as_deref()
             .and_then(|s| s.to_str()),
-        Some("_boot-vm") | Some("_cuda-daemon") | Some("_cuda-clone-worker")
+        Some("_boot-vm")
+            | Some("_cuda-daemon")
+            | Some("_cuda-clone-worker")
+            | Some("_cuda-mps-supervisor")
     );
     if !internal {
         if let Some(mode) = smolvm_pack::detect_packed_mode() {
@@ -155,6 +165,15 @@ fn main() {
         Commands::CudaCloneWorker { .. } => Err(smolvm::Error::Io(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "the CUDA clone worker is unix-only",
+        ))),
+        #[cfg(target_os = "linux")]
+        Commands::CudaMpsSupervisor { fd } => {
+            smolvm::cuda_daemon::run_mps_supervisor(fd).map_err(smolvm::Error::Io)
+        }
+        #[cfg(not(target_os = "linux"))]
+        Commands::CudaMpsSupervisor { .. } => Err(smolvm::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "NVIDIA MPS supervision is Linux-only",
         ))),
         Commands::CleanupEphemeral {
             vm_name,

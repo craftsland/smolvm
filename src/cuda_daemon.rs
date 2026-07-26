@@ -30,6 +30,264 @@ pub fn socket_path() -> PathBuf {
     root.join("cuda-daemon.sock")
 }
 
+/// Pure policy helper for the managed MPS default.
+///
+/// Fork-worker pools opt in automatically because that is the configuration in
+/// which separate clone contexts contend for GPU scheduling. An explicit value
+/// always wins, including opt-in for a manually started shared daemon.
+#[cfg(target_os = "linux")]
+fn mps_enabled(mode: Option<&str>, fork_workers: bool) -> bool {
+    match mode.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("0" | "off" | "false" | "no") => false,
+        Some("1" | "on" | "true" | "yes" | "force") => true,
+        Some(_) => fork_workers,
+        None => fork_workers,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn mps_control_binary() -> std::ffi::OsString {
+    std::env::var_os("SMOLVM_CUDA_MPS_CONTROL").unwrap_or_else(|| "nvidia-cuda-mps-control".into())
+}
+
+/// The daemon keeps this channel open for its lifetime. The supervisor owns the
+/// other end and shuts down only the private MPS controller it started when it
+/// observes EOF, including daemon SIGKILL, crash, or `process::exit`.
+#[cfg(target_os = "linux")]
+struct MpsOwnership {
+    _lifecycle: UnixStream,
+}
+
+/// Remove only the controller artifacts that NVIDIA may create inside
+/// smolvm's private, PID-scoped directories. Directory removal is deliberately
+/// non-recursive: an unexpected entry is preserved instead of being deleted.
+#[cfg(target_os = "linux")]
+fn cleanup_private_mps_paths() {
+    if let Some(pipe) = std::env::var_os("CUDA_MPS_PIPE_DIRECTORY") {
+        let pipe = PathBuf::from(pipe);
+        for name in [
+            "control",
+            "control_privileged",
+            "control_lock",
+            "log",
+            "nvidia-cuda-mps-control.pid",
+        ] {
+            let _ = std::fs::remove_file(pipe.join(name));
+        }
+        let _ = std::fs::remove_dir(pipe);
+    }
+
+    if let Some(logs) = std::env::var_os("CUDA_MPS_LOG_DIRECTORY") {
+        let logs = PathBuf::from(logs);
+        for name in ["control.log", "server.log"] {
+            let _ = std::fs::remove_file(logs.join(name));
+        }
+        let _ = std::fs::remove_dir(logs);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn create_private_mps_paths(pipe: &Path, log_root: &Path, logs: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(log_root)?;
+
+    // Refuse a PID-path collision instead of adopting or cleaning an existing
+    // directory. That keeps the ownership guarantee true even after PID reuse.
+    std::fs::create_dir(pipe)?;
+    if let Err(e) = std::fs::create_dir(logs) {
+        let _ = std::fs::remove_dir(pipe);
+        return Err(e);
+    }
+
+    use std::os::unix::fs::PermissionsExt as _;
+    for dir in [pipe, logs] {
+        if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
+            let _ = std::fs::remove_dir(logs);
+            let _ = std::fs::remove_dir(pipe);
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// Start a private, uncapped NVIDIA MPS controller before this process loads
+/// libcuda. Failure is deliberately non-fatal: with no live controller the
+/// NVIDIA driver uses ordinary contexts, which is the existing safe path.
+#[cfg(target_os = "linux")]
+fn start_managed_mps(sock: &Path) -> Option<MpsOwnership> {
+    let fork_workers = std::env::var_os("SMOLVM_CUDA_FORK_WORKERS").is_some();
+    let mode = std::env::var("SMOLVM_CUDA_MPS").ok();
+    if !mps_enabled(mode.as_deref(), fork_workers) {
+        tracing::info!("cuda-daemon: managed NVIDIA MPS disabled");
+        return None;
+    }
+
+    // An explicit pipe directory is externally owned. Use it but never start,
+    // stop, or otherwise mutate that controller.
+    if let Some(pipe) = std::env::var_os("CUDA_MPS_PIPE_DIRECTORY") {
+        tracing::info!(
+            pipe = %PathBuf::from(pipe).display(),
+            "cuda-daemon: using externally managed NVIDIA MPS"
+        );
+        return None;
+    }
+
+    let uid = unsafe { libc::geteuid() };
+    let pid = std::process::id();
+    let pipe_dir = std::env::temp_dir().join(format!("smolvm-mps-{uid}-{pid}"));
+    let log_root = sock
+        .parent()
+        .unwrap_or_else(|| Path::new("/tmp"))
+        .join("cuda-mps-logs");
+    let log_dir = log_root.join(pid.to_string());
+    if let Err(e) = create_private_mps_paths(&pipe_dir, &log_root, &log_dir) {
+        tracing::warn!(
+            pipe = %pipe_dir.display(),
+            logs = %log_dir.display(),
+            error = %e,
+            "cuda-daemon: cannot create private MPS directories; using ordinary contexts"
+        );
+        return None;
+    }
+
+    // This is an internal daemon subcommand at single-threaded startup, before
+    // any CUDA backend or worker thread exists. The variables must be in this
+    // process so every subsequently spawned clone worker inherits the same MPS
+    // endpoint.
+    unsafe {
+        std::env::set_var("CUDA_MPS_PIPE_DIRECTORY", &pipe_dir);
+        std::env::set_var("CUDA_MPS_LOG_DIRECTORY", &log_dir);
+    }
+
+    let (mut daemon_end, supervisor_end) = match UnixStream::pair() {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::warn!(error = %e, "cuda-daemon: MPS lifecycle channel failed");
+            cleanup_private_mps_paths();
+            unsafe {
+                std::env::remove_var("CUDA_MPS_PIPE_DIRECTORY");
+                std::env::remove_var("CUDA_MPS_LOG_DIRECTORY");
+            }
+            return None;
+        }
+    };
+    let _ = daemon_end.set_read_timeout(Some(Duration::from_secs(10)));
+
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::process::CommandExt as _;
+    let supervisor_fd = supervisor_end.as_raw_fd();
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => {
+            tracing::warn!(error = %e, "cuda-daemon: cannot locate MPS supervisor");
+            cleanup_private_mps_paths();
+            unsafe {
+                std::env::remove_var("CUDA_MPS_PIPE_DIRECTORY");
+                std::env::remove_var("CUDA_MPS_LOG_DIRECTORY");
+            }
+            return None;
+        }
+    };
+    let mut cmd = Command::new(exe);
+    cmd.args(["_cuda-mps-supervisor", "3"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        // A separate process group is essential: the daemon's SIGTERM handler
+        // kills its own group (daemon + clone workers). The supervisor must
+        // survive long enough to observe EOF and send `quit` to MPS.
+        .process_group(0);
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::dup2(supervisor_fd, 3) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    if let Err(e) = cmd.spawn() {
+        tracing::warn!(
+            error = %e,
+            "cuda-daemon: cannot spawn MPS supervisor; using ordinary contexts"
+        );
+        cleanup_private_mps_paths();
+        unsafe {
+            std::env::remove_var("CUDA_MPS_PIPE_DIRECTORY");
+            std::env::remove_var("CUDA_MPS_LOG_DIRECTORY");
+        }
+        return None;
+    }
+    drop(supervisor_end);
+
+    use std::io::Read as _;
+    let mut ready = [0u8; 1];
+    if daemon_end.read_exact(&mut ready).is_err() || ready[0] != 1 {
+        tracing::warn!("cuda-daemon: NVIDIA MPS unavailable; falling back to ordinary contexts");
+        drop(daemon_end);
+        unsafe {
+            std::env::remove_var("CUDA_MPS_PIPE_DIRECTORY");
+            std::env::remove_var("CUDA_MPS_LOG_DIRECTORY");
+        }
+        return None;
+    }
+
+    tracing::info!(
+        pipe = %pipe_dir.display(),
+        logs = %log_dir.display(),
+        "cuda-daemon: private uncapped NVIDIA MPS active"
+    );
+    Some(MpsOwnership {
+        _lifecycle: daemon_end,
+    })
+}
+
+/// Hidden supervisor entry point. It starts one controller in the private pipe
+/// directory inherited from the daemon, reports readiness over `fd`, and then
+/// blocks until the daemon closes its channel. It never quits a controller it
+/// did not successfully start.
+#[cfg(target_os = "linux")]
+pub fn run_mps_supervisor(fd: i32) -> io::Result<()> {
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::FromRawFd as _;
+
+    // SAFETY: the daemon handed this process an owned dup of its UnixStream at
+    // exactly `fd`; this function is the sole owner in the exec'd supervisor.
+    let mut lifecycle = unsafe { UnixStream::from_raw_fd(fd) };
+    let started = Command::new(mps_control_binary())
+        .arg("-d")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    let _ = lifecycle.write_all(&[u8::from(started)]);
+    if !started {
+        cleanup_private_mps_paths();
+        return Ok(());
+    }
+
+    // No messages are expected. EOF is the lifecycle signal and is guaranteed
+    // by the kernel even when the parent is killed without running destructors.
+    let mut discard = [0u8; 64];
+    while lifecycle.read(&mut discard)? != 0 {}
+
+    let mut stop = Command::new(mps_control_binary())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    if let Some(mut stdin) = stop.stdin.take() {
+        let _ = stdin.write_all(b"quit\n");
+    }
+    let _ = stop.wait();
+
+    // NVIDIA leaves control nodes behind after a graceful quit. It also keeps
+    // per-controller logs that would otherwise accumulate across daemon
+    // restarts, so reclaim both private PID-scoped directories.
+    cleanup_private_mps_paths();
+    Ok(())
+}
+
 /// True if a daemon is already listening on `sock` (a probe connect succeeds).
 fn is_alive(sock: &Path) -> bool {
     UnixStream::connect(sock).is_ok()
@@ -259,8 +517,6 @@ pub(crate) fn install_crash_handler(role: &'static str) {
 
 /// Serve the shared CUDA daemon on `sock` (spawned as `smolvm _cuda-daemon`).
 pub fn run(sock: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    install_crash_handler("cuda-daemon");
     // Become our own process-group leader so a clean-shutdown signal can take the
     // whole group (this daemon + its clone workers) down together without ever
     // touching the shell/ssh session that launched us. The `ensure_running` spawn
@@ -271,6 +527,8 @@ pub fn run(sock: &Path) -> io::Result<()> {
     unsafe {
         libc::setpgid(0, 0);
     }
+    #[cfg(unix)]
+    install_crash_handler("cuda-daemon");
     if let Some(parent) = sock.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -295,6 +553,12 @@ pub fn run(sock: &Path) -> io::Result<()> {
     #[cfg(unix)]
     install_shutdown_handler(sock);
     let listener = UdsListener::bind(sock)?;
+    // Must precede listener threads and the first GpuBackend::load. Clone
+    // workers inherit the endpoint from this daemon. Starting only after the
+    // socket is exclusively bound avoids briefly starting MPS in a losing
+    // double-daemon process.
+    #[cfg(target_os = "linux")]
+    let _mps_ownership = start_managed_mps(sock);
     tracing::info!(socket = %sock.display(), "shared CUDA daemon listening");
     let active = Arc::new(AtomicUsize::new(0));
     // Optional network transport (P1): also accept CUDA-RPC over TCP so a remote,
@@ -2329,5 +2593,66 @@ impl Drop for FileLock {
     fn drop(&mut self) {
         use std::os::unix::io::AsRawFd;
         unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod mps_tests {
+    use super::{create_private_mps_paths, mps_enabled};
+    use std::io;
+
+    #[test]
+    fn mps_defaults_to_fork_worker_pools() {
+        assert!(mps_enabled(None, true));
+        assert!(!mps_enabled(None, false));
+    }
+
+    #[test]
+    fn explicit_mps_mode_overrides_pool_default() {
+        for off in ["0", "off", "FALSE", " no "] {
+            assert!(!mps_enabled(Some(off), true), "{off}");
+        }
+        for on in ["1", "on", "TRUE", " yes ", "force"] {
+            assert!(mps_enabled(Some(on), false), "{on}");
+        }
+    }
+
+    #[test]
+    fn private_mps_paths_are_new_and_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let pipe = tmp.path().join("pipe");
+        let log_root = tmp.path().join("log-root");
+        let logs = log_root.join("123");
+
+        create_private_mps_paths(&pipe, &log_root, &logs).unwrap();
+
+        assert!(pipe.is_dir());
+        assert!(logs.is_dir());
+        assert_eq!(
+            std::fs::metadata(&pipe).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&logs).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn private_mps_path_collision_is_preserved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pipe = tmp.path().join("pipe");
+        let log_root = tmp.path().join("log-root");
+        let logs = log_root.join("123");
+        std::fs::create_dir(&pipe).unwrap();
+        std::fs::write(pipe.join("owner-sentinel"), b"keep").unwrap();
+
+        let error = create_private_mps_paths(&pipe, &log_root, &logs).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(pipe.join("owner-sentinel")).unwrap(), b"keep");
+        assert!(!logs.exists());
     }
 }
