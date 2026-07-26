@@ -1009,6 +1009,26 @@ pub fn layout_tokens() -> Vec<u64> {
     seen.into_iter().map(|(_, t)| t).collect()
 }
 
+/// Whether two lineage tokens belong to channels of the same guest process.
+///
+/// A process shares one [`GoldenLayout`] across all of its CUDA connections.
+/// Distinct processes in the same VM (for example an SFT preprocessing child
+/// and the trainer) register distinct layouts and must never share one clone
+/// worker/context.
+pub fn layout_handoff_same_process(a: u64, b: u64) -> bool {
+    let reg = LAYOUT_HANDOFF.lock().unwrap();
+    let Some(reg) = reg.as_ref() else {
+        return false;
+    };
+    let Some(a) = reg.get(&a).and_then(|w| w.upgrade()) else {
+        return false;
+    };
+    let Some(b) = reg.get(&b).and_then(|w| w.upgrade()) else {
+        return false;
+    };
+    std::sync::Arc::ptr_eq(&a, &b)
+}
+
 /// P3b: snapshot the golden's capture-replay op-logs for a clone worker,
 /// `(graph_vh, exec_vh, ordered op payloads)`. Separate from
 /// [`module_handoff_snapshot`] so its 6-tuple stays stable.
@@ -4937,6 +4957,26 @@ mod tests {
             "a dead lineage token hands off nothing"
         );
     }
+
+    #[test]
+    fn layout_lineage_distinguishes_processes_in_one_vm() {
+        use std::sync::{Arc, Mutex};
+
+        let trainer: Arc<LayoutCell> = Arc::new(Mutex::new(GoldenLayout::default()));
+        let preprocessing: Arc<LayoutCell> = Arc::new(Mutex::new(GoldenLayout::default()));
+        let trainer_a = 0xA2A2_0000_0000_0001;
+        let trainer_b = 0xA2A2_0000_0000_0002;
+        let child = 0xA2A2_0000_0000_0003;
+
+        layout_handoff_register(&trainer, trainer_a);
+        layout_handoff_register(&trainer, trainer_b);
+        layout_handoff_register(&preprocessing, child);
+
+        assert!(layout_handoff_same_process(trainer_a, trainer_b));
+        assert!(!layout_handoff_same_process(trainer_a, child));
+        assert!(!layout_handoff_same_process(trainer_a, u64::MAX));
+    }
+
     // The connect handshake rejects a client whose wire fingerprint differs
     // (stale shim/server), so protocol skew fails loudly instead of decoding
     // the wrong bytes and corrupting silently.
