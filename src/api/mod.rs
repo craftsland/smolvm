@@ -320,6 +320,19 @@ pub static METRICS_HANDLE: std::sync::OnceLock<metrics_exporter_prometheus::Prom
 
 /// Normalize a request path for Prometheus labels.
 /// Replaces machine IDs with `:id` to prevent cardinality explosion.
+/// Pull the machine id out of `/api/v1/machines/<id>/...` so request logs can be
+/// attributed to a specific machine. Metrics deliberately normalize this segment
+/// away (cardinality), but logs need it: without it a failed start is an
+/// anonymous 5xx and answering "why did this customer's machine fail" means
+/// grepping journals on every worker by hand.
+fn machine_id_from_path(path: &str) -> Option<&str> {
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() >= 5 && parts[1] == "api" && parts[3] == "machines" {
+        return parts.get(4).copied().filter(|s| !s.is_empty());
+    }
+    None
+}
+
 fn normalize_metrics_path(path: &str) -> String {
     let parts: Vec<&str> = path.split('/').collect();
     if parts.len() >= 4 && parts[1] == "api" && parts[3] == "machines" {
@@ -355,7 +368,12 @@ async fn trace_id_middleware(mut req: Request, next: Next) -> Response {
     // Normalize path to template to avoid cardinality explosion from machine IDs
     let path_template = normalize_metrics_path(req.uri().path());
 
-    let span = tracing::info_span!("request", trace_id = %trace_id);
+    // Attach the machine id to the span so every line emitted while handling the
+    // request — including the trace layer's response-failure log — is attributable.
+    let machine = machine_id_from_path(req.uri().path())
+        .unwrap_or("-")
+        .to_string();
+    let span = tracing::info_span!("request", trace_id = %trace_id, machine = %machine);
     let mut response = next.run(req).instrument(span).await;
 
     let status = response.status().as_u16().to_string();
@@ -369,7 +387,30 @@ async fn trace_id_middleware(mut req: Request, next: Next) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_command;
+    use super::{machine_id_from_path, validate_command};
+
+    #[test]
+    fn machine_id_is_extracted_from_machine_routes() {
+        assert_eq!(
+            machine_id_from_path("/api/v1/machines/my-vm"),
+            Some("my-vm")
+        );
+        assert_eq!(
+            machine_id_from_path("/api/v1/machines/my-vm/start"),
+            Some("my-vm")
+        );
+        assert_eq!(
+            machine_id_from_path("/api/v1/machines/my-vm/exec"),
+            Some("my-vm")
+        );
+    }
+
+    #[test]
+    fn non_machine_routes_have_no_machine_id() {
+        assert_eq!(machine_id_from_path("/health"), None);
+        assert_eq!(machine_id_from_path("/api/v1/machines"), None);
+        assert_eq!(machine_id_from_path("/api/v1/machines/"), None);
+    }
 
     #[test]
     fn test_validate_command() {
