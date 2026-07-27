@@ -691,6 +691,60 @@ pub struct StartMachineQuery {
     pub forkable: bool,
 }
 
+/// Credentials for the registry a machine's image lives in.
+///
+/// Supplied per-start rather than stored on the machine record: a customer's
+/// registry password must not be written to node disk, and the caller (the
+/// control plane) already re-sends it on every dispatch. The username is
+/// conventional for token-style credentials (`token`, `oauth2accesstoken`,
+/// a GitHub PAT username); what matters is the password.
+#[derive(Clone, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RegistryAuthSpec {
+    /// Registry username.
+    pub username: String,
+    /// Registry password, token, or PAT.
+    pub password: String,
+}
+
+// Hand-written so a credential can never reach a log line through `{:?}` on a
+// request struct — the derived Debug would print the password verbatim.
+impl std::fmt::Debug for RegistryAuthSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistryAuthSpec")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+impl From<RegistryAuthSpec> for crate::registry::RegistryAuth {
+    fn from(s: RegistryAuthSpec) -> Self {
+        Self {
+            username: s.username,
+            password: s.password,
+        }
+    }
+}
+
+/// Optional body for `POST /machines/{name}/start`.
+///
+/// Entirely optional so an older caller that sends no body keeps working
+/// unchanged — the route accepted only a query string before this existed.
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StartMachineRequest {
+    /// Credentials for the image's registry, used for THIS start only.
+    ///
+    /// Takes precedence over any registry credentials configured on the node,
+    /// which are operator-level and therefore cannot be per-tenant. Without
+    /// this, a private image on a third-party registry (a customer's own
+    /// `ghcr.io/<org>/<img>`) has no way to authenticate and the in-guest pull
+    /// fails with an opaque DENIED.
+    #[serde(default)]
+    pub registry_auth: Option<RegistryAuthSpec>,
+}
+
 /// Request to fork a running, forkable golden machine into a new clone.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -722,4 +776,70 @@ pub struct ForkRequest {
     #[serde(default)]
     #[schema(value_type = Object)]
     pub secrets: RequestSecretRefs,
+}
+
+#[cfg(test)]
+mod registry_auth_tests {
+    use super::*;
+
+    /// A registry password must never be printable via `Debug`.
+    ///
+    /// `StartMachineRequest` is exactly the kind of struct that ends up in a
+    /// `tracing::debug!(?req)` during a future debugging session, and the
+    /// derived Debug would put a customer's PAT straight into the node's
+    /// journal — which is shipped to Cloud Logging and retained.
+    #[test]
+    fn debug_never_prints_the_password() {
+        let spec = RegistryAuthSpec {
+            username: "bhbryant".into(),
+            password: "ghp_super_secret_value".into(),
+        };
+        let shown = format!("{spec:?}");
+        assert!(
+            !shown.contains("ghp_super_secret_value"),
+            "password leaked into Debug output: {shown}"
+        );
+        assert!(shown.contains("<redacted>"), "got: {shown}");
+        // The username is not a secret and stays visible for debugging.
+        assert!(shown.contains("bhbryant"));
+
+        // And it must stay redacted when nested in the request struct.
+        let req = StartMachineRequest {
+            registry_auth: Some(spec),
+        };
+        assert!(!format!("{req:?}").contains("ghp_super_secret_value"));
+    }
+
+    /// The body is optional and additive: absent, empty, or unrelated JSON all
+    /// deserialize to "no credentials", so an older control plane that sends
+    /// nothing keeps starting machines exactly as before.
+    #[test]
+    fn body_is_optional_and_backwards_compatible() {
+        let empty: StartMachineRequest = serde_json::from_str("{}").unwrap();
+        assert!(empty.registry_auth.is_none());
+
+        let unrelated: StartMachineRequest =
+            serde_json::from_str(r#"{"somethingElse":1}"#).unwrap();
+        assert!(unrelated.registry_auth.is_none());
+
+        let with_auth: StartMachineRequest =
+            serde_json::from_str(r#"{"registryAuth":{"username":"token","password":"pat"}}"#)
+                .unwrap();
+        let auth = with_auth.registry_auth.expect("registryAuth parsed");
+        assert_eq!(auth.username, "token");
+        assert_eq!(auth.password, "pat");
+    }
+
+    /// Converting into the protocol type preserves both fields verbatim — a
+    /// silent truncation here would authenticate as the wrong principal.
+    #[test]
+    fn converts_to_the_protocol_credential_unchanged() {
+        let a: crate::registry::RegistryAuth = RegistryAuthSpec {
+            username: "oauth2accesstoken".into(),
+            password: "p:with:colons".into(),
+        }
+        .into();
+        assert_eq!(a.username, "oauth2accesstoken");
+        assert_eq!(a.password, "p:with:colons");
+    }
 }

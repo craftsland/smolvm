@@ -915,7 +915,12 @@ pub async fn start_machine(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
     Query(query): Query<StartMachineQuery>,
+    // Optional: the route took only a query string before this existed, so a
+    // caller that sends no body (or a non-JSON one) still starts normally.
+    body: Option<Json<crate::api::types::StartMachineRequest>>,
 ) -> Result<Json<MachineInfo>, ApiError> {
+    let registry_auth: Option<crate::registry::RegistryAuth> =
+        body.and_then(|Json(b)| b.registry_auth).map(Into::into);
     // Hold the per-machine lifecycle lock across the whole start so a concurrent
     // stop/delete cannot detach the macOS layers volume between our acquire+mount
     // and the launch, nor launch a guest into the launcher's missing-dir error
@@ -1076,9 +1081,19 @@ pub async fn start_machine(
         // no-op on the stop→restart path. Mirrors how the smolmachine source
         // fails a bad artifact at create.
         let image_pull = image.clone();
+        // Caller-supplied credentials win over the node's own registry config:
+        // that config is operator-level and shared by every tenant, so it can
+        // never hold a customer's private-registry password. `PullOptions::auth`
+        // is consulted before the config inside `pull`, so passing it here is
+        // enough — and passing `None` leaves the previous behaviour untouched.
+        let pull_auth = registry_auth.clone();
         let pull = with_machine_client_traced(&entry, None, move |c| {
             if c.query(&image_pull)?.is_none() {
-                c.pull_with_registry_config(&image_pull)?;
+                let mut opts = crate::agent::PullOptions::new().use_registry_config(true);
+                if let Some(auth) = pull_auth {
+                    opts = opts.auth(auth);
+                }
+                c.pull(&image_pull, opts)?;
             }
             Ok(())
         })
