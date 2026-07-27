@@ -998,6 +998,21 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    // Reserve the golden's address ranges before retaining this worker's CUDA
+    // context, so context initialization cannot occupy them. Some drivers
+    // require non-zero address hints to use a coarser boundary than the
+    // allocation granularity, so probe aligned envelopes from small to large.
+    let clone_layout = std::env::var("SMOLVM_CUDA_CLONE_LAYOUT").ok();
+    let mut pre_reserved = Vec::new();
+    if let Some(layout) = clone_layout.as_deref() {
+        let (ranges, granularity) = reserve_clone_layout_exact(backend.as_mut(), layout, clone_dev);
+        pre_reserved = ranges;
+        tracing::info!(
+            exact = pre_reserved.len(),
+            granularity,
+            "clone-worker: reserved golden address ranges before context creation"
+        );
+    }
     let _ = backend.primary_ctx_retain(clone_dev);
     // Clone transport: consume the proc-mem advert (SMVGPVM1) the clone proxy
     // sent right after its clone preamble, so D2H/H2D reach the clone's LIVE
@@ -1026,8 +1041,9 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
     // M2: reconstruct the golden's memory at its exact VAs from the layout the
     // daemon passed (SMOLVM_CUDA_CLONE_LAYOUT) + the golden's physical exported to
     // fds 4.. — BEFORE serving, so the clone's inherited pointers are valid verbatim.
-    if let Ok(layout) = std::env::var("SMOLVM_CUDA_CLONE_LAYOUT") {
-        let (n, vmm_trans) = reconstruct_golden_memory(backend.as_mut(), &layout, clone_dev);
+    if let Some(layout) = clone_layout.as_deref() {
+        let (n, vmm_trans) =
+            reconstruct_golden_memory(backend.as_mut(), layout, clone_dev, &pre_reserved);
         tracing::info!(
             maps = n,
             vmm_handles = vmm_trans.len(),
@@ -1235,6 +1251,119 @@ fn import_with_retry(b: &mut dyn Backend, fd: i32) -> Result<u64, i32> {
     Err(last)
 }
 
+#[cfg(unix)]
+fn clone_layout_reservations(layout: &str) -> Vec<(u64, u64)> {
+    let hx = |s: &str| u64::from_str_radix(s, 16).ok();
+    let mut ranges = Vec::new();
+    for part in layout.split('|') {
+        if let Some(entries) = part.strip_prefix("resv=") {
+            ranges.extend(entries.split(',').filter_map(|entry| {
+                let (va, size) = entry.split_once(':')?;
+                Some((hx(va)?, hx(size)?))
+            }));
+        }
+        if let Some(entries) = part.strip_prefix("aregions=") {
+            ranges.extend(entries.split(',').filter_map(|entry| {
+                let mut fields = entry.split(':');
+                Some((hx(fields.next()?)?, hx(fields.next()?)?))
+            }));
+        }
+    }
+    ranges.sort_unstable();
+    ranges.dedup();
+    ranges
+}
+
+#[cfg(unix)]
+fn clone_layout_reservation_envelopes(layout: &str, granularity: u64) -> Vec<(u64, u64)> {
+    let mask = granularity - 1;
+    let mut spans: Vec<(u64, u64)> = clone_layout_reservations(layout)
+        .into_iter()
+        .map(|(va, size)| {
+            let base = va & !mask;
+            let end = va.saturating_add(size).saturating_add(mask) & !mask;
+            (base, end)
+        })
+        .collect();
+    spans.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for (base, end) in spans {
+        match merged.last_mut() {
+            Some((_, prior_end)) if base <= *prior_end => *prior_end = (*prior_end).max(end),
+            _ => merged.push((base, end)),
+        }
+    }
+    merged
+        .into_iter()
+        .map(|(base, end)| (base, end - base))
+        .collect()
+}
+
+#[cfg(unix)]
+fn range_is_reserved(ranges: &[(u64, u64)], va: u64, size: u64) -> bool {
+    ranges
+        .iter()
+        .any(|&(base, span)| va >= base && va.saturating_add(size) <= base.saturating_add(span))
+}
+
+#[cfg(unix)]
+fn reserve_clone_address_exact(b: &mut dyn Backend, va: u64, size: u64, align: u64) -> bool {
+    match b.mem_address_reserve_fixed(size, align, va) {
+        Ok(actual) if actual == va => true,
+        Ok(actual) => {
+            let _ = b.mem_address_free(actual, size);
+            tracing::warn!(
+                requested = va,
+                actual,
+                size,
+                "clone-worker: CUDA moved an exact-address reservation"
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!(e, va, size, "clone-worker: exact-address reserve failed");
+            false
+        }
+    }
+}
+
+#[cfg(unix)]
+fn reserve_clone_layout_exact(
+    b: &mut dyn Backend,
+    layout: &str,
+    device: i32,
+) -> (Vec<(u64, u64)>, u64) {
+    const MIN_GRANULARITY: u64 = 1 << 16;
+    const MAX_HINT_GRANULARITY: u64 = 1 << 30;
+
+    let mut granularity = b
+        .mem_get_allocation_granularity(device, 0)
+        .unwrap_or(1 << 21)
+        .max(MIN_GRANULARITY)
+        .next_power_of_two();
+    while granularity <= MAX_HINT_GRANULARITY {
+        let envelopes = clone_layout_reservation_envelopes(layout, granularity);
+        let mut reserved = Vec::with_capacity(envelopes.len());
+        let mut complete = true;
+        for &(va, size) in &envelopes {
+            if reserve_clone_address_exact(b, va, size, granularity) {
+                reserved.push((va, size));
+            } else {
+                complete = false;
+                break;
+            }
+        }
+        if complete {
+            return (reserved, granularity);
+        }
+        for (va, size) in reserved {
+            let _ = b.mem_address_free(va, size);
+        }
+        granularity = granularity.saturating_mul(2);
+    }
+    (Vec::new(), granularity)
+}
+
 /// M2: rebuild the golden's VMM layout in THIS worker's context at the golden's
 /// EXACT VAs. `layout` = `"resv=va:size,…|maps=va:size:fdidx:loaded:ghandle,…"` (hex);
 /// each map's physical was exported by the daemon to fd `4 + fdidx`. We import +
@@ -1250,6 +1379,7 @@ fn reconstruct_golden_memory(
     b: &mut dyn Backend,
     layout: &str,
     device: i32,
+    pre_reserved: &[(u64, u64)],
 ) -> (usize, std::collections::HashMap<u64, u64>) {
     let mut vmm_trans = std::collections::HashMap::new();
     let (mut resv_s, mut maps_s, mut aregions_s, mut allocs_s) = ("", "", "", "");
@@ -1275,8 +1405,10 @@ fn reconstruct_golden_memory(
     for e in resv_s.split(',').filter(|s| !s.is_empty()) {
         if let Some((va, size)) = e.split_once(':') {
             if let (Some(va), Some(size)) = (hx(va), hx(size)) {
-                if let Err(e) = b.mem_address_reserve_fixed(size, 0, va) {
-                    tracing::warn!(e, va, "M2: reserve-fixed failed");
+                if !range_is_reserved(pre_reserved, va, size)
+                    && !reserve_clone_address_exact(b, va, size, 0)
+                {
+                    tracing::warn!(va, size, "M2: reservation unavailable at golden VA");
                 }
             }
         }
@@ -1447,8 +1579,10 @@ fn reconstruct_golden_memory(
         // poisons the context: e=700 on every later op — found via QA-1l,
         // first-ever cuBLAS init inside a clone).
         for &(b0, sz, _) in &regions {
-            if let Err(e) = b.mem_address_reserve_fixed(sz, 0, b0) {
-                tracing::warn!(e, va = b0, size = sz, "M2-alloc: VA guard reserve failed");
+            if !range_is_reserved(pre_reserved, b0, sz)
+                && !reserve_clone_address_exact(b, b0, sz, 0)
+            {
+                tracing::warn!(va = b0, size = sz, "M2-alloc: VA guard reserve failed");
             }
         }
         let total: u64 = regions.iter().map(|r| r.1).sum();
@@ -2760,9 +2894,9 @@ impl Drop for FileLock {
 #[cfg(all(test, target_os = "linux"))]
 mod mps_tests {
     use super::{
-        clone_worker_share_env, create_private_mps_paths, decode_attach_procmem,
-        disabled_worker_route, encode_attach_procmem, mps_enabled, recv_fd, send_fd,
-        unique_live_clone_worker,
+        clone_layout_reservation_envelopes, clone_worker_share_env, create_private_mps_paths,
+        decode_attach_procmem, disabled_worker_route, encode_attach_procmem, mps_enabled,
+        range_is_reserved, recv_fd, send_fd, unique_live_clone_worker,
     };
     use std::collections::HashMap;
     use std::io;
@@ -2848,6 +2982,24 @@ mod mps_tests {
         assert_eq!(disabled_worker_route(3, false, true), Some(true));
         assert_eq!(disabled_worker_route(3, true, false), Some(true));
         assert_eq!(disabled_worker_route(3, true, true), None);
+    }
+
+    #[test]
+    fn clone_address_envelopes_align_merge_and_cover_original_ranges() {
+        let layout = concat!(
+            "resv=312400000:200000,314000000:1400000,|maps=|",
+            "aregions=7a5ed2400000:200000:0,7a5ed2600000:200000:200000,"
+        );
+        let ranges = clone_layout_reservation_envelopes(layout, 0x2000000);
+
+        assert_eq!(
+            ranges,
+            vec![(0x312000000, 0x4000000), (0x7a5ed2000000, 0x2000000)]
+        );
+        assert!(range_is_reserved(&ranges, 0x312400000, 0x200000));
+        assert!(range_is_reserved(&ranges, 0x314000000, 0x1400000));
+        assert!(range_is_reserved(&ranges, 0x7a5ed2600000, 0x200000));
+        assert!(!range_is_reserved(&ranges, 0x316000000, 0x200000));
     }
 
     #[test]
