@@ -2477,6 +2477,16 @@ fn vram_limit() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+fn session_vram_used(sess: &Session) -> u64 {
+    sess.owned_dptrs.values().sum::<u64>() + sess.owned_vmm_handles.values().sum::<u64>()
+}
+
+fn virtual_memory_info(sess: &Session, free: u64, total: u64) -> (u64, u64) {
+    let total = total.min(vram_limit());
+    let free = free.min(total.saturating_sub(session_vram_used(sess)));
+    (free, total)
+}
+
 /// Debug op trace (`SMOLVM_CUDA_OPTRACE=<path>`): appends one line per traced
 /// memory/launch op with pid + post-translation params + status, so a fork
 /// investigation can see exactly which PROCESS executed which op on which
@@ -3040,9 +3050,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         Request::DeviceGetName { device } => {
             b.device_get_name(dev(sess, device)).map(Response::Name)
         }
-        Request::DeviceTotalMem { device } => {
-            b.device_total_mem(dev(sess, device)).map(Response::Bytes)
-        }
+        Request::DeviceTotalMem { device } => b
+            .device_total_mem(dev(sess, device))
+            .map(|total| Response::Bytes(total.min(vram_limit()))),
         Request::DriverGetVersion => b.driver_get_version().map(Response::Count),
         Request::DeviceGetAttribute { attrib, device } => b
             .device_get_attribute(attrib, dev(sess, device))
@@ -3386,7 +3396,10 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         Request::MemsetD8 { dptr, value, bytes } => {
             b.memset_d8(dptr, value, bytes).map(|_| Response::Ok)
         }
-        Request::MemGetInfo => b.mem_get_info().map(|(f, t)| Response::Pair(f, t)),
+        Request::MemGetInfo => b
+            .mem_get_info()
+            .map(|(free, total)| virtual_memory_info(sess, free, total))
+            .map(|(free, total)| Response::Pair(free, total)),
         Request::LaunchKernel {
             function,
             grid,
@@ -4983,12 +4996,21 @@ mod tests {
         let mut sess = Session::default();
         let mut b = CpuBackend::default();
         let mb = 1024 * 1024;
+        let (st, total) = dispatch(&mut sess, &mut b, Request::DeviceTotalMem { device: 0 });
+        assert_eq!(st, 0);
+        assert!(matches!(total, Response::Bytes(n) if n == mb));
+        let (st, info) = dispatch(&mut sess, &mut b, Request::MemGetInfo);
+        assert_eq!(st, 0);
+        assert!(matches!(info, Response::Pair(free, total) if free == mb && total == mb));
         let (st, r) = dispatch(&mut sess, &mut b, Request::MemAlloc { bytes: mb / 2 });
         assert_eq!(st, 0);
         let d1 = match r {
             Response::Dptr(d) => d,
             _ => unreachable!(),
         };
+        let (st, info) = dispatch(&mut sess, &mut b, Request::MemGetInfo);
+        assert_eq!(st, 0);
+        assert!(matches!(info, Response::Pair(free, total) if free == mb / 2 && total == mb));
         // Second half-MB fits exactly; a byte more must fail with OOM(2).
         let (st, _) = dispatch(&mut sess, &mut b, Request::MemAlloc { bytes: mb / 2 });
         assert_eq!(st, 0);
