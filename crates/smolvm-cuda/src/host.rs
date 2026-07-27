@@ -1922,6 +1922,27 @@ pub fn serve<S: Read + Write>(stream: S, backend: &mut dyn Backend) -> std::io::
     r
 }
 
+/// Execute one fire-and-forget request unless an earlier request in the same
+/// deferred batch already failed. Continuing after a failed handle create can
+/// feed its never-created virtual handle into a dependent driver call before
+/// the next fence reports the sticky error; libcuda may dereference such an
+/// opaque handle instead of returning a second clean error.
+fn dispatch_quiet(
+    sess: &mut Session,
+    backend: &mut dyn Backend,
+    req: Request,
+    quiet_sticky: &mut i32,
+) -> (i32, Response) {
+    if *quiet_sticky != 0 {
+        return (*quiet_sticky, Response::Ok);
+    }
+    let result = dispatch(sess, backend, req);
+    if result.0 != 0 {
+        *quiet_sticky = result.0;
+    }
+    result
+}
+
 fn serve_inner<S: Read + Write>(
     mut stream: S,
     backend: &mut dyn Backend,
@@ -1946,12 +1967,9 @@ fn serve_inner<S: Read + Write>(
                         libcall_tag(&payload[1..])
                     );
                 }
-                let (status, _) = dispatch(sess, backend, req);
+                let (status, _) = dispatch_quiet(sess, backend, req, &mut quiet_sticky);
                 if status != 0 && std::env::var_os("SMOLVM_CUDA_HOST_OPLOG").is_some() {
                     eprintln!("[op~!] status={status}");
-                }
-                if status != 0 && quiet_sticky == 0 {
-                    quiet_sticky = status;
                 }
             }
             // Fence: report (and clear) the sticky quiet failure.
@@ -2388,7 +2406,7 @@ fn serve_rings<S: Read + Write>(
                     prof.decode += t_dec.elapsed().as_micros();
                 }
                 let t_exec = std::time::Instant::now();
-                let (status, _) = dispatch(sess, backend, req);
+                let (status, _) = dispatch_quiet(sess, backend, req, &mut quiet_sticky);
                 if prof.on {
                     prof.exec += t_exec.elapsed().as_micros();
                     prof.ops += 1;
@@ -2397,9 +2415,6 @@ fn serve_rings<S: Read + Write>(
                 if status != 0 {
                     if oplog {
                         eprintln!("[op~!] status={status}");
-                    }
-                    if quiet_sticky == 0 {
-                        quiet_sticky = status;
                     }
                 }
             }
@@ -4034,13 +4049,22 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             // raw real. Recorded as the chunk's ghandle so a clone's inherited
             // ops (which carry this value) translate in the worker.
             let ghandle = handle;
-            // Burst create: resolve the session's minted virtual handle.
-            let handle = sess.vmm_vhandles.get(&handle).copied().unwrap_or(handle);
-            // Path 3 worker: an inherited golden handle must map via the worker's
-            // own physical (raw golden values are invalid in this context).
-            let handle = VMM_TRANS
-                .with(|m| m.borrow().as_ref().and_then(|t| t.get(&handle).copied()))
-                .unwrap_or(handle);
+            // Burst create: resolve the session's minted virtual handle. In a
+            // clone worker, an inherited golden handle instead resolves through
+            // the reconstructed worker map. A tagged handle found in neither
+            // table was never created (commonly because the preceding deferred
+            // MemCreateVh returned OOM); never pass it into libcuda.
+            let handle = if let Some(real) = sess.vmm_vhandles.get(&handle).copied() {
+                real
+            } else if let Some(real) =
+                VMM_TRANS.with(|m| m.borrow().as_ref().and_then(|t| t.get(&handle).copied()))
+            {
+                real
+            } else if handle & VHANDLE_TAG != 0 {
+                return Err(CUDA_ERROR_INVALID_HANDLE);
+            } else {
+                handle
+            };
             b.mem_map(va, size, offset, handle).map(|_| {
                 sess.owned_vmm_maps.insert(va, size);
                 sess.vmm_ranges.lock().unwrap().insert(va, size);
@@ -4070,7 +4094,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         }
         Request::MemRelease { handle } => {
             // Burst create: resolve (and retire) the session's virtual handle.
-            let handle = sess.vmm_vhandles.remove(&handle).unwrap_or(handle);
+            let guest_handle = handle;
+            let session_handle = sess.vmm_vhandles.remove(&handle);
+            let handle = session_handle.unwrap_or(handle);
             let created_here = sess.owned_vmm_handles.remove(&handle).is_some();
             // Path 3 worker: translate an inherited golden handle to the worker
             // handle backing that chunk (consumed: releasing twice is a no-op).
@@ -4090,6 +4116,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 Some(None) => {
                     eprintln!("[M2] MemRelease: unknown inherited handle {handle:#x} → no-op");
                     Ok(Response::Ok)
+                }
+                None if session_handle.is_none() && guest_handle & VHANDLE_TAG != 0 => {
+                    Err(CUDA_ERROR_INVALID_HANDLE)
                 }
                 None => b.mem_release(handle).map(|_| Response::Ok),
             }
@@ -4531,6 +4560,47 @@ mod tests {
         set_worker_graph_oplogs(vec![(7, exec, vec![vec![1, 2, 3]])]);
         assert_eq!(worker_graph_oplog(exec), Some(vec![vec![1, 2, 3]]));
         assert_eq!(worker_graph_oplogs_len(), 1);
+    }
+
+    #[test]
+    fn deferred_failure_skips_dependent_ops_until_fence() {
+        let mut sess = Session::default();
+        let mut backend = CpuBackend::default();
+        let mut sticky = 0;
+        let unknown = VHANDLE_TAG | 0x53;
+
+        let (status, _) = dispatch_quiet(
+            &mut sess,
+            &mut backend,
+            Request::MemMap {
+                va: 0x20_0000,
+                size: 0x20_0000,
+                offset: 0,
+                handle: unknown,
+            },
+            &mut sticky,
+        );
+        assert_eq!(status, CUDA_ERROR_INVALID_HANDLE);
+        assert_eq!(sticky, CUDA_ERROR_INVALID_HANDLE);
+
+        let (status, _) = dispatch_quiet(
+            &mut sess,
+            &mut backend,
+            Request::MemAlloc { bytes: 16 },
+            &mut sticky,
+        );
+        assert_eq!(status, CUDA_ERROR_INVALID_HANDLE);
+        assert!(sess.owned_dptrs.is_empty());
+
+        sticky = 0;
+        let (status, _) = dispatch_quiet(
+            &mut sess,
+            &mut backend,
+            Request::MemAlloc { bytes: 16 },
+            &mut sticky,
+        );
+        assert_eq!(status, 0);
+        assert_eq!(sess.owned_dptrs.len(), 1);
     }
 
     /// Coverage is recorded per overlapped chunk, each hashing only its own
