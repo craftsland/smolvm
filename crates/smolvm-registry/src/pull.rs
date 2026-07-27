@@ -14,7 +14,14 @@ use crate::{OciManifest, RegistryError, Result, LAYER_MEDIA_TYPE};
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, BufWriter};
+
+/// Write-buffer for streaming a blob to disk.
+///
+/// Sized to amortise the per-write trip to tokio's blocking pool across a whole
+/// network read burst without holding a meaningful amount of RAM per concurrent
+/// pull (a node runs many at once during a fan-out).
+const WRITE_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
 /// Result of a successful pull.
 #[derive(Debug)]
@@ -141,7 +148,14 @@ where
     S: futures_util::Stream<Item = reqwest::Result<bytes::Bytes>>,
 {
     let partial_path = cache.blob_path_for(digest).with_extension("partial");
-    let mut file = tokio::fs::File::create(&partial_path).await?;
+    // BUFFERED. `tokio::fs::File` is unbuffered and every `write_all` hands a
+    // blocking syscall to the runtime's blocking pool, awaited inline. reqwest
+    // yields the body in transport-sized chunks (~8-16 KiB), so an unbuffered
+    // loop costs thousands of pool round-trips per blob and stalls the socket
+    // between each one — measured at 6.5 MB/s against a link that delivers 62.
+    // Batching into large writes keeps the download the bottleneck instead.
+    let file = tokio::fs::File::create(&partial_path).await?;
+    let mut file = BufWriter::with_capacity(WRITE_BUFFER_BYTES, file);
     let mut hasher = Sha256::new();
     let mut total_bytes: u64 = 0;
 
@@ -152,6 +166,11 @@ where
         file.write_all(&chunk).await?;
         total_bytes += chunk.len() as u64;
     }
+    // Flush the writer AND the file beneath it: dropping a `BufWriter` discards
+    // buffered bytes silently, which would truncate the blob and surface as a
+    // digest mismatch rather than an I/O error.
+    file.flush().await?;
+    let mut file = file.into_inner();
     file.flush().await?;
     drop(file);
 
@@ -249,5 +268,46 @@ mod tests {
             "blob must be adopted into cache"
         );
         // MockServer drop asserts the blob endpoint's expect(1) was satisfied.
+    }
+
+    /// A blob larger than the write buffer, delivered in many small chunks —
+    /// the shape a real registry body arrives in.
+    ///
+    /// Guards the buffering change: a `BufWriter` that is dropped without
+    /// flushing loses whatever is still buffered, and the resulting truncated
+    /// file fails digest verification. Chunking finer than the buffer and
+    /// exceeding it in total is what makes that bug observable.
+    #[tokio::test]
+    async fn buffered_write_preserves_every_byte_across_many_small_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(dir.path().to_path_buf(), 64 * 1024 * 1024).unwrap();
+
+        // 9 MiB in 16 KiB chunks: > WRITE_BUFFER_BYTES, so the buffer must spill
+        // and be flushed at least twice.
+        let chunk = vec![0xABu8; 16 * 1024];
+        let chunks = 9 * 64;
+        let total = chunk.len() * chunks;
+
+        let mut hasher = Sha256::new();
+        for _ in 0..chunks {
+            hasher.update(&chunk);
+        }
+        let digest = format!("sha256:{}", hex::encode(hasher.finalize()));
+
+        let stream = futures_util::stream::iter(
+            (0..chunks).map(move |_| Ok(bytes::Bytes::from(vec![0xABu8; 16 * 1024]))),
+        );
+
+        let out = dir.path().join("blob.out");
+        let result = stream_verify_adopt(stream, &digest, Some(&out), &cache)
+            .await
+            .expect("digest must verify — a short write means buffered bytes were lost");
+
+        assert_eq!(result.size, total as u64, "every byte accounted for");
+        assert_eq!(
+            tokio::fs::metadata(&out).await.unwrap().len(),
+            total as u64,
+            "written file must not be truncated"
+        );
     }
 }
