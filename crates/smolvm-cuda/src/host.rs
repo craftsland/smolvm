@@ -14,7 +14,7 @@
 use crate::proto::{
     decode_request, encode_request, encode_response, fnv64, read_msg, write_msg, Request, Response,
 };
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 use std::io::{Read, Write};
 
 /// `Ok(value)` or `Err(CUresult)` — a non-zero CUDA error code.
@@ -2412,10 +2412,8 @@ fn serve_rings<S: Read + Write>(
                     prof.ops += 1;
                     prof.dump_maybe();
                 }
-                if status != 0 {
-                    if oplog {
-                        eprintln!("[op~!] status={status}");
-                    }
+                if status != 0 && oplog {
+                    eprintln!("[op~!] status={status}");
                 }
             }
             Some(&crate::proto::FENCE_OP) if frame.len() == 1 => {
@@ -3548,9 +3546,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                     let raw = raw_stream(sess, stream)?;
                     return b.graph_launch(exec, raw).map(|_| Response::Ok);
                 }
-                if !sess.clone_graph_oplogs.contains_key(&graph_exec) {
+                if let Entry::Vacant(entry) = sess.clone_graph_oplogs.entry(graph_exec) {
                     if let Some(ops) = worker_graph_oplog(graph_exec) {
-                        sess.clone_graph_oplogs.insert(graph_exec, ops);
+                        entry.insert(ops);
                     }
                 }
                 if !sess.clone_graph_oplogs.contains_key(&graph_exec) {
