@@ -2060,6 +2060,25 @@ async fn pull_from_registry(
     identity_token: Option<&str>,
     blob_peers: &[String],
 ) -> Result<String, ApiError> {
+    let result = pull_smolmachine(registry_ref, identity_token, blob_peers).await?;
+    tracing::info!(path = %result.path.display(), cached = result.cached, "pull complete");
+    Ok(result.path.to_string_lossy().into_owned())
+}
+
+/// Resolve `registry_ref` and pull its `.smolmachine` layer into this node's
+/// blob cache, returning the full [`smolvm_registry::PullResult`].
+///
+/// Split out of [`pull_from_registry`] so the pre-warm endpoint
+/// ([`crate::api::handlers::prewarm`]) reaches the registry through byte-for-byte
+/// the same reference parsing, mirror lookup, credential precedence, cache, and
+/// peer fallback that a real create uses. A warm path that resolved references
+/// even slightly differently would cache a blob under one key and leave the
+/// create looking for another — a silent no-op that still looks like a success.
+pub(crate) async fn pull_smolmachine(
+    registry_ref: &str,
+    identity_token: Option<&str>,
+    blob_peers: &[String],
+) -> Result<smolvm_registry::PullResult, ApiError> {
     let parsed = crate::registry::Reference::parse(registry_ref)
         .map_err(|e| ApiError::BadRequest(format!("invalid registry reference: {}", e)))?;
 
@@ -2119,9 +2138,7 @@ async fn pull_from_registry(
             _ => ApiError::internal(format!("registry pull failed: {}", e)),
         })?;
 
-    tracing::info!(path = %result.path.display(), cached = result.cached, "pull complete");
-
-    Ok(result.path.to_string_lossy().into_owned())
+    Ok(result)
 }
 
 fn registry_reference_tag_or_digest(parsed: &crate::registry::Reference) -> &str {

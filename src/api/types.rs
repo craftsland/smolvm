@@ -241,6 +241,40 @@ pub struct ExportResponse {
     pub manifest: String,
 }
 
+/// Request to pull a `.smolmachine` artifact into this node's blob cache ahead
+/// of any machine that needs it. See [`crate::api::handlers::prewarm`].
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WarmArtifactRequest {
+    /// Full registry reference of the artifact to cache.
+    #[schema(example = "registry.example.com/tenants/t/app:latest")]
+    pub reference: String,
+    /// Short-lived, scoped registry token authorizing the pull. Omitted for a
+    /// reference this node already holds a persisted credential for.
+    #[serde(default)]
+    pub identity_token: Option<String>,
+    /// Sibling nodes to try before the registry, same as the create path. Warming
+    /// the second and later nodes from a peer keeps the fan-out off the registry
+    /// link entirely.
+    #[serde(default)]
+    pub blob_peers: Vec<String>,
+}
+
+/// Result of pre-warming an artifact into the node's blob cache.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WarmArtifactResponse {
+    /// Digest of the cached layer blob.
+    #[schema(example = "sha256:abc123")]
+    pub digest: String,
+    /// Size of the cached layer blob in bytes.
+    #[schema(example = 104857600)]
+    pub size_bytes: u64,
+    /// True when the blob was already cached and no transfer was needed — the
+    /// signal that a repeat warm cost nothing.
+    pub already_cached: bool,
+}
+
 /// Request to run a command in an image.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]

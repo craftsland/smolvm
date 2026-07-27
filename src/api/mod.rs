@@ -174,6 +174,14 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
     // blobs can be large.
     let p2p_route = Router::new().route("/p2p/blob/{digest}", get(handlers::p2p::serve_blob));
 
+    // Control-initiated artifact pre-warm: pull a `.smolmachine` layer into this
+    // node's blob cache before any machine needs it, so a create finds it warm
+    // instead of racing a cold multi-hundred-MB download against a client's
+    // readiness timeout. mTLS-gated by the listener like `/drain` and `/p2p`
+    // above. No request timeout: the transfer is as large as a blob pull, and
+    // it runs off the critical path where slowness costs nothing.
+    let warm_route = Router::new().route("/artifacts/warm", post(handlers::prewarm::warm_artifact));
+
     // Long-lived streaming routes (no request timeout): SSE logs and the
     // interactive PTY WebSocket both outlive the 5-minute API timeout.
     let logs_route = Router::new()
@@ -291,6 +299,7 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .merge(capacity_route)
         .merge(drain_route)
         .merge(p2p_route)
+        .merge(warm_route)
         .merge(metrics_route)
         .nest("/api/v1", api_v1)
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
