@@ -1044,23 +1044,51 @@ pub fn graph_oplogs_snapshot(token: u64) -> GraphOplogs {
     }
 }
 
-/// P3b worker: install inherited capture-replay logs for this clone. Drained
-/// into the serving session at clone resume; replayed lazily at first launch.
+/// P3b worker: install inherited capture-replay logs for this clone. Kept
+/// process-global and immutable so every late-attached CUDA channel can lazily
+/// rebuild a graph the first channel has not used yet.
 pub fn set_worker_graph_oplogs(v: GraphOplogs) {
-    WORKER_GRAPH_OPLOGS.with(|r| *r.borrow_mut() = v);
+    *WORKER_GRAPH_OPLOGS.lock().unwrap() = Some(std::sync::Arc::new(v));
 }
 
-thread_local! {
-    static WORKER_GRAPH_OPLOGS: std::cell::RefCell<GraphOplogs> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
+static WORKER_GRAPH_OPLOGS: std::sync::Mutex<Option<std::sync::Arc<GraphOplogs>>> =
+    std::sync::Mutex::new(None);
 
-fn take_worker_graph_oplogs() -> GraphOplogs {
-    WORKER_GRAPH_OPLOGS.with(|r| std::mem::take(&mut *r.borrow_mut()))
+fn worker_graph_oplog(exec_vh: u64) -> Option<Vec<Vec<u8>>> {
+    WORKER_GRAPH_OPLOGS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|logs| {
+            logs.iter()
+                .find(|(_, exec, _)| *exec == exec_vh)
+                .map(|(_, _, ops)| ops.clone())
+        })
 }
 
 fn worker_graph_oplogs_peek() -> GraphOplogs {
-    WORKER_GRAPH_OPLOGS.with(|r| r.borrow().clone())
+    WORKER_GRAPH_OPLOGS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|logs| logs.as_ref().clone())
+        .unwrap_or_default()
+}
+
+fn worker_graph_oplogs_len() -> usize {
+    WORKER_GRAPH_OPLOGS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map_or(0, |logs| logs.len())
+}
+
+fn prereplay_setting(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some("1" | "true" | "on" | "yes"))
+}
+
+fn prereplay_enabled() -> bool {
+    prereplay_setting(std::env::var("SMOLVM_CUDA_PREREPLAY").ok().as_deref())
 }
 
 /// P3b: pre-warm a clone worker at SPAWN, before any guest channel attaches —
@@ -1069,9 +1097,11 @@ fn worker_graph_oplogs_peek() -> GraphOplogs {
 /// results at resume instead of paying reload/re-capture on the guest's first
 /// CUDA call. Must run on the worker main thread AFTER module staging and
 /// lib-handle replay (their thread-locals seed the scratch session).
-/// Opt out: SMOLVM_CUDA_PREREPLAY=0.
+/// Opt in: SMOLVM_CUDA_PREREPLAY=1. Replaying every captured shape can execute
+/// stale/unneeded buffers and poison the context; lazy first-launch replay is
+/// the safe default.
 pub fn prewarm_clone_worker(b: &mut dyn Backend) {
-    if std::env::var("SMOLVM_CUDA_PREREPLAY").as_deref() == Ok("0") {
+    if !prereplay_enabled() {
         return;
     }
     let t0 = std::time::Instant::now();
@@ -2682,6 +2712,8 @@ fn adopt_replayed_exec(sess: &mut Session, exec_vh: u64, exec: u64) {
     sess.owned_graph_reals.insert(exec);
 }
 
+static REPLAY_CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// P3b: rebuild an inherited graph by RE-CAPTURING its recorded op sequence in
 /// this clone's context. Begins capture on the clone's remapped copy of the
 /// golden's capture stream, re-dispatches each recorded op (so `dispatch`'s
@@ -3105,20 +3137,16 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 }
                 sort_trans(&mut sess.dptr_trans); // xlat binary-searches by base
                 gpu::set_lib_trans(&sess.dptr_trans); // forwarded-lib pointer map
-                                                      // P3b: adopt inherited capture-replay logs, keyed by exec_vh —
-                                                      // replayed lazily at the clone's first GraphLaunch.
-                for (graph_vh, exec_vh, ops) in take_worker_graph_oplogs() {
-                    eprintln!(
-                        "[p3b] clone adopted oplog: graph {graph_vh:#x} exec {exec_vh:#x} ({} ops)",
-                        ops.len()
-                    );
-                    sess.clone_graph_oplogs.insert(exec_vh, ops);
-                }
+                                                      // P3b logs remain process-global so late-attached channels can
+                                                      // fetch unseen graphs on demand instead of inheriting an empty
+                                                      // thread-local after the first channel drains it.
+                let inherited_graphs = worker_graph_oplogs_len();
                 eprintln!(
                     "[cuda-fork-isolate] clone resumed token {parent}: {copied} private copies \
-                     ({cbytes} B), {shared} shared read-only ({sbytes} B)"
+                     ({cbytes} B), {shared} shared read-only ({sbytes} B), \
+                     {inherited_graphs} inherited graph logs"
                 );
-                // P3b PRE-WARM (opt out: SMOLVM_CUDA_PREREPLAY=0). Two stages,
+                // P3b PRE-WARM (explicit opt in: SMOLVM_CUDA_PREREPLAY=1). Two stages,
                 // both moving one-time clone costs off the first-request path:
                 // (1) eagerly reload every staged golden module — first-touch
                 // kernel launches (prefill, eager ops) stop paying per-module
@@ -3126,7 +3154,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 // rather than lazily at first launch. Failures are left for
                 // the lazy paths to retry; later sessions adopt from the
                 // registry.
-                if std::env::var("SMOLVM_CUDA_PREREPLAY").as_deref() != Ok("0") {
+                if prereplay_enabled() {
                     let mods: Vec<u64> = MOD_IMAGES.with(|m| m.borrow().keys().copied().collect());
                     if !mods.is_empty() {
                         let t0 = std::time::Instant::now();
@@ -3142,9 +3170,12 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                         );
                     }
                 }
-                if !sess.clone_graph_oplogs.is_empty()
-                    && std::env::var("SMOLVM_CUDA_PREREPLAY").as_deref() != Ok("0")
-                {
+                if prereplay_enabled() {
+                    for (_, exec_vh, ops) in worker_graph_oplogs_peek() {
+                        sess.clone_graph_oplogs.entry(exec_vh).or_insert(ops);
+                    }
+                }
+                if !sess.clone_graph_oplogs.is_empty() && prereplay_enabled() {
                     let t0 = std::time::Instant::now();
                     let execs: Vec<u64> = sess.clone_graph_oplogs.keys().copied().collect();
                     let (mut fresh, mut adopted, mut deferred) = (0u32, 0u32, 0u32);
@@ -3476,21 +3507,43 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 && !sess
                     .owned_graph_reals
                     .contains(&raw_graph(sess, graph_exec))
-                && sess.clone_graph_oplogs.contains_key(&graph_exec)
             {
-                match replay_capture_graph(sess, b, graph_exec) {
-                    Ok(exec) => {
-                        replayed_exec_put(graph_exec, exec);
-                        adopt_replayed_exec(sess, graph_exec, exec);
-                        let raw = raw_stream(sess, stream)?;
-                        return b.graph_launch(exec, raw).map(|_| Response::Ok);
+                // Only one channel may capture an inherited exec at a time.
+                // Re-check the process registry after acquiring the lock: a
+                // sibling channel may have completed this graph while we
+                // waited. Fetch only this graph's immutable global log, so a
+                // late channel does not duplicate every inherited shape log.
+                let _capture_guard = REPLAY_CAPTURE_LOCK.lock().unwrap();
+                if let Some(exec) = replayed_exec_get(graph_exec) {
+                    adopt_replayed_exec(sess, graph_exec, exec);
+                    let raw = raw_stream(sess, stream)?;
+                    return b.graph_launch(exec, raw).map(|_| Response::Ok);
+                }
+                if !sess.clone_graph_oplogs.contains_key(&graph_exec) {
+                    if let Some(ops) = worker_graph_oplog(graph_exec) {
+                        sess.clone_graph_oplogs.insert(graph_exec, ops);
                     }
-                    Err(e) => {
-                        eprintln!(
-                            "[p3b] capture-replay failed for exec {graph_exec:#x}: e={e}; \
+                }
+                if !sess.clone_graph_oplogs.contains_key(&graph_exec) {
+                    let real = raw_graph(sess, graph_exec);
+                    if real == 0 {
+                        return Err(CUDA_ERROR_INVALID_HANDLE);
+                    }
+                } else {
+                    match replay_capture_graph(sess, b, graph_exec) {
+                        Ok(exec) => {
+                            replayed_exec_put(graph_exec, exec);
+                            adopt_replayed_exec(sess, graph_exec, exec);
+                            let raw = raw_stream(sess, stream)?;
+                            return b.graph_launch(exec, raw).map(|_| Response::Ok);
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[p3b] capture-replay failed for exec {graph_exec:#x}: e={e}; \
                                    falling back to node rebuild"
-                        );
-                        // fall through to the node-rebuild / patch paths below
+                            );
+                            // fall through to the node-rebuild / patch paths below
+                        }
                     }
                 }
             }
@@ -4461,6 +4514,23 @@ mod tests {
             !g.maps[&0x1000].covered_exactly(),
             "an unverifiable chunk must stay private"
         );
+    }
+
+    #[test]
+    fn eager_graph_prereplay_requires_explicit_opt_in() {
+        assert!(!prereplay_setting(None));
+        assert!(!prereplay_setting(Some("0")));
+        assert!(!prereplay_setting(Some("false")));
+        assert!(prereplay_setting(Some("1")));
+        assert!(prereplay_setting(Some(" on ")));
+    }
+
+    #[test]
+    fn inherited_graph_logs_are_visible_to_late_channels() {
+        let exec = 0x8000_0000_0000_f123;
+        set_worker_graph_oplogs(vec![(7, exec, vec![vec![1, 2, 3]])]);
+        assert_eq!(worker_graph_oplog(exec), Some(vec![vec![1, 2, 3]]));
+        assert_eq!(worker_graph_oplogs_len(), 1);
     }
 
     /// Coverage is recorded per overlapped chunk, each hashing only its own
