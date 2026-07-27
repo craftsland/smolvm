@@ -1044,7 +1044,7 @@ pub fn graph_oplogs_snapshot(token: u64) -> GraphOplogs {
     }
 }
 
-/// P3b worker: install inherited capture-replay logs for this clone. Kept
+/// Install inherited capture-replay logs for this clone. The logs remain
 /// process-global and immutable so every late-attached CUDA channel can lazily
 /// rebuild a graph the first channel has not used yet.
 pub fn set_worker_graph_oplogs(v: GraphOplogs) {
@@ -3160,19 +3160,20 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                     copied += 1;
                     cbytes += size;
                 }
-                sort_trans(&mut sess.dptr_trans); // xlat binary-searches by base
-                gpu::set_lib_trans(&sess.dptr_trans); // forwarded-lib pointer map
-                                                      // P3b logs remain process-global so late-attached channels can
-                                                      // fetch unseen graphs on demand instead of inheriting an empty
-                                                      // thread-local after the first channel drains it.
+                // Pointer translation uses a binary search over allocation bases.
+                sort_trans(&mut sess.dptr_trans);
+                // Forwarded CUDA libraries use the same pointer map.
+                gpu::set_lib_trans(&sess.dptr_trans);
+                // Capture-replay logs remain process-global so late-attached channels can
+                // fetch unseen graphs on demand instead of inheriting an empty thread-local.
                 let inherited_graphs = worker_graph_oplogs_len();
                 eprintln!(
                     "[cuda-fork-isolate] clone resumed token {parent}: {copied} private copies \
                      ({cbytes} B), {shared} shared read-only ({sbytes} B), \
                      {inherited_graphs} inherited graph logs"
                 );
-                // P3b PRE-WARM (explicit opt in: SMOLVM_CUDA_PREREPLAY=1). Two stages,
-                // both moving one-time clone costs off the first-request path:
+                // Pre-warming is explicitly enabled with SMOLVM_CUDA_PREREPLAY=1. Two stages
+                // move one-time clone costs off the first-request path:
                 // (1) eagerly reload every staged golden module — first-touch
                 // kernel launches (prefill, eager ops) stop paying per-module
                 // reload stalls; (2) re-capture every inherited graph now
