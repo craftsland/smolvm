@@ -3647,3 +3647,165 @@ mod sparse_copy_tests {
         assert_eq!(want, got, "multi-chunk extent must copy exactly");
     }
 }
+
+/// Differential tests: the extent-based copy must agree with the exhaustive
+/// scan it replaced, on every shape of sparse file.
+#[cfg(test)]
+mod sparse_copy_differential_tests {
+    use super::*;
+    /// The algorithm exactly as it was before the SEEK_DATA change, kept here as
+    /// the reference oracle. Any divergence from this is a regression.
+    fn reference_scan_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
+        let mut src_file = File::open(src)?;
+        let size = src_file.metadata()?.len();
+        let mut dst_file = File::create(dst)?;
+        dst_file.set_len(size)?;
+        let mut buf = vec![0u8; 512 * 1024];
+        let mut offset: u64 = 0;
+        while offset < size {
+            let to_read = (size - offset).min(buf.len() as u64) as usize;
+            let n = src_file.read(&mut buf[..to_read])?;
+            if n == 0 {
+                break;
+            }
+            let chunk = &buf[..n];
+            if chunk.iter().any(|&b| b != 0) {
+                dst_file.seek(SeekFrom::Start(offset))?;
+                dst_file.write_all(chunk)?;
+            }
+            offset += n as u64;
+        }
+        Ok(())
+    }
+
+    /// Stream-compare two files. `memcmp` stays fast even in the unoptimized
+    /// test profile, unlike a cryptographic digest — and comparing the bytes is
+    /// a stronger check than comparing hashes of them.
+    fn files_equal(a: &Path, b: &Path) -> bool {
+        let (mut fa, mut fb) = (
+            File::open(a).expect("open a"),
+            File::open(b).expect("open b"),
+        );
+        if fa.metadata().expect("meta").len() != fb.metadata().expect("meta").len() {
+            return false;
+        }
+        let (mut ba, mut bb) = (vec![0u8; 4 << 20], vec![0u8; 4 << 20]);
+        loop {
+            let na = fa.read(&mut ba).expect("read a");
+            let nb = fb.read(&mut bb).expect("read b");
+            if na != nb {
+                return false;
+            }
+            if na == 0 {
+                return true;
+            }
+            if ba[..na] != bb[..nb] {
+                return false;
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn blocks(p: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(p).expect("stat").blocks()
+    }
+
+    /// Deterministic pseudo-random layouts: same seed, same file, every run.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+            self.0 >> 11
+        }
+    }
+
+    /// Fuzz many sparse shapes; the new copy must agree with the old one and
+    /// with the source, byte for byte, on every one.
+    #[test]
+    fn fuzz_layouts_agree_with_the_old_algorithm() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut rng = Lcg(0x5EED);
+
+        for case in 0..60 {
+            let src = tmp.path().join(format!("s{case}.img"));
+            let fast = tmp.path().join(format!("f{case}.img"));
+            let slow = tmp.path().join(format!("r{case}.img"));
+
+            let size = 1 + (rng.next() % (24 * 1024 * 1024));
+            let mut f = File::create(&src).expect("create");
+            f.set_len(size).expect("set_len");
+            // Scatter a handful of data runs, some tiny, some spanning chunks.
+            let runs = rng.next() % 7;
+            for _ in 0..runs {
+                let at = rng.next() % size;
+                let len = (1 + rng.next() % (2 * 1024 * 1024)).min(size - at);
+                let byte = (1 + (rng.next() % 254)) as u8;
+                f.seek(SeekFrom::Start(at)).expect("seek");
+                f.write_all(&vec![byte; len as usize]).expect("write");
+            }
+            f.sync_all().expect("sync");
+            drop(f);
+
+            sparse_copy(&src, &fast).expect("fast");
+            reference_scan_copy(&src, &slow).expect("slow");
+
+            assert!(
+                files_equal(&fast, &src),
+                "case {case}: fast path diverged from source"
+            );
+            assert!(
+                files_equal(&fast, &slow),
+                "case {case}: fast path diverged from old algorithm"
+            );
+            #[cfg(unix)]
+            assert!(
+                blocks(&fast) <= blocks(&slow),
+                "case {case}: fast path is less sparse than the old one"
+            );
+        }
+    }
+
+    /// Offsets beyond 4 GiB must not truncate through any 32-bit path.
+    #[test]
+    fn data_beyond_four_gib_round_trips() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("big.img");
+        let dst = tmp.path().join("big-copy.img");
+        let far: u64 = 6 * 1024 * 1024 * 1024; // 6 GiB, sparse
+
+        let mut f = File::create(&src).expect("create");
+        f.write_all(b"START").expect("start");
+        f.seek(SeekFrom::Start(far)).expect("seek");
+        f.write_all(b"BEYOND-4GIB").expect("far write");
+        f.sync_all().expect("sync");
+        drop(f);
+
+        sparse_copy(&src, &dst).expect("copy");
+
+        assert!(files_equal(&dst, &src), "6 GiB sparse file must round-trip");
+        #[cfg(unix)]
+        assert!(
+            blocks(&dst) < 4096,
+            "must stay sparse, got {}",
+            blocks(&dst)
+        );
+    }
+
+    /// Data touching the final byte: SEEK_HOLE has no hole to report past it.
+    #[test]
+    fn data_at_the_very_end_round_trips() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("tail.img");
+        let dst = tmp.path().join("tail-copy.img");
+        let mut f = File::create(&src).expect("create");
+        f.set_len(8 * 1024 * 1024).expect("len");
+        f.seek(SeekFrom::Start(8 * 1024 * 1024 - 3)).expect("seek");
+        f.write_all(b"EOF").expect("write");
+        f.sync_all().expect("sync");
+        drop(f);
+
+        sparse_copy(&src, &dst).expect("copy");
+        assert!(files_equal(&dst, &src));
+    }
+}
