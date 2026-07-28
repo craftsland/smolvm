@@ -945,12 +945,9 @@ where
     let crane_status = crane_child
         .wait()
         .map_err(|e| StorageError::new(format!("failed to wait for crane: {e}")))?;
-    let input_copy_result = input_copy_thread.join().unwrap_or_else(|_| {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "archive input worker panicked",
-        ))
-    });
+    let input_copy_result = input_copy_thread
+        .join()
+        .unwrap_or_else(|_| Err(std::io::Error::other("archive input worker panicked")));
     let crane_stderr = crane_err_thread.join().unwrap_or_default();
 
     if !crane_status.success() {
