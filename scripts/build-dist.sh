@@ -555,6 +555,26 @@ else
     # Size to the default overlay virtual size (DEFAULT_OVERLAY_SIZE_GIB=10).
     extend_sparse "$OVERLAY_TEMPLATE_PATH" $((10 * 1024 * 1024 * 1024))
     echo "Overlay template created: $(du -h "$OVERLAY_TEMPLATE_PATH" | cut -f1) physical (10 GiB virtual)"
+
+    # Ship the templates compressed rather than sparse.
+    #
+    # A 20 GiB file holding a few MiB of real data only stays small where the
+    # filesystem understands holes, and that assumption breaks outside it: GNU
+    # tar cannot read the sparse encoding bsdtar writes (so `nix run` fails on
+    # the macOS tarball), and the Nix store materializes every zero, costing
+    # 30 GiB for the pair. Compressed, the same content is a few hundred KiB and
+    # is just an ordinary file to every tool in the chain. smolvm expands it
+    # back into a sparse file on first use.
+    if command -v zstd >/dev/null 2>&1; then
+        for tmpl in "$TEMPLATE_PATH" "$OVERLAY_TEMPLATE_PATH"; do
+            zstd -19 -T0 -q --rm -f "$tmpl" -o "${tmpl}.zst"
+            echo "  compressed $(basename "$tmpl") -> $(du -h "${tmpl}.zst" | cut -f1)"
+        done
+    else
+        echo "Warning: zstd not found; shipping uncompressed sparse templates."
+        echo "         These cannot be extracted by GNU tar from a macOS-built"
+        echo "         tarball, and consume their full virtual size under Nix."
+    fi
 fi
 
 # Copy README
