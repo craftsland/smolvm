@@ -1568,6 +1568,9 @@ fn acquire_lease(cache_dir: &Path, debug: bool) -> std::io::Result<PathBuf> {
     // Garbage-collect leases from dead processes.
     gc_stale_leases(&leases_dir);
 
+    // Reclaim volumes stranded by runs that were killed before releasing.
+    reap_orphan_volumes(cache_dir);
+
     // Ensure the sparse image exists and is mounted.
     ensure_cs_volume_mounted(cache_dir, debug)?;
 
@@ -1649,6 +1652,82 @@ fn detach_if_unused(cache_dir: &Path) {
                 .output();
         }
     }
+}
+
+/// The sibling cache directories that may hold a stranded volume.
+///
+/// Two layouts use this protocol: `<root>/<hash>` (standalone packs) and
+/// `<root>/<hash>/pack` (VM-backed packs). Both are handled by walking up to the
+/// directory that *contains the hashes* and re-applying our own suffix, so we
+/// only ever look at peers of the same shape.
+#[cfg(target_os = "macos")]
+fn sibling_cache_dirs(cache_dir: &Path) -> Vec<PathBuf> {
+    let nested = cache_dir.file_name().is_some_and(|n| n == "pack");
+    let Some(root) = (if nested {
+        cache_dir.parent().and_then(Path::parent)
+    } else {
+        cache_dir.parent()
+    }) else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .map(|e| {
+            if nested {
+                e.path().join("pack")
+            } else {
+                e.path()
+            }
+        })
+        .filter(|p| p != cache_dir && p.is_dir())
+        .collect()
+}
+
+/// Detach case-sensitive volumes stranded by runs that never released.
+///
+/// A run that is killed (or crashes) skips [`release_lease`], leaving its volume
+/// mounted with a lease file whose PID is dead. Its *own* directory self-heals —
+/// the next run of that same artifact acquires, GCs the dead lease, and detaches
+/// on release. What never heals is an artifact that is not run again: its volume
+/// holds a `/dev/diskN` for the life of the login session, and enough of them
+/// exhaust the device table. So the sweep is over *siblings*, not self.
+///
+/// Each peer is locked non-blocking: a directory whose lock is held has a live
+/// process inside acquire/release, which by definition is not stranded, and
+/// blocking on it would let an unrelated artifact stall this run.
+#[cfg(target_os = "macos")]
+fn reap_orphan_volumes(cache_dir: &Path) {
+    for dir in sibling_cache_dirs(cache_dir) {
+        let mount_point = dir.join(CS_MOUNT_DIR);
+        if !mount_point.exists() || !is_mount_point(&mount_point) {
+            continue;
+        }
+        let Ok(lock) = try_lock_leases(&dir) else {
+            continue;
+        };
+        gc_stale_leases(&dir.join(LEASES_DIR));
+        detach_if_unused(&dir);
+        drop(lock);
+    }
+}
+
+/// Acquire the leases lock, or fail immediately if another process holds it.
+#[cfg(target_os = "macos")]
+fn try_lock_leases(cache_dir: &Path) -> std::io::Result<File> {
+    let lock_path = cache_dir.join(LEASES_LOCK);
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    let ret = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(lock_file)
 }
 
 /// Acquire the leases lock (flock-based, like extract_sidecar).
@@ -3284,5 +3363,87 @@ mod tests {
         let freed = evict_cache_to_size(root, 0);
         assert_eq!(freed, 0, "leased extraction must not be evicted");
         assert!(d.exists());
+    }
+}
+
+/// Reaping stranded case-sensitive volumes (macOS-only lease protocol).
+#[cfg(all(test, target_os = "macos"))]
+mod orphan_reap_tests {
+    use super::*;
+
+    /// Standalone packs live at `<root>/<hash>`, so peers are the other hashes.
+    #[test]
+    fn flat_layout_sees_its_peers() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        for h in ["aaa", "bbb", "ccc"] {
+            fs::create_dir_all(root.join(h)).expect("mkdir");
+        }
+        let peers = sibling_cache_dirs(&root.join("aaa"));
+
+        assert_eq!(peers.len(), 2, "both peers, and never itself");
+        assert!(peers.contains(&root.join("bbb")));
+        assert!(peers.contains(&root.join("ccc")));
+        assert!(!peers.contains(&root.join("aaa")));
+    }
+
+    /// VM-backed packs live at `<root>/<hash>/pack` — a peer is another hash's
+    /// `pack` subdir, not the hash directory itself.
+    #[test]
+    fn nested_layout_keeps_the_pack_suffix() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        for h in ["aaa", "bbb"] {
+            fs::create_dir_all(root.join(h).join("pack")).expect("mkdir");
+        }
+        let peers = sibling_cache_dirs(&root.join("aaa").join("pack"));
+
+        assert_eq!(peers, vec![root.join("bbb").join("pack")]);
+    }
+
+    /// A hash directory with no `pack` subdir is simply skipped, rather than
+    /// yielding a path that does not exist.
+    #[test]
+    fn nested_layout_skips_peers_without_a_pack_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        fs::create_dir_all(root.join("aaa").join("pack")).expect("mkdir");
+        fs::create_dir_all(root.join("bbb")).expect("mkdir");
+
+        assert!(sibling_cache_dirs(&root.join("aaa").join("pack")).is_empty());
+    }
+
+    /// The reaper must never block: a peer mid-acquire holds its lock, and
+    /// waiting on it would stall an unrelated artifact's run.
+    #[test]
+    fn a_held_lock_is_skipped_not_waited_on() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        let held = lock_leases(dir).expect("first lock");
+
+        assert!(
+            try_lock_leases(dir).is_err(),
+            "must fail immediately while held"
+        );
+
+        drop(held);
+        assert!(try_lock_leases(dir).is_ok(), "succeeds once released");
+    }
+
+    /// Reaping is a no-op when nothing is mounted — the common case, and it must
+    /// not disturb a peer's directory contents.
+    #[test]
+    fn unmounted_peers_are_left_alone() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let peer = root.join("bbb");
+        fs::create_dir_all(peer.join(LEASES_DIR)).expect("mkdir");
+        fs::create_dir_all(root.join("aaa")).expect("mkdir");
+        let marker = peer.join(LEASES_DIR).join("12345");
+        fs::write(&marker, "").expect("write lease");
+
+        reap_orphan_volumes(&root.join("aaa"));
+
+        assert!(peer.exists(), "peer directory must survive");
     }
 }
