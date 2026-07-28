@@ -1953,12 +1953,19 @@ pub fn extract_libs_from_binary(exe_path: &Path, debug: bool) -> std::io::Result
 /// disk, so two extractions can exhaust the runner and fail with ENOSPC.
 ///
 /// This copy creates the destination as a sparse skeleton (`set_len` to the
-/// source's logical size) and then writes only the chunks that contain non-zero
-/// bytes, leaving every zero run as a hole. It mirrors the write-side
+/// source's logical size) and then writes only the regions that hold real data,
+/// leaving every zero run as a hole. It mirrors the write-side
 /// `assets::sparse_copy_overlay`, so behavior is consistent on both ends and on
-/// APFS/ext4/xfs/NTFS alike. Reading over holes costs no disk I/O (the kernel
-/// serves zero pages from cache), so scanning even a mostly-empty 20 GiB
-/// template is fast.
+/// APFS/ext4/xfs/NTFS alike.
+///
+/// The holes are located by asking the filesystem (`SEEK_DATA`/`SEEK_HOLE`)
+/// rather than by reading across them. Reading a hole costs no *disk* I/O — the
+/// kernel serves zero pages — but it still costs a syscall and a memory scan per
+/// chunk, and that is not free at scale: the 20 GiB `storage-template.ext4`
+/// holds ~9 MiB of real data, so a linear scan performed 40,960 read-and-compare
+/// iterations to find it and took ~11 s, which landed on the critical path of
+/// every packed `run`. Seeking straight between data extents reduces that to a
+/// handful of syscalls.
 ///
 /// Used on both ends: the extract/run side here, and the pack-create side in
 /// `assets::create_storage_template` when it copies the pre-formatted
@@ -1975,8 +1982,17 @@ pub(crate) fn sparse_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
     mark_file_sparse(&dst_file)?;
     dst_file.set_len(size)?;
 
-    // Forward pass: read in 512 KiB chunks, writing only chunks that contain a
-    // non-zero byte. Zero chunks are skipped, so they stay as holes in `dst`.
+    // Fast path: copy only the extents the filesystem reports as data. Falls
+    // through to the scan below on any filesystem that does not implement the
+    // SEEK_DATA/SEEK_HOLE extension.
+    #[cfg(unix)]
+    if copy_data_extents(&mut src_file, &mut dst_file, size)? {
+        return Ok(());
+    }
+
+    // Portable fallback: read in 512 KiB chunks, writing only chunks that contain
+    // a non-zero byte. Zero chunks are skipped, so they stay as holes in `dst`.
+    src_file.seek(SeekFrom::Start(0))?;
     let mut buf = vec![0u8; 512 * 1024];
     let mut offset: u64 = 0;
     while offset < size {
@@ -1994,6 +2010,80 @@ pub(crate) fn sparse_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+/// Copy just the data extents of `src` into `dst`, skipping holes outright.
+///
+/// Returns `Ok(false)` — having written nothing — when the filesystem does not
+/// support `SEEK_DATA`, so the caller can fall back to scanning. Support is
+/// per-filesystem rather than per-OS (APFS, ext4, xfs and btrfs have it; some
+/// network and FUSE filesystems do not), which is why this is detected at run
+/// time instead of by `cfg`.
+#[cfg(unix)]
+fn copy_data_extents(src: &mut File, dst: &mut File, size: u64) -> std::io::Result<bool> {
+    use std::os::unix::io::AsRawFd;
+
+    let fd = src.as_raw_fd();
+    let seek = |from: u64, whence: libc::c_int| -> Option<i64> {
+        let r = unsafe { libc::lseek(fd, from as libc::off_t, whence) };
+        if r < 0 {
+            None
+        } else {
+            Some(r as i64)
+        }
+    };
+
+    // Probe before writing anything: an unsupported filesystem must leave `dst`
+    // untouched so the fallback starts from a clean slate. ENXIO means "no data
+    // at or after this offset", which for offset 0 is a legitimately empty file.
+    if seek(0, libc::SEEK_DATA).is_none() {
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::ENXIO) {
+            return Ok(true); // entirely holes — the skeleton is already correct
+        }
+        return Ok(false);
+    }
+
+    let mut buf = vec![0u8; 512 * 1024];
+    let mut offset: u64 = 0;
+    while offset < size {
+        // Start of the next region containing data.
+        let Some(data_start) = seek(offset, libc::SEEK_DATA) else {
+            break; // ENXIO: only holes remain
+        };
+        let data_start = data_start as u64;
+        if data_start >= size {
+            break;
+        }
+        // Where that region ends. A file always has an implicit hole at EOF, so
+        // this resolves even for a trailing extent; clamp anyway for safety.
+        let data_end = seek(data_start, libc::SEEK_HOLE)
+            .map(|v| (v as u64).min(size))
+            .unwrap_or(size);
+
+        src.seek(SeekFrom::Start(data_start))?;
+        dst.seek(SeekFrom::Start(data_start))?;
+        let mut remaining = data_end.saturating_sub(data_start);
+        while remaining > 0 {
+            let want = remaining.min(buf.len() as u64) as usize;
+            let n = src.read(&mut buf[..want])?;
+            if n == 0 {
+                break;
+            }
+            // An extent may be allocated yet zero-filled; keeping the zero test
+            // means such regions stay holes in `dst` exactly as before.
+            let chunk = &buf[..n];
+            if chunk.iter().any(|&b| b != 0) {
+                dst.write_all(chunk)?;
+            } else {
+                dst.seek(SeekFrom::Current(n as i64))?;
+            }
+            remaining -= n as u64;
+        }
+        offset = data_end.max(data_start + 1);
+    }
+
+    Ok(true)
 }
 
 /// Create a storage disk file (empty sparse file).
@@ -3449,5 +3539,111 @@ mod orphan_reap_tests {
         reap_orphan_volumes(&root.join("aaa"));
 
         assert!(peer.exists(), "peer directory must survive");
+    }
+}
+
+/// `sparse_copy` must reproduce the source exactly while preserving holes.
+#[cfg(test)]
+mod sparse_copy_tests {
+    use super::*;
+
+    /// Write `src`, copy it, and assert the bytes round-trip identically.
+    fn roundtrip(build: impl FnOnce(&mut File)) -> (Vec<u8>, Vec<u8>, u64) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("src.img");
+        let dst = tmp.path().join("dst.img");
+        let mut f = File::create(&src).expect("create src");
+        build(&mut f);
+        f.sync_all().expect("sync");
+        drop(f);
+
+        sparse_copy(&src, &dst).expect("sparse_copy");
+
+        let want = fs::read(&src).expect("read src");
+        let got = fs::read(&dst).expect("read dst");
+        let blocks = dst_blocks(&dst);
+        (want, got, blocks)
+    }
+
+    #[cfg(unix)]
+    fn dst_blocks(p: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(p).expect("stat").blocks()
+    }
+    #[cfg(not(unix))]
+    fn dst_blocks(_p: &Path) -> u64 {
+        0
+    }
+
+    /// Data at both ends with a large hole between — the storage-template shape.
+    #[test]
+    fn data_separated_by_a_large_hole_round_trips() {
+        let (want, got, _) = roundtrip(|f| {
+            f.write_all(b"HEAD").expect("head");
+            f.seek(SeekFrom::Start(64 * 1024 * 1024)).expect("seek");
+            f.write_all(b"TAIL").expect("tail");
+        });
+        assert_eq!(want.len(), 64 * 1024 * 1024 + 4);
+        assert_eq!(want, got, "copy must be byte-identical across the hole");
+    }
+
+    /// The hole must survive the copy rather than being filled with zeros.
+    #[cfg(unix)]
+    #[test]
+    fn the_hole_is_not_materialized() {
+        let (want, _got, blocks) = roundtrip(|f| {
+            f.write_all(b"HEAD").expect("head");
+            f.seek(SeekFrom::Start(64 * 1024 * 1024)).expect("seek");
+            f.write_all(b"TAIL").expect("tail");
+        });
+        // A dense 64 MiB copy would be ~131072 512-byte blocks; a sparse one is
+        // a few. Assert well under a tenth to stay robust across filesystems.
+        let dense = (want.len() as u64) / 512;
+        assert!(
+            blocks < dense / 10,
+            "destination should stay sparse: {blocks} blocks vs {dense} if dense"
+        );
+    }
+
+    /// A fully-zero file has no data extents at all — the SEEK_DATA probe
+    /// returns ENXIO immediately, which must not be mistaken for failure.
+    #[test]
+    fn an_all_zero_file_round_trips() {
+        let (want, got, _) = roundtrip(|f| {
+            f.set_len(8 * 1024 * 1024).expect("set_len");
+        });
+        assert_eq!(want.len(), 8 * 1024 * 1024);
+        assert_eq!(got, want, "all-zero file must copy as all zeros");
+    }
+
+    /// Dense, non-zero content must copy verbatim — the no-holes case.
+    #[test]
+    fn a_dense_file_round_trips() {
+        let (want, got, _) = roundtrip(|f| {
+            let data: Vec<u8> = (0..=255u8).cycle().take(3 * 1024 * 1024).collect();
+            f.write_all(&data).expect("write");
+        });
+        assert_eq!(want, got, "dense content must be preserved exactly");
+        assert!(want.iter().any(|&b| b != 0));
+    }
+
+    /// An empty file is a degenerate case both paths must survive.
+    #[test]
+    fn an_empty_file_round_trips() {
+        let (want, got, _) = roundtrip(|_f| {});
+        assert!(want.is_empty() && got.is_empty());
+    }
+
+    /// Data crossing the 512 KiB buffer boundary must not be truncated or
+    /// misaligned by the chunked read inside an extent.
+    #[test]
+    fn an_extent_larger_than_the_buffer_round_trips() {
+        let (want, got, _) = roundtrip(|f| {
+            let data: Vec<u8> = (0..=255u8).cycle().take(1_500_000).collect();
+            f.write_all(&data).expect("write");
+            f.seek(SeekFrom::Start(32 * 1024 * 1024)).expect("seek");
+            f.write_all(b"END").expect("end");
+        });
+        assert_eq!(want, got, "multi-chunk extent must copy exactly");
     }
 }
