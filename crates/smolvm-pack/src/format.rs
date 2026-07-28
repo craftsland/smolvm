@@ -56,8 +56,22 @@ pub const SECTION_MAGIC: &[u8; 8] = b"SMOLSECT";
 /// Magic bytes for libs footer appended to the stub binary.
 pub const LIBS_MAGIC: &[u8; 8] = b"SMOLLIBS";
 
-/// Current format version.
+/// Current format version — the version stamped into newly written packs.
 pub const FORMAT_VERSION: u32 = 1;
+
+/// Format versions this build can READ. New packs are always WRITTEN at
+/// `FORMAT_VERSION`, but older `.smolmachine` artifacts stay readable: the
+/// on-disk layout (footer, manifest, assets blob) is identical across these
+/// versions — only the version number ever differed. It was reset 3→1 in a
+/// format refactor, which orphaned pre-reset packs behind a strict
+/// `version == FORMAT_VERSION` check. Accepting the older numbers keeps those
+/// artifacts runnable instead of failing with "unsupported version: 3".
+pub const SUPPORTED_READ_VERSIONS: &[u32] = &[1, 2, 3];
+
+/// Whether a pack stamped with `version` can be read by this build.
+pub fn is_supported_read_version(version: u32) -> bool {
+    SUPPORTED_READ_VERSIONS.contains(&version)
+}
 
 /// Extension for sidecar assets file.
 pub const SIDECAR_EXTENSION: &str = ".smolmachine";
@@ -138,7 +152,7 @@ impl SectionHeader {
 
         // Check version
         let version = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
-        if version != FORMAT_VERSION {
+        if !is_supported_read_version(version) {
             return Err(PackError::UnsupportedVersion(version));
         }
 
@@ -277,7 +291,7 @@ impl PackFooter {
 
         // Check version
         let version = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
-        if version != FORMAT_VERSION {
+        if !is_supported_read_version(version) {
             return Err(PackError::UnsupportedVersion(version));
         }
 
@@ -384,13 +398,20 @@ pub struct PackManifest {
 
     /// Host platform this .smolmachine runs on (e.g., "darwin/arm64").
     /// Distinct from `platform` which is the guest architecture (always linux).
-    /// Used for registry Image Index resolution.
+    /// Used for registry Image Index resolution. `#[serde(default)]` keeps
+    /// pre-reset packs (which predate this field) loadable — a local run selects
+    /// libs by the actual host, so an empty value is harmless.
+    #[serde(default)]
     pub host_platform: String,
 
-    /// RFC 3339 timestamp when this machine was packed.
+    /// RFC 3339 timestamp when this machine was packed. Defaulted so older packs
+    /// that lack it still load.
+    #[serde(default)]
     pub created: String,
 
-    /// smolvm version that built this machine (e.g., "0.1.15").
+    /// smolvm version that built this machine (e.g., "0.1.15"). Defaulted so
+    /// older packs that lack it still load.
+    #[serde(default)]
     pub smolvm_version: String,
 
     /// Asset inventory - files included in the assets blob.
@@ -582,6 +603,29 @@ mod tests {
 
         let result = PackFooter::from_bytes(&bytes);
         assert!(matches!(result, Err(PackError::UnsupportedVersion(99))));
+    }
+
+    #[test]
+    fn test_footer_reads_legacy_v2_v3() {
+        // Packs written before FORMAT_VERSION was reset 3->1 stamp version 2 or 3
+        // but share the identical byte layout, so they must still read. Regression
+        // for "read footer: unsupported version: 3" on pre-reset .smolmachine files.
+        for legacy in [2u32, 3u32] {
+            let footer = PackFooter {
+                stub_size: 0,
+                assets_offset: 0,
+                assets_size: 10,
+                manifest_offset: 10,
+                manifest_size: 20,
+                checksum: 0,
+            };
+            let mut bytes = footer.to_bytes();
+            bytes[8..12].copy_from_slice(&legacy.to_le_bytes());
+            let restored = PackFooter::from_bytes(&bytes)
+                .unwrap_or_else(|_| panic!("legacy v{legacy} footer must read"));
+            assert_eq!(restored.assets_size, 10);
+            assert_eq!(restored.manifest_size, 20);
+        }
     }
 
     #[test]
