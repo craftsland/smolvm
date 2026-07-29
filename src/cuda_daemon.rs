@@ -84,11 +84,13 @@ fn host_snapshot_capacity_available(required: u64) -> bool {
         .is_some_and(|meminfo| host_snapshot_fits(required, &meminfo))
 }
 
-fn host_snapshot_reconstructable(vmm_maps: usize) -> bool {
-    // Ordinary CUDA allocations can contain device pointers that RPC-boundary
-    // translation cannot see. At least one VMM mapping is required before the
-    // automatic durable-snapshot path is allowed to own the source state.
-    vmm_maps > 0
+fn host_snapshot_reconstructable(vmm_maps: usize, ordinary_allocs: usize) -> bool {
+    // Both paths restore at the golden virtual addresses. Ordinary CUDA
+    // allocations previously relied on RPC-boundary pointer translation, which
+    // could not repair embedded device pointers or TMA descriptors and made an
+    // ordinary-only snapshot unsafe. Exact-address VMM backing removes that
+    // distinction, so either memory class can durably own the frozen state.
+    vmm_maps > 0 || ordinary_allocs > 0
 }
 
 #[cfg(target_os = "linux")]
@@ -2195,6 +2197,11 @@ fn reconstruct_golden_memory(
             count += allocs.len();
             return Ok((count, vmm_trans));
         }
+        if ahost.is_some() {
+            return Err(io::Error::other(
+                "ordinary CUDA host snapshot could not reserve every golden address",
+            ));
+        }
         let mut trans: Vec<(u64, u64, u64)> = Vec::new();
         if let Some(sidx) = ahost {
             for &(d, sz, offset) in &allocs {
@@ -3674,12 +3681,9 @@ fn spawn_clone_worker(
             .chain(allocs.iter().map(|(_, size, _)| *size))
             .fold(0u64, u64::saturating_add);
         let memory_bearing = !maps.is_empty() || !allocs.is_empty();
-        // cudaMalloc pointers can be translated at the RPC boundary, but a
-        // device pointer embedded inside another device allocation cannot.
-        // A VMM layout supplies address-preserved storage for those structures;
-        // an ordinary-allocation-only process does not have a generic durable
-        // reconstruction contract, so keep its live golden as the safe source.
-        let snapshot_reconstructable = host_snapshot_reconstructable(maps.len());
+        // Every retained memory class must have an address-preserving restore
+        // contract before the host snapshot may replace its live golden source.
+        let snapshot_reconstructable = host_snapshot_reconstructable(maps.len(), allocs.len());
         #[cfg(target_os = "linux")]
         let host_snapshot = snapshot_requested
             && memory_bearing
@@ -3687,13 +3691,7 @@ fn spawn_clone_worker(
             && host_snapshot_capacity_available(snapshot_required);
         #[cfg(not(target_os = "linux"))]
         let host_snapshot = false;
-        if snapshot_requested && memory_bearing && !snapshot_reconstructable {
-            tracing::warn!(
-                token,
-                allocs = allocs.len(),
-                "keeping frozen golden resident for an ordinary-allocation-only CUDA layout"
-            );
-        } else if snapshot_requested && memory_bearing && !host_snapshot {
+        if snapshot_requested && memory_bearing && !host_snapshot {
             tracing::warn!(
                 token,
                 snapshot_required,
@@ -4290,9 +4288,10 @@ mod mps_tests {
     }
 
     #[test]
-    fn host_snapshot_requires_an_address_preserved_vmm_layout() {
-        assert!(!host_snapshot_reconstructable(0));
-        assert!(host_snapshot_reconstructable(1));
+    fn host_snapshot_requires_address_preserved_device_memory() {
+        assert!(!host_snapshot_reconstructable(0, 0));
+        assert!(host_snapshot_reconstructable(1, 0));
+        assert!(host_snapshot_reconstructable(0, 1));
     }
 
     #[test]
