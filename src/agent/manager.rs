@@ -1708,11 +1708,12 @@ impl AgentManager {
                 v.push(("SMOLVM_CUDA_VRAM_LIMIT_MB", limit_mib.to_string()));
             }
             // Some KVM kernels return a spurious ENOMEM when a one-vCPU VM
-            // enters KVM immediately after vCPU creation. The bundled libkrun
-            // handles this with one 5 ms delay before only the first KVM_RUN.
+            // enters KVM too soon after vCPU creation. Delay that first entry
+            // and retain bounded retries without delaying normal guest exits.
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             if resources_for_config.cpus == 1 {
                 v.push(("KRUN_FIRST_RUN_DELAY", "1".to_string()));
+                v.push(("KRUN_ENOMEM_RETRY", "1".to_string()));
             }
             // A CUDA fork clone must stay ptrace-readable by the same-uid daemon
             // /worker: the proc-mem live-RAM transport preads /proc/<pid>/mem for
