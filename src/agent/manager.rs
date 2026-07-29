@@ -1620,13 +1620,36 @@ impl AgentManager {
         &self,
         mounts: Vec<HostMount>,
         ports: Vec<PortMapping>,
-        resources: VmResources,
+        mut resources: VmResources,
         mut features: launcher::LaunchFeatures,
     ) -> Result<()> {
         use super::boot_config::BootConfig;
 
         let t_launch = Instant::now();
 
+        let cpu_policy = std::env::var("SMOLVM_CUDA_FORK_CPU_POLICY")
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .is_none_or(|value| !matches!(value.as_str(), "0" | "off" | "false" | "no"));
+        if cpu_policy {
+            if let Some(pool_size) = features.cuda_fork_pool_size.filter(|&size| size > 0) {
+                let host_cpus = std::thread::available_parallelism()
+                    .map(std::num::NonZeroUsize::get)
+                    .unwrap_or(1);
+                let configured = resources.cpus;
+                resources.cpus =
+                    crate::process::cuda_fork_pool_vcpus(configured, pool_size, host_cpus);
+                if resources.cpus < configured {
+                    tracing::info!(
+                        configured,
+                        effective = resources.cpus,
+                        pool_size,
+                        host_cpus,
+                        "auto-sized CUDA fork-pool vCPUs to avoid host oversubscription"
+                    );
+                }
+            }
+        }
         let resources_for_config = resources.clone();
         // Per-boot disk-prep (template copy). Formerly bounded by a process-wide
         // boot gate to avoid host-disk thrash on slow/shared storage; removed
@@ -1683,6 +1706,13 @@ impl AgentManager {
             }
             if let Some(limit_mib) = features.cuda_vram_limit_mib {
                 v.push(("SMOLVM_CUDA_VRAM_LIMIT_MB", limit_mib.to_string()));
+            }
+            // Some KVM kernels return a spurious ENOMEM when a one-vCPU VM
+            // enters KVM immediately after vCPU creation. The bundled libkrun
+            // handles this with one 5 ms delay before only the first KVM_RUN.
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            if resources_for_config.cpus == 1 {
+                v.push(("KRUN_FIRST_RUN_DELAY", "1".to_string()));
             }
             // A CUDA fork clone must stay ptrace-readable by the same-uid daemon
             // /worker: the proc-mem live-RAM transport preads /proc/<pid>/mem for

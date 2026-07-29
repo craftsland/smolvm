@@ -509,6 +509,19 @@ pub fn place_in_cgroup(root: &std::path::Path, vcpus: u8, memory_mib: u32) {
     );
 }
 
+/// Bound each CUDA fork-pool VM to its configured CPU count or an even share
+/// of the host, whichever is smaller. The frozen golden does not compete with
+/// its running clones, so the pool size—not pool size plus one—is the divisor.
+pub fn cuda_fork_pool_vcpus(configured: u8, pool_size: u32, host_cpus: usize) -> u8 {
+    let configured = configured.max(1);
+    if pool_size == 0 {
+        return configured;
+    }
+    let host_cpus = u32::try_from(host_cpus).unwrap_or(u32::MAX).max(1);
+    let per_clone = (host_cpus / pool_size).max(1).min(u32::from(u8::MAX)) as u8;
+    configured.min(per_clone)
+}
+
 // ============================================================================
 // Seccomp-BPF syscall allowlist for the VM boot subprocess
 //
@@ -2561,6 +2574,20 @@ extern "C" fn sigint_kill_handler(_sig: libc::c_int) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cuda_fork_pool_vcpus_avoids_host_oversubscription() {
+        assert_eq!(cuda_fork_pool_vcpus(4, 24, 26), 1);
+        assert_eq!(cuda_fork_pool_vcpus(4, 8, 26), 3);
+        assert_eq!(cuda_fork_pool_vcpus(2, 8, 26), 2);
+    }
+
+    #[test]
+    fn cuda_fork_pool_vcpus_handles_small_or_unplanned_hosts() {
+        assert_eq!(cuda_fork_pool_vcpus(4, 32, 8), 1);
+        assert_eq!(cuda_fork_pool_vcpus(0, 1, 0), 1);
+        assert_eq!(cuda_fork_pool_vcpus(4, 0, 26), 4);
+    }
 
     #[test]
     fn test_is_alive_self() {
