@@ -1565,6 +1565,35 @@ fn import_with_retry(b: &mut dyn Backend, fd: i32) -> Result<u64, i32> {
     Err(last)
 }
 
+/// Map an imported CUDA allocation, retrying the transient CUDA 801 failures
+/// observed when many MPS clients reconstruct a fork pool concurrently.
+#[cfg(unix)]
+fn map_import_with_retry(
+    b: &mut dyn Backend,
+    va: u64,
+    size: u64,
+    offset: u64,
+    handle: u64,
+) -> Result<(), i32> {
+    let mut last = 0;
+    for attempt in 0..5 {
+        match b.mem_map(va, size, offset, handle) {
+            Ok(()) => {
+                if attempt > 0 {
+                    tracing::info!(va, size, attempt, "M2: map succeeded on retry");
+                }
+                return Ok(());
+            }
+            Err(error) => {
+                last = error;
+                let _ = b.ctx_synchronize();
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+    Err(last)
+}
+
 #[cfg(unix)]
 fn read_host_snapshot(fd: i32, offset: u64, size: u64) -> io::Result<Vec<u8>> {
     let len = usize::try_from(size)
@@ -1861,32 +1890,41 @@ fn reconstruct_golden_memory(
         if share_weights && loaded {
             let mut ok = false;
             if let Ok(gh) = import_with_retry(b, 4 + idx) {
-                if b.mem_map(va, size, 0, gh).is_ok() {
-                    // READ-ONLY by default. A shared chunk is one the golden's
-                    // H2Ds wrote and nothing has touched since (verified at fork
-                    // time), so a clone has no business writing it. Mapping it
-                    // read-write means a post-fork base write — unsloth's
-                    // embedding fixup is a KERNEL write, invisible to the COW
-                    // path, which only sees explicit mem ops — silently races
-                    // across every clone sharing that physical (loss=nan).
-                    // Read-only makes that fail-stop instead: the write faults,
-                    // and since each clone worker owns its context the blast
-                    // radius is that one clone, with the shared bytes intact for
-                    // its siblings. A warmed golden never trips it (its writes
-                    // happen pre-fork, so verification already marked those
-                    // chunks private): measured 8/8 clean, 0 faults, same
-                    // 260-shared/160-private split as read-write.
-                    // SMOLVM_CUDA_SHARE_RO=0 restores read-write sharing.
-                    let set = if std::env::var("SMOLVM_CUDA_SHARE_RO").as_deref() == Ok("0") {
-                        b.mem_set_access(va, size, device)
-                    } else {
-                        b.mem_set_access_ro(va, size, device)
-                    };
-                    if set.is_ok() {
-                        ok = true;
-                    } else {
-                        let _ = b.mem_unmap(va, size); // roll back for the fallback
+                match map_import_with_retry(b, va, size, 0, gh) {
+                    Ok(()) => {
+                        // READ-ONLY by default. A shared chunk is one the golden's
+                        // H2Ds wrote and nothing has touched since (verified at fork
+                        // time), so a clone has no business writing it. Mapping it
+                        // read-write means a post-fork base write — unsloth's
+                        // embedding fixup is a KERNEL write, invisible to the COW
+                        // path, which only sees explicit mem ops — silently races
+                        // across every clone sharing that physical (loss=nan).
+                        // Read-only makes that fail-stop instead: the write faults,
+                        // and since each clone worker owns its context the blast
+                        // radius is that one clone, with the shared bytes intact for
+                        // its siblings. A warmed golden never trips it (its writes
+                        // happen pre-fork, so verification already marked those
+                        // chunks private): measured 8/8 clean, 0 faults, same
+                        // 260-shared/160-private split as read-write.
+                        // SMOLVM_CUDA_SHARE_RO=0 restores read-write sharing.
+                        let set = if std::env::var("SMOLVM_CUDA_SHARE_RO").as_deref() == Ok("0") {
+                            b.mem_set_access(va, size, device)
+                        } else {
+                            b.mem_set_access_ro(va, size, device)
+                        };
+                        if set.is_ok() {
+                            ok = true;
+                        } else {
+                            let _ = b.mem_unmap(va, size); // roll back for the fallback
+                        }
                     }
+                    Err(error) => tracing::warn!(
+                        error,
+                        idx,
+                        va,
+                        size,
+                        "M2-share: imported allocation map failed"
+                    ),
                 }
                 match (ok, golden_h) {
                     // Keep gh held and record golden→worker: the clone later
@@ -1945,30 +1983,52 @@ fn reconstruct_golden_memory(
                 ))
             })?;
         } else {
-            match import_with_retry(b, 4 + idx) {
-                Ok(gh) => {
-                    if let Ok(tmp) = b.mem_address_reserve(size, 0) {
-                        match b.mem_map(tmp, size, 0, gh) {
-                            Ok(()) => {
-                                if let Err(e) = b.mem_set_access(tmp, size, device) {
-                                    tracing::warn!(e, "M2: temp set_access failed");
-                                }
-                                if let Err(e) = b.memcpy_dtod(va, tmp, size) {
-                                    tracing::warn!(e, va, tmp, "M2: dtod copy failed");
-                                }
-                                // The copy must finish before we unmap the temp source,
-                                // or the in-flight copy faults on unmapped memory.
-                                let _ = b.ctx_synchronize();
-                                let _ = b.mem_unmap(tmp, size);
-                            }
-                            Err(e) => tracing::warn!(e, tmp, "M2: temp map failed"),
-                        }
-                        let _ = b.mem_address_free(tmp, size);
-                    }
-                    let _ = b.mem_release(gh);
-                }
-                Err(e) => tracing::warn!(e, idx, "M2: import failed"),
-            }
+            let gh = import_with_retry(b, 4 + idx).map_err(|error| {
+                io::Error::other(format!(
+                    "private CUDA snapshot import failed for range {idx}: {error}"
+                ))
+            })?;
+            let tmp = b.mem_address_reserve(size, 0).map_err(|error| {
+                io::Error::other(format!(
+                    "private CUDA snapshot temporary reservation failed at {va:#x}: {error}"
+                ))
+            })?;
+            map_import_with_retry(b, tmp, size, 0, gh).map_err(|error| {
+                io::Error::other(format!(
+                    "private CUDA snapshot temporary map failed at {va:#x}: {error}"
+                ))
+            })?;
+            b.mem_set_access(tmp, size, device).map_err(|error| {
+                io::Error::other(format!(
+                    "private CUDA snapshot temporary access failed at {va:#x}: {error}"
+                ))
+            })?;
+            b.memcpy_dtod(va, tmp, size).map_err(|error| {
+                io::Error::other(format!(
+                    "private CUDA snapshot copy failed at {va:#x}: {error}"
+                ))
+            })?;
+            // The copy must finish before unmapping the temporary source.
+            b.ctx_synchronize().map_err(|error| {
+                io::Error::other(format!(
+                    "private CUDA snapshot synchronization failed at {va:#x}: {error}"
+                ))
+            })?;
+            b.mem_unmap(tmp, size).map_err(|error| {
+                io::Error::other(format!(
+                    "private CUDA snapshot temporary unmap failed at {va:#x}: {error}"
+                ))
+            })?;
+            b.mem_address_free(tmp, size).map_err(|error| {
+                io::Error::other(format!(
+                    "private CUDA snapshot temporary release failed at {va:#x}: {error}"
+                ))
+            })?;
+            b.mem_release(gh).map_err(|error| {
+                io::Error::other(format!(
+                    "private CUDA snapshot handle release failed at {va:#x}: {error}"
+                ))
+            })?;
         }
         count += 1;
     }
@@ -2813,7 +2873,7 @@ fn route_clone_connection(
                     worker_pid = pid,
                     "warm dial: spawned clone process worker ahead of its first CUDA call"
                 );
-                maybe_evict_frozen_golden(*token, &options, &reg);
+                maybe_evict_frozen_golden(*token, options, &reg);
                 true
             }
             Err(e) => {
@@ -2986,7 +3046,7 @@ fn route_clone_connection(
                 share_weights,
                 "routed isolating clone to a worker process"
             );
-            maybe_evict_frozen_golden(token, &options, &reg);
+            maybe_evict_frozen_golden(token, options, &reg);
         }
         Err(e) => {
             // REJECT rather than serve in-process: this IS an isolating clone
