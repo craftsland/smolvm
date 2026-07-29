@@ -1360,6 +1360,16 @@ pub fn worker_alloc_trans_snapshot() -> Vec<(u64, u64, u64)> {
     WORKER_ALLOC_TRANS.lock().unwrap().clone()
 }
 
+fn alloc_trans_is_identity(trans: &[(u64, u64, u64)], dptr: u64) -> bool {
+    trans
+        .iter()
+        .any(|&(golden, _, worker)| golden == dptr && worker == dptr)
+}
+
+fn worker_identity_alloc(dptr: u64) -> bool {
+    alloc_trans_is_identity(&WORKER_ALLOC_TRANS.lock().unwrap(), dptr)
+}
+
 /// M3b: rebuild the golden's captured graphs in THIS worker's context and map
 /// each `(graph_vh, exec_vh)` to the rebuilt reals, so the clone's inherited
 /// `GraphLaunch` resolves. Kernel-node graphs only; a rebuild/instantiate
@@ -3619,7 +3629,15 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             sess.owned_dptrs.remove(&dptr);
             sess.alloc_table.lock().unwrap().remove(&dptr);
             // (removal returns the freed size to the quota ledger)
-            b.mem_free(dptr).map(|_| Response::Ok)
+            if sess.fork_clone && worker_identity_alloc(dptr) {
+                // Address-preserved ordinary allocations are subranges of
+                // larger VMM-backed regions. They cannot be individually
+                // cuMemFree'd; keep the region until worker teardown and make
+                // the inherited cudaFree report success to the guest.
+                Ok(Response::Ok)
+            } else {
+                b.mem_free(dptr).map(|_| Response::Ok)
+            }
         }
         Request::MemcpyHtoD { dptr, stream, data } => {
             mark_loaded(&sess.alloc_table, dptr); // H2D write → weight/read-only
@@ -4785,6 +4803,14 @@ mod tests {
             ..Session::default()
         };
         assert_eq!(session_vram_limit(&sess, 80 * gib), 10 * gib);
+    }
+
+    #[test]
+    fn identity_allocations_are_distinct_from_translated_copies() {
+        let trans = [(0x1000, 0x400, 0x1000), (0x2000, 0x400, 0x9000)];
+        assert!(alloc_trans_is_identity(&trans, 0x1000));
+        assert!(!alloc_trans_is_identity(&trans, 0x2000));
+        assert!(!alloc_trans_is_identity(&trans, 0x3000));
     }
 
     #[test]
