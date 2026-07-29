@@ -387,10 +387,44 @@ pub fn vm_dir_hash(name: &str) -> String {
 /// (`vm_cache_root()/<hash>`) no longer exists. The host owns the rootfs
 /// directory, so it can unlink the markers regardless of their file owner.
 /// Best-effort: I/O errors are ignored.
+///
+/// NOTE: this says the host "owns the rootfs directory", which is only true of
+/// the dev/tarball layout. A packaged install puts it under a root-owned prefix,
+/// where the unlink below silently fails — see [`ready_marker_unwritable`].
 pub fn prune_orphaned_ready_markers() {
     if let Ok(rootfs) = AgentManager::default_rootfs_path() {
         prune_orphaned_ready_markers_in(&rootfs, &vm_cache_root());
     }
+}
+
+/// Whether the ready marker's directory cannot be written by this process — i.e.
+/// the marker is impossible, not merely late.
+///
+/// The guest writes the marker through the virtiofs rootfs share, and the
+/// virtiofs server runs inside this process as the invoking user. So a rootfs
+/// directory this user cannot write makes the guest's `create()` fail with
+/// EACCES forever. Distro packages install that directory root-owned (e.g.
+/// `/usr/lib/smolvm/agent-rootfs`), which is precisely this case — it is the
+/// normal packaged layout, not a misconfiguration.
+///
+/// Uses `access(2)`: one syscall, and unlike a probe file it creates nothing in
+/// a directory we may not own.
+#[cfg(unix)]
+fn ready_marker_unwritable(marker: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Some(dir) = marker.parent() else {
+        return false;
+    };
+    let Ok(c_dir) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `c_dir` is a valid NUL-terminated string for the duration of the call.
+    unsafe { libc::access(c_dir.as_ptr(), libc::W_OK) != 0 }
+}
+
+#[cfg(not(unix))]
+fn ready_marker_unwritable(_marker: &Path) -> bool {
+    false
 }
 
 /// Path-injectable core of [`prune_orphaned_ready_markers`] (unit-testable).
@@ -2393,7 +2427,6 @@ impl AgentManager {
     fn wait_for_ready(&self) -> Result<()> {
         let timeout = AGENT_READY_TIMEOUT;
         let start = Instant::now();
-        let socket_probe_grace = Duration::from_secs(5);
 
         tracing::debug!("waiting for agent to be ready");
 
@@ -2436,6 +2469,11 @@ impl AgentManager {
         }
 
         let ready_marker = self.ready_marker_path();
+        // Socket probing cadence. The marker is a 1ms stat; a connect+ping is
+        // heavier, so pace it — 20ms is what the fork-clone path above already
+        // uses, and it costs at most ~20ms of the ~320ms boot.
+        const SOCKET_PROBE_INTERVAL: Duration = Duration::from_millis(20);
+        let mut next_socket_probe = Duration::ZERO;
 
         while start.elapsed() < timeout {
             // Check if child process is still alive
@@ -2470,39 +2508,59 @@ impl AgentManager {
                 return Ok(());
             }
 
-            // After long grace, fall back to socket ping. This is the intended
-            // path only for pre-marker agents; for a current agent the marker
-            // never appearing is a real fault (e.g. a Landlock rule denying the
-            // marker write — see internal_boot.rs) that silently cost us the
-            // whole probe grace. Logged at WARN so the degradation can't hide.
-            if start.elapsed() >= socket_probe_grace && self.vsock_socket.exists() {
+            let elapsed = start.elapsed();
+
+            // Probe the agent's socket ALONGSIDE the marker, from t=0 — never as
+            // a delayed fallback. The socket becomes pingable at the same instant
+            // the marker appears (both ~320ms, measured), so gating the probe
+            // behind a grace period bought nothing and cost the full grace to
+            // anyone whose marker cannot be written.
+            //
+            // That is not a corner case: the guest writes the marker into the
+            // virtiofs rootfs share, and the virtiofs server runs in this process
+            // as the invoking user. Any install whose rootfs directory is not
+            // user-writable — every distro package installs it root-owned, e.g.
+            // /usr/lib/smolvm/agent-rootfs — makes the guest's create() fail with
+            // EACCES, so the marker can NEVER appear and every boot paid the
+            // grace. The marker stays as a cheap fast path; it is no longer the
+            // only signal.
+            if elapsed >= next_socket_probe && self.vsock_socket.exists() {
+                next_socket_probe = elapsed + SOCKET_PROBE_INTERVAL;
                 if let Ok(mut client) =
                     super::AgentClient::connect_with_boot_probe_timeout(&self.vsock_socket)
                 {
                     if client.ping().is_ok() {
-                        let elapsed = start.elapsed();
-                        let landlock = std::env::var("SMOLVM_LANDLOCK").unwrap_or_default();
-                        tracing::warn!(
-                            elapsed_ms = elapsed.as_millis(),
-                            landlock = %landlock,
-                            "agent ready via SOCKET FALLBACK — ready marker never appeared; \
-                             boot was delayed by the probe grace. If a current agent, this is a \
-                             fault (under SMOLVM_LANDLOCK=enforce the ready-marker carve-out in \
-                             internal_boot.rs is likely broken)"
-                        );
+                        // The agent answers, so readiness is real either way. Say
+                        // WHY the marker lost, and only complain when it is a
+                        // genuine fault rather than a benign race.
+                        if ready_marker_unwritable(&ready_marker) {
+                            tracing::warn!(
+                                elapsed_ms = elapsed.as_millis(),
+                                marker = %ready_marker.display(),
+                                "agent ready via socket; the ready marker cannot be written \
+                                 because its directory is not writable by this user (a \
+                                 root-owned install prefix does this). Boot still works, but \
+                                 the marker fast path is dead — make the agent-rootfs \
+                                 directory writable by the user running smolvm"
+                            );
+                        } else {
+                            tracing::info!(
+                                elapsed_ms = elapsed.as_millis(),
+                                "agent ready (socket)"
+                            );
+                        }
                         return Ok(());
                     }
                 }
-            } else {
-                // 1ms polling during first second for sub-interval boot timing resolution;
-                // 5ms thereafter to avoid burning CPU while waiting on slow starts.
-                let poll_ms = if start.elapsed() < Duration::from_secs(1) {
-                    1
-                } else {
-                    5
-                };
-                std::thread::sleep(Duration::from_millis(poll_ms));
             }
+            // 1ms polling during first second for sub-interval boot timing resolution;
+            // 5ms thereafter to avoid burning CPU while waiting on slow starts.
+            let poll_ms = if elapsed < Duration::from_secs(1) {
+                1
+            } else {
+                5
+            };
+            std::thread::sleep(Duration::from_millis(poll_ms));
         }
 
         Err(Error::agent(
@@ -2655,6 +2713,53 @@ fn boot_failure_reason(exit_code: Option<i32>, startup_log: Option<&str>) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The distro-package case: the rootfs directory is not writable by the user
+    // running smolvm, so the guest's marker write can never succeed. Detecting
+    // this is what lets the warning name the real cause instead of blaming
+    // Landlock (which is uninvolved — issue #700).
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritable_marker_directory_is_detected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join(".smolvm-ready.abc");
+        assert!(
+            !ready_marker_unwritable(&marker),
+            "a writable dir must not be flagged"
+        );
+
+        let mut perms = std::fs::metadata(dir.path())
+            .expect("metadata")
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o555);
+        std::fs::set_permissions(dir.path(), perms).expect("chmod");
+
+        // root ignores directory write bits, so this assertion only holds
+        // unprivileged; skip it when the suite runs as root.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(
+                ready_marker_unwritable(&marker),
+                "a read-only dir must be flagged"
+            );
+        }
+
+        let mut perms = std::fs::metadata(dir.path())
+            .expect("metadata")
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(dir.path(), perms).expect("restore");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_marker_directory_is_not_reported_as_unwritable() {
+        // No parent to test means we cannot claim a permission fault; stay quiet
+        // rather than emit a misleading warning.
+        assert!(ready_marker_unwritable(Path::new(
+            "/nonexistent-dir-for-test/.smolvm-ready.x"
+        )));
+        assert!(!ready_marker_unwritable(Path::new("/")));
+    }
 
     #[test]
     fn vm_dir_hash_is_deterministic() {
