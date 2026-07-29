@@ -18,6 +18,14 @@
 //! probe can never break docker.io/GHCR/other-registry images. Only a pull
 //! failure AFTER a positive probe is an error — falling back at that point
 //! would just reproduce the disk-fill.
+//!
+//! An AUTH denial is the uncomfortable case. It does NOT mean "not a pack"; it
+//! means "I couldn't look". Falling back is still right — the in-guest puller
+//! resolves credentials from a different settings section and may have one the
+//! probe lacked — but it is logged at WARN naming the missing credential,
+//! because when the in-guest pull has no credential either, its `crane ... 401`
+//! is the only thing the user sees and it explains nothing. See
+//! `RCA-tenant-image-pull-401-2026-07-26.md`.
 
 use crate::{Error, Result};
 use std::path::PathBuf;
@@ -26,6 +34,87 @@ use std::path::PathBuf;
 /// (`application/vnd.smolmachines.smolmachine.v1` today; treat the vendor
 /// prefix as the trigger so future versions route the same way).
 pub const PACK_MEDIA_TYPE_PREFIX: &str = "application/vnd.smolmachines.";
+
+/// A credential for the pack probe, in whichever form `RegistryClient` accepts.
+enum ProbeCredential {
+    /// Upstream JWT exchanged at the registry's token service.
+    Identity(String),
+    /// A bearer sent straight to the registry (legacy `username = "token"`).
+    Bearer(String),
+    Basic {
+        username: String,
+        password: String,
+    },
+}
+
+impl ProbeCredential {
+    fn apply(self, client: smolvm_registry::RegistryClient) -> smolvm_registry::RegistryClient {
+        match self {
+            Self::Identity(t) => client.with_identity_token(t),
+            Self::Bearer(t) => client.with_token(t),
+            Self::Basic { username, password } => client.with_basic_credentials(username, password),
+        }
+    }
+}
+
+/// Pull a configured credential for `registry` out of one settings section.
+fn credential_from(
+    config: &crate::registry::RegistryConfig,
+    registry: &str,
+) -> Option<ProbeCredential> {
+    if let Some(token) = config
+        .registries
+        .get(registry)
+        .and_then(|e| e.identity_token.clone())
+    {
+        return Some(ProbeCredential::Identity(token));
+    }
+    let auth = config.get_credentials(registry)?;
+    if auth.username == "token" {
+        // Legacy direct-bearer convention: the password IS the bearer.
+        Some(ProbeCredential::Bearer(auth.password))
+    } else {
+        Some(ProbeCredential::Basic {
+            username: auth.username,
+            password: auth.password,
+        })
+    }
+}
+
+/// Find a credential for `registry`, preferring the `machines` section but
+/// falling back to `images`.
+///
+/// The two sections exist because a `.smolmachine` artifact registry and a
+/// container-image registry are usually different things. But ONE host can
+/// serve both — ours does — and a reference alone doesn't say which it is; the
+/// probe is what finds out. Consulting only `machines` means a user who logged
+/// in for image pulls gets an unauthenticated probe, a 401, and a fall-through
+/// to the in-guest pull, whose failure names nothing useful. Both sections are
+/// the same user's credentials for the same host they typed, so trying the
+/// other one crosses no trust boundary — it only removes a trap where a
+/// credential the user has already provided goes unused.
+fn configured_credential(
+    settings: &crate::settings::SmolSettings,
+    registry: &str,
+) -> Option<ProbeCredential> {
+    credential_from(&settings.machines, registry)
+        .or_else(|| credential_from(&settings.images, registry))
+}
+
+/// Whether a registry error means "you are not authorized" rather than
+/// "something went wrong". These are the failures a missing or unscoped pull
+/// credential produces, and the only ones worth shouting about when the probe
+/// falls back — every other failure really is best-effort noise.
+fn is_auth_denial(err: &smolvm_registry::RegistryError) -> bool {
+    matches!(
+        err,
+        smolvm_registry::RegistryError::Authentication { .. }
+            | smolvm_registry::RegistryError::ApiError {
+                status: 401 | 403,
+                ..
+            }
+    )
+}
 
 /// Whether a (platform-resolved) OCI manifest describes a smolmachine pack:
 /// any layer whose mediaType carries the smolmachines vendor prefix.
@@ -123,17 +212,8 @@ pub async fn resolve_pack_ref(
     let mut client = smolvm_registry::RegistryClient::new(base_url);
     if let Some(token) = identity_token {
         client = client.with_identity_token(token.to_string());
-    } else if let Some(entry) = settings.machines.registries.get(&parsed.registry) {
-        if let Some(ref token) = entry.identity_token {
-            client = client.with_identity_token(token.clone());
-        } else if let Some(auth) = settings.machines.get_credentials(&parsed.registry) {
-            if auth.username == "token" {
-                // Legacy direct-bearer convention: the password IS the bearer.
-                client = client.with_token(auth.password);
-            } else {
-                client = client.with_basic_credentials(auth.username, auth.password);
-            }
-        }
+    } else if let Some(cred) = configured_credential(&settings, &parsed.registry) {
+        client = cred.apply(client);
     }
 
     let repo = parsed.repository();
@@ -148,7 +228,26 @@ pub async fn resolve_pack_ref(
         Err(e) => {
             // Fail open: an unreachable/denying registry falls back to the
             // in-guest pull, which reports its own (authoritative) error.
-            tracing::debug!(image = %image, error = %e, "pack probe failed; using in-guest pull");
+            //
+            // An AUTH denial is logged loudly rather than at debug. It means the
+            // probe held no usable credential for this repository, and the
+            // in-guest puller resolves credentials from a DIFFERENT settings
+            // section (`images` vs `machines`) — so it may or may not have one.
+            // When it doesn't, the customer's only symptom is an opaque
+            // `crane manifest failed: ... 401` with no hint that the real cause
+            // was a missing pull token. Naming it here is the difference between
+            // a one-line diagnosis and an outage investigation.
+            if is_auth_denial(&e) {
+                tracing::warn!(
+                    image = %image,
+                    error = %e,
+                    "registry denied the pack probe: no usable credential for this \
+                     repository. Falling back to the in-guest pull, which will fail \
+                     the same way unless it has separate credentials configured."
+                );
+            } else {
+                tracing::debug!(image = %image, error = %e, "pack probe failed; using in-guest pull");
+            }
             return Ok(None);
         }
     };
@@ -245,5 +344,236 @@ mod tests {
         assert!(is_docker_hub("index.docker.io"));
         assert!(is_docker_hub("registry-1.docker.io"));
         assert!(!is_docker_hub("registry.smolmachines.com"));
+    }
+
+    /// Build a settings object with a direct-bearer credential for `registry`
+    /// in whichever section the caller names.
+    fn settings_with_credential(
+        section: fn(&mut crate::settings::SmolSettings) -> &mut crate::registry::RegistryConfig,
+        registry: &str,
+        password: &str,
+    ) -> crate::settings::SmolSettings {
+        let mut settings = crate::settings::SmolSettings::default();
+        let entry = crate::registry::RegistryEntry {
+            username: Some("token".to_string()),
+            password: Some(password.to_string()),
+            ..Default::default()
+        };
+        section(&mut settings)
+            .registries
+            .insert(registry.to_string(), entry);
+        settings
+    }
+
+    #[test]
+    fn a_probe_credential_falls_back_to_the_image_section() {
+        const REG: &str = "registry.smolmachines.com";
+
+        // Configured under `machines` — the section a pack probe expects.
+        let s = settings_with_credential(|s| &mut s.machines, REG, "from-machines");
+        assert!(matches!(
+            configured_credential(&s, REG),
+            Some(ProbeCredential::Bearer(t)) if t == "from-machines"
+        ));
+
+        // Configured only under `images`. One host can serve both artifact
+        // kinds, and the user already gave us a credential for it — using it
+        // beats an anonymous probe that 401s and fails over to an error message
+        // naming nothing useful.
+        let s = settings_with_credential(|s| &mut s.images, REG, "from-images");
+        assert!(matches!(
+            configured_credential(&s, REG),
+            Some(ProbeCredential::Bearer(t)) if t == "from-images"
+        ));
+
+        // `machines` still wins when both are present.
+        let mut s = settings_with_credential(|s| &mut s.machines, REG, "from-machines");
+        s.images.registries.insert(
+            REG.to_string(),
+            crate::registry::RegistryEntry {
+                username: Some("token".to_string()),
+                password: Some("from-images".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            configured_credential(&s, REG),
+            Some(ProbeCredential::Bearer(t)) if t == "from-machines"
+        ));
+    }
+
+    #[test]
+    fn a_credential_is_never_borrowed_across_registries() {
+        // The fallback crosses SECTIONS, never HOSTS: a credential for one
+        // registry must not be presented to a different one.
+        let s = settings_with_credential(|s| &mut s.images, "ghcr.io", "ghcr-secret");
+        assert!(configured_credential(&s, "registry.smolmachines.com").is_none());
+        assert!(configured_credential(&s, "docker.io").is_none());
+        assert!(configured_credential(&s, "ghcr.io").is_some());
+    }
+
+    #[test]
+    fn auth_denials_are_distinguished_from_ordinary_probe_failures() {
+        use smolvm_registry::RegistryError;
+
+        // A missing/unscoped credential — the case worth warning about.
+        assert!(is_auth_denial(&RegistryError::Authentication {
+            message: "no token".into()
+        }));
+        assert!(is_auth_denial(&RegistryError::ApiError {
+            status: 401,
+            body: "UNAUTHORIZED".into()
+        }));
+        assert!(is_auth_denial(&RegistryError::ApiError {
+            status: 403,
+            body: "DENIED".into()
+        }));
+
+        // Ordinary best-effort noise stays at debug: a 404 means the ref really
+        // isn't there, and a 500 means the registry is unwell — neither implies
+        // a credential problem.
+        assert!(!is_auth_denial(&RegistryError::ApiError {
+            status: 404,
+            body: "NAME_UNKNOWN".into()
+        }));
+        assert!(!is_auth_denial(&RegistryError::ApiError {
+            status: 500,
+            body: "boom".into()
+        }));
+        assert!(!is_auth_denial(&RegistryError::InvalidManifest(
+            "garbage".into()
+        )));
+    }
+
+    /// Sentinel the tests hand in as the minted pull token, so the stub can tell
+    /// an authenticated probe from an anonymous one by content rather than by
+    /// the mere presence of an `Authorization` header (the client always ends up
+    /// sending SOME bearer once it has danced with the token realm).
+    const TEST_IDENTITY_TOKEN: &str = "minted-pull-token-sentinel";
+
+    /// Stub of the smolmachines registry + its token service, wired the way prod
+    /// is: a private repo 401s with a `WWW-Authenticate` challenge, and the realm
+    /// it advertises points back at this same stub (so the probe never leaves the
+    /// test). The token service always issues a token; the registry always 401s,
+    /// modelling a repo the caller has no grant for.
+    ///
+    /// Returns the bound address, plus flags for "a request arrived" and "the
+    /// identity token reached the token service".
+    async fn stub_private_registry() -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let saw_request = Arc::new(AtomicBool::new(false));
+        let saw_identity_token = Arc::new(AtomicBool::new(false));
+        let (req, ident, realm) = (
+            saw_request.clone(),
+            saw_identity_token.clone(),
+            addr.clone(),
+        );
+
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let (req, ident, realm) = (req.clone(), ident.clone(), realm.clone());
+                tokio::spawn(async move {
+                    // reqwest keeps the connection alive, so serve in a loop.
+                    loop {
+                        let mut buf = [0u8; 8192];
+                        let n = match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                        req.store(true, Ordering::SeqCst);
+                        if head.contains(TEST_IDENTITY_TOKEN) {
+                            ident.store(true, Ordering::SeqCst);
+                        }
+
+                        let resp = if head.starts_with("GET /v2/auth") {
+                            let body = r#"{"access_token":"stub-access","token":"stub-access"}"#;
+                            format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                                 content-length: {}\r\n\r\n{body}",
+                                body.len()
+                            )
+                        } else {
+                            // The shape prod returns for a private repo, with the
+                            // realm pointed back at this stub.
+                            let body =
+                                r#"{"code":"UNAUTHORIZED","message":"authentication required"}"#;
+                            format!(
+                                "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\n\
+                                 www-authenticate: Bearer realm=\"http://{realm}/v2/auth\",service=\"{realm}\"\r\n\
+                                 content-length: {}\r\n\r\n{body}",
+                                body.len()
+                            )
+                        };
+                        if sock.write_all(resp.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        (addr, saw_request, saw_identity_token)
+    }
+
+    /// Regression guard for the outage that blocked a tenant's private packs:
+    /// with no identity token the probe goes out ANONYMOUS, the registry
+    /// correctly 401s, and the probe reports "not a pack" — handing a private
+    /// `.smolmachine` to the in-guest OCI puller, which has no credentials
+    /// either and dies with an opaque `crane manifest failed: ... 401`.
+    ///
+    /// The fail-open is right for third-party registries (a 401 there really
+    /// does mean "I can't tell, let the in-guest puller try"), so this test
+    /// pins the CURRENT behavior as the thing a fix must change deliberately.
+    #[tokio::test]
+    async fn an_unauthorized_probe_is_swallowed_as_not_a_pack() {
+        use std::sync::atomic::Ordering;
+
+        let (addr, saw_request, saw_identity_token) = stub_private_registry().await;
+        let image = format!("{addr}/tenants/tenant-abc/e2smoke:v1");
+
+        let resolved = resolve_pack_ref(&image, None, &[]).await.unwrap();
+
+        assert!(
+            saw_request.load(Ordering::SeqCst),
+            "the probe must actually reach the registry, else this proves nothing"
+        );
+        assert!(
+            !saw_identity_token.load(Ordering::SeqCst),
+            "no token was supplied, so nothing tenant-scoped went to the token service"
+        );
+        assert_eq!(
+            resolved, None,
+            "the 401 is swallowed as 'not a pack' and the caller falls through to \
+             the in-guest pull — which is where the opaque crane 401 comes from"
+        );
+    }
+
+    /// The other half: a supplied identity token DOES reach the token service.
+    /// The engine side was never the blocker — the control plane simply never
+    /// minted a token for an `image`-typed source.
+    #[tokio::test]
+    async fn a_supplied_identity_token_reaches_the_token_service() {
+        use std::sync::atomic::Ordering;
+
+        let (addr, saw_request, saw_identity_token) = stub_private_registry().await;
+        let image = format!("{addr}/tenants/tenant-abc/e2smoke:v1");
+
+        let _ = resolve_pack_ref(&image, Some(TEST_IDENTITY_TOKEN), &[]).await;
+
+        assert!(saw_request.load(Ordering::SeqCst));
+        assert!(
+            saw_identity_token.load(Ordering::SeqCst),
+            "a supplied identity token must be exchanged at the token service"
+        );
     }
 }

@@ -7,7 +7,7 @@ mod cli;
 
 /// smolvm - build and run portable, self-contained virtual machines
 #[derive(Parser, Debug)]
-#[command(name = "smolvm")]
+#[command(name = "smolvm", bin_name = "smolvm")]
 #[command(
     about = "Build and run portable, self-contained virtual machines",
     after_help = "Agents: run `smolvm --help` for full documentation including CLI reference and Smolfile schema"
@@ -61,6 +61,13 @@ enum Commands {
         fd: i32,
     },
 
+    /// Internal: own an NVIDIA MPS controller until the CUDA daemon exits
+    #[command(name = "_cuda-mps-supervisor", hide = true)]
+    CudaMpsSupervisor {
+        /// Bidirectional lifecycle fd handed over by the CUDA daemon
+        fd: i32,
+    },
+
     /// Internal: clean up an ephemeral VM after its command exits (not for direct use)
     #[command(name = "_cleanup-ephemeral", hide = true)]
     CleanupEphemeral {
@@ -71,6 +78,33 @@ enum Commands {
         /// Process start time for PID-reuse verification (0 = unknown, skips strict check)
         start_time: u64,
     },
+}
+
+/// Executable file stems that are a normal smolvm install, not a packed stub
+/// that lost its sidecar.
+///
+/// `smolvm-bin` is the real binary the installer lays down; the `smolvm` on the
+/// user's PATH is a launcher script that sets the library path and `exec`s it.
+/// So on every ordinary invocation `current_exe()` is `smolvm-bin`, and treating
+/// that as suspicious means warning every user on every command.
+const PLAIN_CLI_NAMES: [&str; 2] = ["smolvm", "smolvm-bin"];
+
+/// The "you appear to be a packed stub without its assets" note, or `None` when
+/// this executable name is a normal install.
+///
+/// Split out from `main` so the name rule is testable — the regression this
+/// guards against (warning on the shipped `smolvm-bin`) is invisible in a unit
+/// test of anything coarser.
+fn stray_stub_note(exe_stem: &str) -> Option<String> {
+    if PLAIN_CLI_NAMES.contains(&exe_stem) {
+        return None;
+    }
+    Some(format!(
+        "note: no packed assets found for '{exe_stem}' (looked for a \
+         '{exe_stem}.smolmachine' sidecar next to the executable); \
+         running as the plain smolvm CLI. If this is a packed \
+         binary, keep its .smolmachine file alongside it."
+    ))
 }
 
 fn main() {
@@ -97,7 +131,10 @@ fn main() {
             .nth(1)
             .as_deref()
             .and_then(|s| s.to_str()),
-        Some("_boot-vm") | Some("_cuda-daemon") | Some("_cuda-clone-worker")
+        Some("_boot-vm")
+            | Some("_cuda-daemon")
+            | Some("_cuda-clone-worker")
+            | Some("_cuda-mps-supervisor")
     );
     if !internal {
         if let Some(mode) = smolvm_pack::detect_packed_mode() {
@@ -106,19 +143,14 @@ fn main() {
         // A packed stub separated from its `.smolmachine` sidecar is
         // byte-identical to the plain CLI, so detection can't hard-fail —
         // but silently becoming a different program strands users (QA
-        // BUG-167). A non-`smolvm` executable name is the tell: say what
+        // BUG-167). An unexpected executable name is the tell: say what
         // happened before falling through to the normal CLI.
         let exe_name = std::env::current_exe()
             .ok()
             .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()));
         if let Some(name) = exe_name {
-            if name != "smolvm" {
-                eprintln!(
-                    "note: no packed assets found for '{name}' (looked for a \
-                     '{name}.smolmachine' sidecar next to the executable); \
-                     running as the plain smolvm CLI. If this is a packed \
-                     binary, keep its .smolmachine file alongside it."
-                );
+            if let Some(note) = stray_stub_note(&name) {
+                eprintln!("{note}");
             }
         }
     }
@@ -155,6 +187,15 @@ fn main() {
         Commands::CudaCloneWorker { .. } => Err(smolvm::Error::Io(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "the CUDA clone worker is unix-only",
+        ))),
+        #[cfg(target_os = "linux")]
+        Commands::CudaMpsSupervisor { fd } => {
+            smolvm::cuda_daemon::run_mps_supervisor(fd).map_err(smolvm::Error::Io)
+        }
+        #[cfg(not(target_os = "linux"))]
+        Commands::CudaMpsSupervisor { .. } => Err(smolvm::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "NVIDIA MPS supervision is Linux-only",
         ))),
         Commands::CleanupEphemeral {
             vm_name,
@@ -205,5 +246,36 @@ fn init_logging() {
             .with_env_filter(filter)
             .with_target(false)
             .init();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_shipped_binary_name_is_not_flagged() {
+        // The regression this file exists to prevent: install.sh ships
+        // `smolvm-bin` behind a `smolvm` launcher, so flagging it printed a
+        // note on EVERY command of a correct install (shipped in 1.7.0).
+        assert_eq!(stray_stub_note("smolvm-bin"), None);
+    }
+
+    #[test]
+    fn the_launcher_name_is_not_flagged() {
+        assert_eq!(stray_stub_note("smolvm"), None);
+    }
+
+    #[test]
+    fn a_renamed_stub_is_still_flagged() {
+        let note = stray_stub_note("myapp").expect("a foreign name should warn");
+        assert!(
+            note.contains("myapp.smolmachine"),
+            "names the sidecar to add"
+        );
+        assert!(
+            note.contains("plain smolvm CLI"),
+            "says what it fell back to"
+        );
     }
 }

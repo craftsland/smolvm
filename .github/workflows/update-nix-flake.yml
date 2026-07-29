@@ -56,7 +56,17 @@ jobs:
           git add nix/smolvm.nix
           git commit -m "chore(nix): bump flake to ${ver}"
           git push -f origin "$branch"
-          gh pr create --base main --head "$branch" \
-            --title "chore(nix): bump flake to ${ver}" \
-            --body "Automated bump of nix/smolvm.nix to ${ver} (version + per-arch SRI hashes)." \
-            || gh pr edit "$branch" --title "chore(nix): bump flake to ${ver}"
+          title="chore(nix): bump flake to ${ver}"
+          body="Automated bump of nix/smolvm.nix to ${ver} (version + per-arch SRI hashes)."
+          # Opening the PR is best-effort: the default GITHUB_TOKEN can't create PRs
+          # unless the repo's "Allow GitHub Actions to create and approve pull requests"
+          # setting is on. The bump branch is already pushed, so don't red-fail the
+          # release over a blocked create — update an existing PR if there is one, else
+          # surface a one-click compare link and exit clean.
+          if gh pr create --base main --head "$branch" --title "$title" --body "$body"; then
+            echo "Opened bump PR for $branch"
+          elif gh pr edit "$branch" --title "$title" >/dev/null 2>&1; then
+            echo "Updated existing bump PR for $branch"
+          else
+            echo "::warning title=nix bump PR not opened::GITHUB_TOKEN is blocked from creating PRs; branch '${branch}' is pushed — open it at ${{ github.server_url }}/${{ github.repository }}/compare/main...${branch}?expand=1"
+          fi

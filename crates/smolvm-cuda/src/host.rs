@@ -14,7 +14,7 @@
 use crate::proto::{
     decode_request, encode_request, encode_response, fnv64, read_msg, write_msg, Request, Response,
 };
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 use std::io::{Read, Write};
 
 /// `Ok(value)` or `Err(CUresult)` — a non-zero CUDA error code.
@@ -1009,6 +1009,26 @@ pub fn layout_tokens() -> Vec<u64> {
     seen.into_iter().map(|(_, t)| t).collect()
 }
 
+/// Whether two lineage tokens belong to channels of the same guest process.
+///
+/// A process shares one [`GoldenLayout`] across all of its CUDA connections.
+/// Distinct processes in the same VM (for example an SFT preprocessing child
+/// and the trainer) register distinct layouts and must never share one clone
+/// worker/context.
+pub fn layout_handoff_same_process(a: u64, b: u64) -> bool {
+    let reg = LAYOUT_HANDOFF.lock().unwrap();
+    let Some(reg) = reg.as_ref() else {
+        return false;
+    };
+    let Some(a) = reg.get(&a).and_then(|w| w.upgrade()) else {
+        return false;
+    };
+    let Some(b) = reg.get(&b).and_then(|w| w.upgrade()) else {
+        return false;
+    };
+    std::sync::Arc::ptr_eq(&a, &b)
+}
+
 /// P3b: snapshot the golden's capture-replay op-logs for a clone worker,
 /// `(graph_vh, exec_vh, ordered op payloads)`. Separate from
 /// [`module_handoff_snapshot`] so its 6-tuple stays stable.
@@ -1024,23 +1044,51 @@ pub fn graph_oplogs_snapshot(token: u64) -> GraphOplogs {
     }
 }
 
-/// P3b worker: install inherited capture-replay logs for this clone. Drained
-/// into the serving session at clone resume; replayed lazily at first launch.
+/// Install inherited capture-replay logs for this clone. The logs remain
+/// process-global and immutable so every late-attached CUDA channel can lazily
+/// rebuild a graph the first channel has not used yet.
 pub fn set_worker_graph_oplogs(v: GraphOplogs) {
-    WORKER_GRAPH_OPLOGS.with(|r| *r.borrow_mut() = v);
+    *WORKER_GRAPH_OPLOGS.lock().unwrap() = Some(std::sync::Arc::new(v));
 }
 
-thread_local! {
-    static WORKER_GRAPH_OPLOGS: std::cell::RefCell<GraphOplogs> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
+static WORKER_GRAPH_OPLOGS: std::sync::Mutex<Option<std::sync::Arc<GraphOplogs>>> =
+    std::sync::Mutex::new(None);
 
-fn take_worker_graph_oplogs() -> GraphOplogs {
-    WORKER_GRAPH_OPLOGS.with(|r| std::mem::take(&mut *r.borrow_mut()))
+fn worker_graph_oplog(exec_vh: u64) -> Option<Vec<Vec<u8>>> {
+    WORKER_GRAPH_OPLOGS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|logs| {
+            logs.iter()
+                .find(|(_, exec, _)| *exec == exec_vh)
+                .map(|(_, _, ops)| ops.clone())
+        })
 }
 
 fn worker_graph_oplogs_peek() -> GraphOplogs {
-    WORKER_GRAPH_OPLOGS.with(|r| r.borrow().clone())
+    WORKER_GRAPH_OPLOGS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|logs| logs.as_ref().clone())
+        .unwrap_or_default()
+}
+
+fn worker_graph_oplogs_len() -> usize {
+    WORKER_GRAPH_OPLOGS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map_or(0, |logs| logs.len())
+}
+
+fn prereplay_setting(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some("1" | "true" | "on" | "yes"))
+}
+
+fn prereplay_enabled() -> bool {
+    prereplay_setting(std::env::var("SMOLVM_CUDA_PREREPLAY").ok().as_deref())
 }
 
 /// P3b: pre-warm a clone worker at SPAWN, before any guest channel attaches —
@@ -1049,9 +1097,11 @@ fn worker_graph_oplogs_peek() -> GraphOplogs {
 /// results at resume instead of paying reload/re-capture on the guest's first
 /// CUDA call. Must run on the worker main thread AFTER module staging and
 /// lib-handle replay (their thread-locals seed the scratch session).
-/// Opt out: SMOLVM_CUDA_PREREPLAY=0.
+/// Opt in: SMOLVM_CUDA_PREREPLAY=1. Replaying every captured shape can execute
+/// stale/unneeded buffers and poison the context; lazy first-launch replay is
+/// the safe default.
 pub fn prewarm_clone_worker(b: &mut dyn Backend) {
-    if std::env::var("SMOLVM_CUDA_PREREPLAY").as_deref() == Ok("0") {
+    if !prereplay_enabled() {
         return;
     }
     let t0 = std::time::Instant::now();
@@ -1872,6 +1922,27 @@ pub fn serve<S: Read + Write>(stream: S, backend: &mut dyn Backend) -> std::io::
     r
 }
 
+/// Execute one fire-and-forget request unless an earlier request in the same
+/// deferred batch already failed. Continuing after a failed handle create can
+/// feed its never-created virtual handle into a dependent driver call before
+/// the next fence reports the sticky error; libcuda may dereference such an
+/// opaque handle instead of returning a second clean error.
+fn dispatch_quiet(
+    sess: &mut Session,
+    backend: &mut dyn Backend,
+    req: Request,
+    quiet_sticky: &mut i32,
+) -> (i32, Response) {
+    if *quiet_sticky != 0 {
+        return (*quiet_sticky, Response::Ok);
+    }
+    let result = dispatch(sess, backend, req);
+    if result.0 != 0 {
+        *quiet_sticky = result.0;
+    }
+    result
+}
+
 fn serve_inner<S: Read + Write>(
     mut stream: S,
     backend: &mut dyn Backend,
@@ -1896,12 +1967,9 @@ fn serve_inner<S: Read + Write>(
                         libcall_tag(&payload[1..])
                     );
                 }
-                let (status, _) = dispatch(sess, backend, req);
+                let (status, _) = dispatch_quiet(sess, backend, req, &mut quiet_sticky);
                 if status != 0 && std::env::var_os("SMOLVM_CUDA_HOST_OPLOG").is_some() {
                     eprintln!("[op~!] status={status}");
-                }
-                if status != 0 && quiet_sticky == 0 {
-                    quiet_sticky = status;
                 }
             }
             // Fence: report (and clear) the sticky quiet failure.
@@ -2338,19 +2406,14 @@ fn serve_rings<S: Read + Write>(
                     prof.decode += t_dec.elapsed().as_micros();
                 }
                 let t_exec = std::time::Instant::now();
-                let (status, _) = dispatch(sess, backend, req);
+                let (status, _) = dispatch_quiet(sess, backend, req, &mut quiet_sticky);
                 if prof.on {
                     prof.exec += t_exec.elapsed().as_micros();
                     prof.ops += 1;
                     prof.dump_maybe();
                 }
-                if status != 0 {
-                    if oplog {
-                        eprintln!("[op~!] status={status}");
-                    }
-                    if quiet_sticky == 0 {
-                        quiet_sticky = status;
-                    }
+                if status != 0 && oplog {
+                    eprintln!("[op~!] status={status}");
                 }
             }
             Some(&crate::proto::FENCE_OP) if frame.len() == 1 => {
@@ -2410,6 +2473,16 @@ fn vram_limit() -> u64 {
         .and_then(|v| v.parse::<u64>().ok())
         .map(|mb| mb * 1024 * 1024)
         .unwrap_or(u64::MAX)
+}
+
+fn session_vram_used(sess: &Session) -> u64 {
+    sess.owned_dptrs.values().sum::<u64>() + sess.owned_vmm_handles.values().sum::<u64>()
+}
+
+fn virtual_memory_info(sess: &Session, free: u64, total: u64) -> (u64, u64) {
+    let total = total.min(vram_limit());
+    let free = free.min(total.saturating_sub(session_vram_used(sess)));
+    (free, total)
 }
 
 /// Debug op trace (`SMOLVM_CUDA_OPTRACE=<path>`): appends one line per traced
@@ -2661,6 +2734,8 @@ fn adopt_replayed_exec(sess: &mut Session, exec_vh: u64, exec: u64) {
     sess.graph_vhandles.lock().unwrap().insert(exec_vh, exec);
     sess.owned_graph_reals.insert(exec);
 }
+
+static REPLAY_CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// P3b: rebuild an inherited graph by RE-CAPTURING its recorded op sequence in
 /// this clone's context. Begins capture on the clone's remapped copy of the
@@ -2973,9 +3048,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         Request::DeviceGetName { device } => {
             b.device_get_name(dev(sess, device)).map(Response::Name)
         }
-        Request::DeviceTotalMem { device } => {
-            b.device_total_mem(dev(sess, device)).map(Response::Bytes)
-        }
+        Request::DeviceTotalMem { device } => b
+            .device_total_mem(dev(sess, device))
+            .map(|total| Response::Bytes(total.min(vram_limit()))),
         Request::DriverGetVersion => b.driver_get_version().map(Response::Count),
         Request::DeviceGetAttribute { attrib, device } => b
             .device_get_attribute(attrib, dev(sess, device))
@@ -3083,30 +3158,27 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                     copied += 1;
                     cbytes += size;
                 }
-                sort_trans(&mut sess.dptr_trans); // xlat binary-searches by base
-                gpu::set_lib_trans(&sess.dptr_trans); // forwarded-lib pointer map
-                                                      // P3b: adopt inherited capture-replay logs, keyed by exec_vh —
-                                                      // replayed lazily at the clone's first GraphLaunch.
-                for (graph_vh, exec_vh, ops) in take_worker_graph_oplogs() {
-                    eprintln!(
-                        "[p3b] clone adopted oplog: graph {graph_vh:#x} exec {exec_vh:#x} ({} ops)",
-                        ops.len()
-                    );
-                    sess.clone_graph_oplogs.insert(exec_vh, ops);
-                }
+                // Pointer translation uses a binary search over allocation bases.
+                sort_trans(&mut sess.dptr_trans);
+                // Forwarded CUDA libraries use the same pointer map.
+                gpu::set_lib_trans(&sess.dptr_trans);
+                // Capture-replay logs remain process-global so late-attached channels can
+                // fetch unseen graphs on demand instead of inheriting an empty thread-local.
+                let inherited_graphs = worker_graph_oplogs_len();
                 eprintln!(
                     "[cuda-fork-isolate] clone resumed token {parent}: {copied} private copies \
-                     ({cbytes} B), {shared} shared read-only ({sbytes} B)"
+                     ({cbytes} B), {shared} shared read-only ({sbytes} B), \
+                     {inherited_graphs} inherited graph logs"
                 );
-                // P3b PRE-WARM (opt out: SMOLVM_CUDA_PREREPLAY=0). Two stages,
-                // both moving one-time clone costs off the first-request path:
+                // Pre-warming is explicitly enabled with SMOLVM_CUDA_PREREPLAY=1. Two stages
+                // move one-time clone costs off the first-request path:
                 // (1) eagerly reload every staged golden module — first-touch
                 // kernel launches (prefill, eager ops) stop paying per-module
                 // reload stalls; (2) re-capture every inherited graph now
                 // rather than lazily at first launch. Failures are left for
                 // the lazy paths to retry; later sessions adopt from the
                 // registry.
-                if std::env::var("SMOLVM_CUDA_PREREPLAY").as_deref() != Ok("0") {
+                if prereplay_enabled() {
                     let mods: Vec<u64> = MOD_IMAGES.with(|m| m.borrow().keys().copied().collect());
                     if !mods.is_empty() {
                         let t0 = std::time::Instant::now();
@@ -3122,9 +3194,12 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                         );
                     }
                 }
-                if !sess.clone_graph_oplogs.is_empty()
-                    && std::env::var("SMOLVM_CUDA_PREREPLAY").as_deref() != Ok("0")
-                {
+                if prereplay_enabled() {
+                    for (_, exec_vh, ops) in worker_graph_oplogs_peek() {
+                        sess.clone_graph_oplogs.entry(exec_vh).or_insert(ops);
+                    }
+                }
+                if !sess.clone_graph_oplogs.is_empty() && prereplay_enabled() {
                     let t0 = std::time::Instant::now();
                     let execs: Vec<u64> = sess.clone_graph_oplogs.keys().copied().collect();
                     let (mut fresh, mut adopted, mut deferred) = (0u32, 0u32, 0u32);
@@ -3320,7 +3395,10 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         Request::MemsetD8 { dptr, value, bytes } => {
             b.memset_d8(dptr, value, bytes).map(|_| Response::Ok)
         }
-        Request::MemGetInfo => b.mem_get_info().map(|(f, t)| Response::Pair(f, t)),
+        Request::MemGetInfo => b
+            .mem_get_info()
+            .map(|(free, total)| virtual_memory_info(sess, free, total))
+            .map(|(free, total)| Response::Pair(free, total)),
         Request::LaunchKernel {
             function,
             grid,
@@ -3456,21 +3534,43 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 && !sess
                     .owned_graph_reals
                     .contains(&raw_graph(sess, graph_exec))
-                && sess.clone_graph_oplogs.contains_key(&graph_exec)
             {
-                match replay_capture_graph(sess, b, graph_exec) {
-                    Ok(exec) => {
-                        replayed_exec_put(graph_exec, exec);
-                        adopt_replayed_exec(sess, graph_exec, exec);
-                        let raw = raw_stream(sess, stream)?;
-                        return b.graph_launch(exec, raw).map(|_| Response::Ok);
+                // Only one channel may capture an inherited exec at a time.
+                // Re-check the process registry after acquiring the lock: a
+                // sibling channel may have completed this graph while we
+                // waited. Fetch only this graph's immutable global log, so a
+                // late channel does not duplicate every inherited shape log.
+                let _capture_guard = REPLAY_CAPTURE_LOCK.lock().unwrap();
+                if let Some(exec) = replayed_exec_get(graph_exec) {
+                    adopt_replayed_exec(sess, graph_exec, exec);
+                    let raw = raw_stream(sess, stream)?;
+                    return b.graph_launch(exec, raw).map(|_| Response::Ok);
+                }
+                if let Entry::Vacant(entry) = sess.clone_graph_oplogs.entry(graph_exec) {
+                    if let Some(ops) = worker_graph_oplog(graph_exec) {
+                        entry.insert(ops);
                     }
-                    Err(e) => {
-                        eprintln!(
-                            "[p3b] capture-replay failed for exec {graph_exec:#x}: e={e}; \
+                }
+                if !sess.clone_graph_oplogs.contains_key(&graph_exec) {
+                    let real = raw_graph(sess, graph_exec);
+                    if real == 0 {
+                        return Err(CUDA_ERROR_INVALID_HANDLE);
+                    }
+                } else {
+                    match replay_capture_graph(sess, b, graph_exec) {
+                        Ok(exec) => {
+                            replayed_exec_put(graph_exec, exec);
+                            adopt_replayed_exec(sess, graph_exec, exec);
+                            let raw = raw_stream(sess, stream)?;
+                            return b.graph_launch(exec, raw).map(|_| Response::Ok);
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[p3b] capture-replay failed for exec {graph_exec:#x}: e={e}; \
                                    falling back to node rebuild"
-                        );
-                        // fall through to the node-rebuild / patch paths below
+                            );
+                            // fall through to the node-rebuild / patch paths below
+                        }
                     }
                 }
             }
@@ -3961,13 +4061,22 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             // raw real. Recorded as the chunk's ghandle so a clone's inherited
             // ops (which carry this value) translate in the worker.
             let ghandle = handle;
-            // Burst create: resolve the session's minted virtual handle.
-            let handle = sess.vmm_vhandles.get(&handle).copied().unwrap_or(handle);
-            // Path 3 worker: an inherited golden handle must map via the worker's
-            // own physical (raw golden values are invalid in this context).
-            let handle = VMM_TRANS
-                .with(|m| m.borrow().as_ref().and_then(|t| t.get(&handle).copied()))
-                .unwrap_or(handle);
+            // Burst create: resolve the session's minted virtual handle. In a
+            // clone worker, an inherited golden handle instead resolves through
+            // the reconstructed worker map. A tagged handle found in neither
+            // table was never created (commonly because the preceding deferred
+            // MemCreateVh returned OOM); never pass it into libcuda.
+            let handle = if let Some(real) = sess.vmm_vhandles.get(&handle).copied() {
+                real
+            } else if let Some(real) =
+                VMM_TRANS.with(|m| m.borrow().as_ref().and_then(|t| t.get(&handle).copied()))
+            {
+                real
+            } else if handle & VHANDLE_TAG != 0 {
+                return Err(CUDA_ERROR_INVALID_HANDLE);
+            } else {
+                handle
+            };
             b.mem_map(va, size, offset, handle).map(|_| {
                 sess.owned_vmm_maps.insert(va, size);
                 sess.vmm_ranges.lock().unwrap().insert(va, size);
@@ -3997,7 +4106,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         }
         Request::MemRelease { handle } => {
             // Burst create: resolve (and retire) the session's virtual handle.
-            let handle = sess.vmm_vhandles.remove(&handle).unwrap_or(handle);
+            let guest_handle = handle;
+            let session_handle = sess.vmm_vhandles.remove(&handle);
+            let handle = session_handle.unwrap_or(handle);
             let created_here = sess.owned_vmm_handles.remove(&handle).is_some();
             // Path 3 worker: translate an inherited golden handle to the worker
             // handle backing that chunk (consumed: releasing twice is a no-op).
@@ -4017,6 +4128,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 Some(None) => {
                     eprintln!("[M2] MemRelease: unknown inherited handle {handle:#x} → no-op");
                     Ok(Response::Ok)
+                }
+                None if session_handle.is_none() && guest_handle & VHANDLE_TAG != 0 => {
+                    Err(CUDA_ERROR_INVALID_HANDLE)
                 }
                 None => b.mem_release(handle).map(|_| Response::Ok),
             }
@@ -4443,6 +4557,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn eager_graph_prereplay_requires_explicit_opt_in() {
+        assert!(!prereplay_setting(None));
+        assert!(!prereplay_setting(Some("0")));
+        assert!(!prereplay_setting(Some("false")));
+        assert!(prereplay_setting(Some("1")));
+        assert!(prereplay_setting(Some(" on ")));
+    }
+
+    #[test]
+    fn inherited_graph_logs_are_visible_to_late_channels() {
+        let exec = 0x8000_0000_0000_f123;
+        set_worker_graph_oplogs(vec![(7, exec, vec![vec![1, 2, 3]])]);
+        assert_eq!(worker_graph_oplog(exec), Some(vec![vec![1, 2, 3]]));
+        assert_eq!(worker_graph_oplogs_len(), 1);
+    }
+
+    #[test]
+    fn deferred_failure_skips_dependent_ops_until_fence() {
+        let mut sess = Session::default();
+        let mut backend = CpuBackend::default();
+        let mut sticky = 0;
+        let unknown = VHANDLE_TAG | 0x53;
+
+        let (status, _) = dispatch_quiet(
+            &mut sess,
+            &mut backend,
+            Request::MemMap {
+                va: 0x20_0000,
+                size: 0x20_0000,
+                offset: 0,
+                handle: unknown,
+            },
+            &mut sticky,
+        );
+        assert_eq!(status, CUDA_ERROR_INVALID_HANDLE);
+        assert_eq!(sticky, CUDA_ERROR_INVALID_HANDLE);
+
+        let (status, _) = dispatch_quiet(
+            &mut sess,
+            &mut backend,
+            Request::MemAlloc { bytes: 16 },
+            &mut sticky,
+        );
+        assert_eq!(status, CUDA_ERROR_INVALID_HANDLE);
+        assert!(sess.owned_dptrs.is_empty());
+
+        sticky = 0;
+        let (status, _) = dispatch_quiet(
+            &mut sess,
+            &mut backend,
+            Request::MemAlloc { bytes: 16 },
+            &mut sticky,
+        );
+        assert_eq!(status, 0);
+        assert_eq!(sess.owned_dptrs.len(), 1);
+    }
+
     /// Coverage is recorded per overlapped chunk, each hashing only its own
     /// slice of the payload, so one H2D spanning several chunks leaves every
     /// chunk independently verifiable.
@@ -4823,12 +4995,21 @@ mod tests {
         let mut sess = Session::default();
         let mut b = CpuBackend::default();
         let mb = 1024 * 1024;
+        let (st, total) = dispatch(&mut sess, &mut b, Request::DeviceTotalMem { device: 0 });
+        assert_eq!(st, 0);
+        assert!(matches!(total, Response::Bytes(n) if n == mb));
+        let (st, info) = dispatch(&mut sess, &mut b, Request::MemGetInfo);
+        assert_eq!(st, 0);
+        assert!(matches!(info, Response::Pair(free, total) if free == mb && total == mb));
         let (st, r) = dispatch(&mut sess, &mut b, Request::MemAlloc { bytes: mb / 2 });
         assert_eq!(st, 0);
         let d1 = match r {
             Response::Dptr(d) => d,
             _ => unreachable!(),
         };
+        let (st, info) = dispatch(&mut sess, &mut b, Request::MemGetInfo);
+        assert_eq!(st, 0);
+        assert!(matches!(info, Response::Pair(free, total) if free == mb / 2 && total == mb));
         // Second half-MB fits exactly; a byte more must fail with OOM(2).
         let (st, _) = dispatch(&mut sess, &mut b, Request::MemAlloc { bytes: mb / 2 });
         assert_eq!(st, 0);
@@ -4937,6 +5118,26 @@ mod tests {
             "a dead lineage token hands off nothing"
         );
     }
+
+    #[test]
+    fn layout_lineage_distinguishes_processes_in_one_vm() {
+        use std::sync::{Arc, Mutex};
+
+        let trainer: Arc<LayoutCell> = Arc::new(Mutex::new(GoldenLayout::default()));
+        let preprocessing: Arc<LayoutCell> = Arc::new(Mutex::new(GoldenLayout::default()));
+        let trainer_a = 0xA2A2_0000_0000_0001;
+        let trainer_b = 0xA2A2_0000_0000_0002;
+        let child = 0xA2A2_0000_0000_0003;
+
+        layout_handoff_register(&trainer, trainer_a);
+        layout_handoff_register(&trainer, trainer_b);
+        layout_handoff_register(&preprocessing, child);
+
+        assert!(layout_handoff_same_process(trainer_a, trainer_b));
+        assert!(!layout_handoff_same_process(trainer_a, child));
+        assert!(!layout_handoff_same_process(trainer_a, u64::MAX));
+    }
+
     // The connect handshake rejects a client whose wire fingerprint differs
     // (stale shim/server), so protocol skew fails loudly instead of decoding
     // the wrong bytes and corrupting silently.

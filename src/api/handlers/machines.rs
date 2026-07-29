@@ -915,7 +915,12 @@ pub async fn start_machine(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
     Query(query): Query<StartMachineQuery>,
+    // Optional: the route took only a query string before this existed, so a
+    // caller that sends no body (or a non-JSON one) still starts normally.
+    body: Option<Json<crate::api::types::StartMachineRequest>>,
 ) -> Result<Json<MachineInfo>, ApiError> {
+    let registry_auth: Option<crate::registry::RegistryAuth> =
+        body.and_then(|Json(b)| b.registry_auth).map(Into::into);
     // Hold the per-machine lifecycle lock across the whole start so a concurrent
     // stop/delete cannot detach the macOS layers volume between our acquire+mount
     // and the launch, nor launch a guest into the launcher's missing-dir error
@@ -1076,9 +1081,19 @@ pub async fn start_machine(
         // no-op on the stop→restart path. Mirrors how the smolmachine source
         // fails a bad artifact at create.
         let image_pull = image.clone();
+        // Caller-supplied credentials win over the node's own registry config:
+        // that config is operator-level and shared by every tenant, so it can
+        // never hold a customer's private-registry password. `PullOptions::auth`
+        // is consulted before the config inside `pull`, so passing it here is
+        // enough — and passing `None` leaves the previous behaviour untouched.
+        let pull_auth = registry_auth.clone();
         let pull = with_machine_client_traced(&entry, None, move |c| {
             if c.query(&image_pull)?.is_none() {
-                c.pull_with_registry_config(&image_pull)?;
+                let mut opts = crate::agent::PullOptions::new().use_registry_config(true);
+                if let Some(auth) = pull_auth {
+                    opts = opts.auth(auth);
+                }
+                c.pull(&image_pull, opts)?;
             }
             Ok(())
         })
@@ -1169,10 +1184,13 @@ fn classify_fork_error(e: SmolvmError) -> ApiError {
         ApiError::BadRequest(msg)
     } else if lc.contains("already exists")
         || lc.contains("not running forkable")
+        || lc.contains("no memfd-backed ram")
         || lc.contains("control socket not responding")
         || lc.contains("not ready to fork")
     {
-        // Clone name taken, or the golden isn't a ready fork base — both 409.
+        // Clone name taken, or the golden isn't a ready fork base (never started
+        // forkable, so it has no memfd-backed RAM to CoW-fork) — both 409, a
+        // caller-fixable precondition, not a server fault a client should retry.
         ApiError::Conflict(msg)
     } else if lc.contains("not found") {
         ApiError::NotFound(msg)
@@ -1822,6 +1840,29 @@ pub async fn resize_machine(
         }
     }
 
+    // A fork base's disks are the copy-on-write backing for its clones' disks, so
+    // growing them corrupts the clones. The state check above is not enough: a
+    // golden whose VMM has died (e.g. after a host reboot) resolves to Stopped
+    // while its clones still depend on it, so `actual_state` would pass. Refuse
+    // explicitly, mirroring delete/stop and the CLI resize guard.
+    {
+        let db = state.db().clone();
+        let golden = name.clone();
+        let clones = tokio::task::spawn_blocking(move || db.dependent_clones(&golden))
+            .await
+            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+            .map_err(ApiError::database)?;
+        if !clones.is_empty() {
+            return Err(ApiError::Conflict(format!(
+                "machine '{}' is the fork base of {} live clone(s) ({}); their disks are backed \
+                 by its disks — delete the clones first",
+                name,
+                clones.len(),
+                clones.join(", ")
+            )));
+        }
+    }
+
     let current_storage_gb = record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GIB);
     let current_overlay_gb = record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB);
 
@@ -2019,6 +2060,25 @@ async fn pull_from_registry(
     identity_token: Option<&str>,
     blob_peers: &[String],
 ) -> Result<String, ApiError> {
+    let result = pull_smolmachine(registry_ref, identity_token, blob_peers).await?;
+    tracing::info!(path = %result.path.display(), cached = result.cached, "pull complete");
+    Ok(result.path.to_string_lossy().into_owned())
+}
+
+/// Resolve `registry_ref` and pull its `.smolmachine` layer into this node's
+/// blob cache, returning the full [`smolvm_registry::PullResult`].
+///
+/// Split out of [`pull_from_registry`] so the pre-warm endpoint
+/// ([`crate::api::handlers::prewarm`]) reaches the registry through byte-for-byte
+/// the same reference parsing, mirror lookup, credential precedence, cache, and
+/// peer fallback that a real create uses. A warm path that resolved references
+/// even slightly differently would cache a blob under one key and leave the
+/// create looking for another — a silent no-op that still looks like a success.
+pub(crate) async fn pull_smolmachine(
+    registry_ref: &str,
+    identity_token: Option<&str>,
+    blob_peers: &[String],
+) -> Result<smolvm_registry::PullResult, ApiError> {
     let parsed = crate::registry::Reference::parse(registry_ref)
         .map_err(|e| ApiError::BadRequest(format!("invalid registry reference: {}", e)))?;
 
@@ -2078,9 +2138,7 @@ async fn pull_from_registry(
             _ => ApiError::internal(format!("registry pull failed: {}", e)),
         })?;
 
-    tracing::info!(path = %result.path.display(), cached = result.cached, "pull complete");
-
-    Ok(result.path.to_string_lossy().into_owned())
+    Ok(result)
 }
 
 fn registry_reference_tag_or_digest(parsed: &crate::registry::Reference) -> &str {
@@ -2121,6 +2179,23 @@ mod tests {
     use super::*;
     use crate::db::SmolvmDb;
     use tempfile::TempDir;
+
+    #[test]
+    fn classify_fork_error_maps_precondition_failures_to_conflict() {
+        // A golden started without SMOLVM_FORKABLE has no memfd RAM to CoW-fork —
+        // a caller-fixable precondition (409), not a 500 a client would retry.
+        let e = SmolvmError::agent(
+            "fork",
+            "golden FORK failed: ERR EINVAL no memfd-backed RAM (start the golden VM with SMOLVM_FORKABLE=1)",
+        );
+        assert!(matches!(classify_fork_error(e), ApiError::Conflict(_)));
+        // A stopped golden's dead control socket is likewise a 409.
+        let e = SmolvmError::agent("fork", "golden 'g' control socket not responding");
+        assert!(matches!(classify_fork_error(e), ApiError::Conflict(_)));
+        // An unrelated fork failure stays a 500.
+        let e = SmolvmError::agent("fork", "disk write failed");
+        assert!(matches!(classify_fork_error(e), ApiError::Internal(_)));
+    }
 
     #[test]
     fn classify_launch_error_flags_virtio_port_conflict() {

@@ -318,11 +318,39 @@ impl PackRunCmd {
             return Ok(());
         }
 
+        // 4b. Legacy-format heads-up. Packs built before the format was reset lack
+        //     a recorded `smolvm_version` (it deserializes empty via the compat
+        //     default). They read fine — `--info` and extraction work — but their
+        //     embedded runtime speaks an older wire protocol the current agent may
+        //     not understand, so a run can still fail deep in the agent exchange
+        //     with an opaque error. Surface a clear, actionable note up front.
+        if manifest.smolvm_version.is_empty() {
+            let sidecar = sidecar_path.display();
+            if manifest.image.starts_with("vm://") {
+                eprintln!(
+                    "Note: '{sidecar}' was built with an older smolvm (legacy pack format) \
+                     from a VM snapshot. It may not run on this engine; re-create the VM \
+                     and re-pack it. Its contents remain inspectable with `--info`."
+                );
+            } else {
+                eprintln!(
+                    "Note: '{sidecar}' was built with an older smolvm (legacy pack format). \
+                     It may not run on this engine; if it fails, rebuild it from source:\n  \
+                     smolvm pack create --image {} -o <name>",
+                    manifest.image,
+                );
+            }
+        }
+
         // 5. Platform compatibility check — fail before extraction so the error
         //    is immediate and actionable rather than a cryptic dlopen failure.
         {
             let current = Platform::current().host_oci_platform();
-            if manifest.host_platform != current {
+            // Legacy packs (pre-reset format) don't record `host_platform`; it
+            // deserializes empty. Skip the early check for those and let the run
+            // proceed on the current host — a genuine arch mismatch still fails
+            // later at lib load. Only enforce when the pack actually declares one.
+            if !manifest.host_platform.is_empty() && manifest.host_platform != current {
                 return Err(Error::agent(
                     "platform mismatch",
                     format!(

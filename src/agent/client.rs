@@ -79,6 +79,13 @@ const DEFAULT_WRITE_TIMEOUT_SECS: u64 = 10;
 /// Image pulls can take a long time for large images over slow connections.
 const IMAGE_PULL_TIMEOUT_SECS: u64 = 600;
 
+/// Maximum silence while starting a detached container.
+///
+/// Archive flattening may take arbitrarily long, but the agent streams progress
+/// while work is advancing. Each progress response starts a fresh socket read,
+/// so this remains an inactivity timeout rather than a total operation limit.
+const DETACHED_START_TIMEOUT_SECS: u64 = 120;
+
 // (Removed INTERACTIVE_TIMEOUT_SECS — no-user-timeout execs now disable
 // the socket read timeout entirely, matching interactive_session behavior.)
 
@@ -1326,11 +1333,13 @@ impl AgentClient {
     /// Requires `config.persistent_overlay_id` to be set — detached containers
     /// only make sense when there is a persistent overlay to associate with.
     pub fn run_container_detached(&mut self, config: RunConfig) -> Result<String> {
-        // Container startup involves overlay setup + crun init which can exceed
+        // Container startup involves overlay setup, a one-time flatten of a local
+        // image archive into guest storage, and crun init, which can far exceed
         // the default 30s read timeout on first run (cold overlay, cold image).
-        let _timeout_guard = self.set_extended_read_timeout(Duration::from_secs(120))?;
+        let _timeout_guard =
+            self.set_extended_read_timeout(Duration::from_secs(DETACHED_START_TIMEOUT_SECS))?;
 
-        let resp = self.request(&AgentRequest::Run {
+        self.send(&AgentRequest::Run {
             image: config.image,
             command: config.command,
             env: config.env,
@@ -1346,6 +1355,22 @@ impl AgentClient {
             stdin_data: None,
             background: false,
         })?;
+        let resp = loop {
+            match self.receive()? {
+                AgentResponse::Progress { message, .. } => {
+                    tracing::info!(message = %message, "detached start progress");
+                }
+                terminal @ (AgentResponse::Completed { .. } | AgentResponse::Error { .. }) => {
+                    break terminal;
+                }
+                _ => {
+                    return Err(Error::agent(
+                        "run container detached",
+                        "unexpected response type",
+                    ));
+                }
+            }
+        };
         let (exit_code, stdout, _) = expect_completed(resp, "run container detached")?;
         if exit_code != 0 {
             return Err(Error::agent(
@@ -2573,6 +2598,58 @@ mod run_background_tests {
             "unexpected error: {}",
             err
         );
+        server.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod run_container_detached_tests {
+    use super::*;
+    use smolvm_protocol::{decode_message, encode_message, AgentRequest, AgentResponse, Envelope};
+    use std::io::{Read, Write};
+    use std::thread;
+
+    #[test]
+    fn accepts_progress_before_detached_container_completion() {
+        let (client_stream, mut server_stream) = UdsStream::pair().unwrap();
+
+        let server = thread::spawn(move || {
+            let mut len_buf = [0u8; 4];
+            server_stream.read_exact(&mut len_buf).unwrap();
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut payload = vec![0u8; len];
+            server_stream.read_exact(&mut payload).unwrap();
+            let envelope: Envelope<AgentRequest> =
+                decode_message(&[&len_buf[..], &payload[..]].concat()).unwrap();
+            assert!(matches!(
+                envelope.body,
+                AgentRequest::Run { detached: true, .. }
+            ));
+
+            for response in [
+                AgentResponse::Progress {
+                    message: "extracting flattened rootfs (64 MiB)".to_string(),
+                    percent: None,
+                    layer: None,
+                },
+                AgentResponse::Completed {
+                    exit_code: 0,
+                    stdout: b"container-123".to_vec(),
+                    stderr: Vec::new(),
+                },
+            ] {
+                server_stream
+                    .write_all(&encode_message(&response).unwrap())
+                    .unwrap();
+            }
+        });
+
+        let mut client = AgentClient::from_stream(client_stream);
+        let config = RunConfig::new("local-archive", Vec::new())
+            .with_persistent_overlay(Some("default".to_string()));
+        let id = client.run_container_detached(config).unwrap();
+
+        assert_eq!(id, "container-123");
         server.join().unwrap();
     }
 }

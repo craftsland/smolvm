@@ -30,6 +30,264 @@ pub fn socket_path() -> PathBuf {
     root.join("cuda-daemon.sock")
 }
 
+/// Pure policy helper for the managed MPS default.
+///
+/// Fork-worker pools opt in automatically because that is the configuration in
+/// which separate clone contexts contend for GPU scheduling. An explicit value
+/// always wins, including opt-in for a manually started shared daemon.
+#[cfg(target_os = "linux")]
+fn mps_enabled(mode: Option<&str>, fork_workers: bool) -> bool {
+    match mode.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("0" | "off" | "false" | "no") => false,
+        Some("1" | "on" | "true" | "yes" | "force") => true,
+        Some(_) => fork_workers,
+        None => fork_workers,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn mps_control_binary() -> std::ffi::OsString {
+    std::env::var_os("SMOLVM_CUDA_MPS_CONTROL").unwrap_or_else(|| "nvidia-cuda-mps-control".into())
+}
+
+/// The daemon keeps this channel open for its lifetime. The supervisor owns the
+/// other end and shuts down only the private MPS controller it started when it
+/// observes EOF, including daemon SIGKILL, crash, or `process::exit`.
+#[cfg(target_os = "linux")]
+struct MpsOwnership {
+    _lifecycle: UnixStream,
+}
+
+/// Remove only the controller artifacts that NVIDIA may create inside
+/// smolvm's private, PID-scoped directories. Directory removal is deliberately
+/// non-recursive: an unexpected entry is preserved instead of being deleted.
+#[cfg(target_os = "linux")]
+fn cleanup_private_mps_paths() {
+    if let Some(pipe) = std::env::var_os("CUDA_MPS_PIPE_DIRECTORY") {
+        let pipe = PathBuf::from(pipe);
+        for name in [
+            "control",
+            "control_privileged",
+            "control_lock",
+            "log",
+            "nvidia-cuda-mps-control.pid",
+        ] {
+            let _ = std::fs::remove_file(pipe.join(name));
+        }
+        let _ = std::fs::remove_dir(pipe);
+    }
+
+    if let Some(logs) = std::env::var_os("CUDA_MPS_LOG_DIRECTORY") {
+        let logs = PathBuf::from(logs);
+        for name in ["control.log", "server.log"] {
+            let _ = std::fs::remove_file(logs.join(name));
+        }
+        let _ = std::fs::remove_dir(logs);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn create_private_mps_paths(pipe: &Path, log_root: &Path, logs: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(log_root)?;
+
+    // Refuse a PID-path collision instead of adopting or cleaning an existing
+    // directory. That keeps the ownership guarantee true even after PID reuse.
+    std::fs::create_dir(pipe)?;
+    if let Err(e) = std::fs::create_dir(logs) {
+        let _ = std::fs::remove_dir(pipe);
+        return Err(e);
+    }
+
+    use std::os::unix::fs::PermissionsExt as _;
+    for dir in [pipe, logs] {
+        if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
+            let _ = std::fs::remove_dir(logs);
+            let _ = std::fs::remove_dir(pipe);
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// Start a private, uncapped NVIDIA MPS controller before this process loads
+/// libcuda. Failure is deliberately non-fatal: with no live controller the
+/// NVIDIA driver uses ordinary contexts, which is the existing safe path.
+#[cfg(target_os = "linux")]
+fn start_managed_mps(sock: &Path) -> Option<MpsOwnership> {
+    let fork_workers = std::env::var_os("SMOLVM_CUDA_FORK_WORKERS").is_some();
+    let mode = std::env::var("SMOLVM_CUDA_MPS").ok();
+    if !mps_enabled(mode.as_deref(), fork_workers) {
+        tracing::info!("cuda-daemon: managed NVIDIA MPS disabled");
+        return None;
+    }
+
+    // An explicit pipe directory is externally owned. Use it but never start,
+    // stop, or otherwise mutate that controller.
+    if let Some(pipe) = std::env::var_os("CUDA_MPS_PIPE_DIRECTORY") {
+        tracing::info!(
+            pipe = %PathBuf::from(pipe).display(),
+            "cuda-daemon: using externally managed NVIDIA MPS"
+        );
+        return None;
+    }
+
+    let uid = unsafe { libc::geteuid() };
+    let pid = std::process::id();
+    let pipe_dir = std::env::temp_dir().join(format!("smolvm-mps-{uid}-{pid}"));
+    let log_root = sock
+        .parent()
+        .unwrap_or_else(|| Path::new("/tmp"))
+        .join("cuda-mps-logs");
+    let log_dir = log_root.join(pid.to_string());
+    if let Err(e) = create_private_mps_paths(&pipe_dir, &log_root, &log_dir) {
+        tracing::warn!(
+            pipe = %pipe_dir.display(),
+            logs = %log_dir.display(),
+            error = %e,
+            "cuda-daemon: cannot create private MPS directories; using ordinary contexts"
+        );
+        return None;
+    }
+
+    // This is an internal daemon subcommand at single-threaded startup, before
+    // any CUDA backend or worker thread exists. The variables must be in this
+    // process so every subsequently spawned clone worker inherits the same MPS
+    // endpoint.
+    unsafe {
+        std::env::set_var("CUDA_MPS_PIPE_DIRECTORY", &pipe_dir);
+        std::env::set_var("CUDA_MPS_LOG_DIRECTORY", &log_dir);
+    }
+
+    let (mut daemon_end, supervisor_end) = match UnixStream::pair() {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::warn!(error = %e, "cuda-daemon: MPS lifecycle channel failed");
+            cleanup_private_mps_paths();
+            unsafe {
+                std::env::remove_var("CUDA_MPS_PIPE_DIRECTORY");
+                std::env::remove_var("CUDA_MPS_LOG_DIRECTORY");
+            }
+            return None;
+        }
+    };
+    let _ = daemon_end.set_read_timeout(Some(Duration::from_secs(10)));
+
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::process::CommandExt as _;
+    let supervisor_fd = supervisor_end.as_raw_fd();
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => {
+            tracing::warn!(error = %e, "cuda-daemon: cannot locate MPS supervisor");
+            cleanup_private_mps_paths();
+            unsafe {
+                std::env::remove_var("CUDA_MPS_PIPE_DIRECTORY");
+                std::env::remove_var("CUDA_MPS_LOG_DIRECTORY");
+            }
+            return None;
+        }
+    };
+    let mut cmd = Command::new(exe);
+    cmd.args(["_cuda-mps-supervisor", "3"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        // A separate process group is essential: the daemon's SIGTERM handler
+        // kills its own group (daemon + clone workers). The supervisor must
+        // survive long enough to observe EOF and send `quit` to MPS.
+        .process_group(0);
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::dup2(supervisor_fd, 3) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    if let Err(e) = cmd.spawn() {
+        tracing::warn!(
+            error = %e,
+            "cuda-daemon: cannot spawn MPS supervisor; using ordinary contexts"
+        );
+        cleanup_private_mps_paths();
+        unsafe {
+            std::env::remove_var("CUDA_MPS_PIPE_DIRECTORY");
+            std::env::remove_var("CUDA_MPS_LOG_DIRECTORY");
+        }
+        return None;
+    }
+    drop(supervisor_end);
+
+    use std::io::Read as _;
+    let mut ready = [0u8; 1];
+    if daemon_end.read_exact(&mut ready).is_err() || ready[0] != 1 {
+        tracing::warn!("cuda-daemon: NVIDIA MPS unavailable; falling back to ordinary contexts");
+        drop(daemon_end);
+        unsafe {
+            std::env::remove_var("CUDA_MPS_PIPE_DIRECTORY");
+            std::env::remove_var("CUDA_MPS_LOG_DIRECTORY");
+        }
+        return None;
+    }
+
+    tracing::info!(
+        pipe = %pipe_dir.display(),
+        logs = %log_dir.display(),
+        "cuda-daemon: private uncapped NVIDIA MPS active"
+    );
+    Some(MpsOwnership {
+        _lifecycle: daemon_end,
+    })
+}
+
+/// Hidden supervisor entry point. It starts one controller in the private pipe
+/// directory inherited from the daemon, reports readiness over `fd`, and then
+/// blocks until the daemon closes its channel. It never quits a controller it
+/// did not successfully start.
+#[cfg(target_os = "linux")]
+pub fn run_mps_supervisor(fd: i32) -> io::Result<()> {
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::FromRawFd as _;
+
+    // SAFETY: the daemon handed this process an owned dup of its UnixStream at
+    // exactly `fd`; this function is the sole owner in the exec'd supervisor.
+    let mut lifecycle = unsafe { UnixStream::from_raw_fd(fd) };
+    let started = Command::new(mps_control_binary())
+        .arg("-d")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    let _ = lifecycle.write_all(&[u8::from(started)]);
+    if !started {
+        cleanup_private_mps_paths();
+        return Ok(());
+    }
+
+    // No messages are expected. EOF is the lifecycle signal and is guaranteed
+    // by the kernel even when the parent is killed without running destructors.
+    let mut discard = [0u8; 64];
+    while lifecycle.read(&mut discard)? != 0 {}
+
+    let mut stop = Command::new(mps_control_binary())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    if let Some(mut stdin) = stop.stdin.take() {
+        let _ = stdin.write_all(b"quit\n");
+    }
+    let _ = stop.wait();
+
+    // NVIDIA leaves control nodes behind after a graceful quit. It also keeps
+    // per-controller logs that would otherwise accumulate across daemon
+    // restarts, so reclaim both private PID-scoped directories.
+    cleanup_private_mps_paths();
+    Ok(())
+}
+
 /// True if a daemon is already listening on `sock` (a probe connect succeeds).
 fn is_alive(sock: &Path) -> bool {
     UnixStream::connect(sock).is_ok()
@@ -259,8 +517,6 @@ pub(crate) fn install_crash_handler(role: &'static str) {
 
 /// Serve the shared CUDA daemon on `sock` (spawned as `smolvm _cuda-daemon`).
 pub fn run(sock: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    install_crash_handler("cuda-daemon");
     // Become our own process-group leader so a clean-shutdown signal can take the
     // whole group (this daemon + its clone workers) down together without ever
     // touching the shell/ssh session that launched us. The `ensure_running` spawn
@@ -271,6 +527,8 @@ pub fn run(sock: &Path) -> io::Result<()> {
     unsafe {
         libc::setpgid(0, 0);
     }
+    #[cfg(unix)]
+    install_crash_handler("cuda-daemon");
     if let Some(parent) = sock.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -295,6 +553,12 @@ pub fn run(sock: &Path) -> io::Result<()> {
     #[cfg(unix)]
     install_shutdown_handler(sock);
     let listener = UdsListener::bind(sock)?;
+    // Must precede listener threads and the first GpuBackend::load. Clone
+    // workers inherit the endpoint from this daemon. Starting only after the
+    // socket is exclusively bound avoids briefly starting MPS in a losing
+    // double-daemon process.
+    #[cfg(target_os = "linux")]
+    let _mps_ownership = start_managed_mps(sock);
     tracing::info!(socket = %sock.display(), "shared CUDA daemon listening");
     let active = Arc::new(AtomicUsize::new(0));
     // Optional network transport (P1): also accept CUDA-RPC over TCP so a remote,
@@ -734,6 +998,21 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    // Reserve the golden's address ranges before retaining this worker's CUDA
+    // context, so context initialization cannot occupy them. Some drivers
+    // require non-zero address hints to use a coarser boundary than the
+    // allocation granularity, so probe aligned envelopes from small to large.
+    let clone_layout = std::env::var("SMOLVM_CUDA_CLONE_LAYOUT").ok();
+    let mut pre_reserved = Vec::new();
+    if let Some(layout) = clone_layout.as_deref() {
+        let (ranges, granularity) = reserve_clone_layout_exact(backend.as_mut(), layout, clone_dev);
+        pre_reserved = ranges;
+        tracing::info!(
+            exact = pre_reserved.len(),
+            granularity,
+            "clone-worker: reserved golden address ranges before context creation"
+        );
+    }
     let _ = backend.primary_ctx_retain(clone_dev);
     // Clone transport: consume the proc-mem advert (SMVGPVM1) the clone proxy
     // sent right after its clone preamble, so D2H/H2D reach the clone's LIVE
@@ -762,8 +1041,9 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
     // M2: reconstruct the golden's memory at its exact VAs from the layout the
     // daemon passed (SMOLVM_CUDA_CLONE_LAYOUT) + the golden's physical exported to
     // fds 4.. — BEFORE serving, so the clone's inherited pointers are valid verbatim.
-    if let Ok(layout) = std::env::var("SMOLVM_CUDA_CLONE_LAYOUT") {
-        let (n, vmm_trans) = reconstruct_golden_memory(backend.as_mut(), &layout, clone_dev);
+    if let Some(layout) = clone_layout.as_deref() {
+        let (n, vmm_trans) =
+            reconstruct_golden_memory(backend.as_mut(), layout, clone_dev, &pre_reserved);
         tracing::info!(
             maps = n,
             vmm_handles = vmm_trans.len(),
@@ -844,9 +1124,11 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
         let seed = std::sync::Arc::new((seed_vmm, seed_handles, seed_alloc));
         std::thread::spawn(move || loop {
             match recv_fd(ctrl) {
-                Ok(nfd) => {
+                Ok((nfd, procmem)) => {
                     let seed = seed.clone();
-                    std::thread::spawn(move || serve_attached_channel(nfd, clone_dev, &seed));
+                    std::thread::spawn(move || {
+                        serve_attached_channel(nfd, clone_dev, &seed, procmem)
+                    });
                 }
                 Err(e) => {
                     tracing::info!(error = %e, "clone-worker: control channel closed");
@@ -896,12 +1178,13 @@ fn serve_attached_channel(
         Option<SeedHandles>,
         Vec<(u64, u64, u64)>,
     ),
+    attached_procmem: Option<ProcMemAdvert>,
 ) {
     use std::os::unix::io::FromRawFd;
     let mut backend = make_backend();
     let _ = backend.init();
     let _ = backend.primary_ctx_retain(dev);
-    if let Some((pid, regions)) = procmem_from_env() {
+    if let Some((pid, regions)) = attached_procmem.or_else(procmem_from_env) {
         backend.set_guest_ram_procmem(pid, regions);
     }
     // File-ring transport: attached channels serve on their own threads, and
@@ -968,6 +1251,119 @@ fn import_with_retry(b: &mut dyn Backend, fd: i32) -> Result<u64, i32> {
     Err(last)
 }
 
+#[cfg(unix)]
+fn clone_layout_reservations(layout: &str) -> Vec<(u64, u64)> {
+    let hx = |s: &str| u64::from_str_radix(s, 16).ok();
+    let mut ranges = Vec::new();
+    for part in layout.split('|') {
+        if let Some(entries) = part.strip_prefix("resv=") {
+            ranges.extend(entries.split(',').filter_map(|entry| {
+                let (va, size) = entry.split_once(':')?;
+                Some((hx(va)?, hx(size)?))
+            }));
+        }
+        if let Some(entries) = part.strip_prefix("aregions=") {
+            ranges.extend(entries.split(',').filter_map(|entry| {
+                let mut fields = entry.split(':');
+                Some((hx(fields.next()?)?, hx(fields.next()?)?))
+            }));
+        }
+    }
+    ranges.sort_unstable();
+    ranges.dedup();
+    ranges
+}
+
+#[cfg(unix)]
+fn clone_layout_reservation_envelopes(layout: &str, granularity: u64) -> Vec<(u64, u64)> {
+    let mask = granularity - 1;
+    let mut spans: Vec<(u64, u64)> = clone_layout_reservations(layout)
+        .into_iter()
+        .map(|(va, size)| {
+            let base = va & !mask;
+            let end = va.saturating_add(size).saturating_add(mask) & !mask;
+            (base, end)
+        })
+        .collect();
+    spans.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for (base, end) in spans {
+        match merged.last_mut() {
+            Some((_, prior_end)) if base <= *prior_end => *prior_end = (*prior_end).max(end),
+            _ => merged.push((base, end)),
+        }
+    }
+    merged
+        .into_iter()
+        .map(|(base, end)| (base, end - base))
+        .collect()
+}
+
+#[cfg(unix)]
+fn range_is_reserved(ranges: &[(u64, u64)], va: u64, size: u64) -> bool {
+    ranges
+        .iter()
+        .any(|&(base, span)| va >= base && va.saturating_add(size) <= base.saturating_add(span))
+}
+
+#[cfg(unix)]
+fn reserve_clone_address_exact(b: &mut dyn Backend, va: u64, size: u64, align: u64) -> bool {
+    match b.mem_address_reserve_fixed(size, align, va) {
+        Ok(actual) if actual == va => true,
+        Ok(actual) => {
+            let _ = b.mem_address_free(actual, size);
+            tracing::warn!(
+                requested = va,
+                actual,
+                size,
+                "clone-worker: CUDA moved an exact-address reservation"
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!(e, va, size, "clone-worker: exact-address reserve failed");
+            false
+        }
+    }
+}
+
+#[cfg(unix)]
+fn reserve_clone_layout_exact(
+    b: &mut dyn Backend,
+    layout: &str,
+    device: i32,
+) -> (Vec<(u64, u64)>, u64) {
+    const MIN_GRANULARITY: u64 = 1 << 16;
+    const MAX_HINT_GRANULARITY: u64 = 1 << 30;
+
+    let mut granularity = b
+        .mem_get_allocation_granularity(device, 0)
+        .unwrap_or(1 << 21)
+        .max(MIN_GRANULARITY)
+        .next_power_of_two();
+    while granularity <= MAX_HINT_GRANULARITY {
+        let envelopes = clone_layout_reservation_envelopes(layout, granularity);
+        let mut reserved = Vec::with_capacity(envelopes.len());
+        let mut complete = true;
+        for &(va, size) in &envelopes {
+            if reserve_clone_address_exact(b, va, size, granularity) {
+                reserved.push((va, size));
+            } else {
+                complete = false;
+                break;
+            }
+        }
+        if complete {
+            return (reserved, granularity);
+        }
+        for (va, size) in reserved {
+            let _ = b.mem_address_free(va, size);
+        }
+        granularity = granularity.saturating_mul(2);
+    }
+    (Vec::new(), granularity)
+}
+
 /// M2: rebuild the golden's VMM layout in THIS worker's context at the golden's
 /// EXACT VAs. `layout` = `"resv=va:size,…|maps=va:size:fdidx:loaded:ghandle,…"` (hex);
 /// each map's physical was exported by the daemon to fd `4 + fdidx`. We import +
@@ -983,6 +1379,7 @@ fn reconstruct_golden_memory(
     b: &mut dyn Backend,
     layout: &str,
     device: i32,
+    pre_reserved: &[(u64, u64)],
 ) -> (usize, std::collections::HashMap<u64, u64>) {
     let mut vmm_trans = std::collections::HashMap::new();
     let (mut resv_s, mut maps_s, mut aregions_s, mut allocs_s) = ("", "", "", "");
@@ -1008,8 +1405,10 @@ fn reconstruct_golden_memory(
     for e in resv_s.split(',').filter(|s| !s.is_empty()) {
         if let Some((va, size)) = e.split_once(':') {
             if let (Some(va), Some(size)) = (hx(va), hx(size)) {
-                if let Err(e) = b.mem_address_reserve_fixed(size, 0, va) {
-                    tracing::warn!(e, va, "M2: reserve-fixed failed");
+                if !range_is_reserved(pre_reserved, va, size)
+                    && !reserve_clone_address_exact(b, va, size, 0)
+                {
+                    tracing::warn!(va, size, "M2: reservation unavailable at golden VA");
                 }
             }
         }
@@ -1138,9 +1537,9 @@ fn reconstruct_golden_memory(
         }
         count += 1;
     }
-    if share_weights {
-        tracing::info!(shared, private = count - shared, "M2: shared weight ranges");
-    }
+    // Emit the verdict in both modes. Private-copy controls need positive
+    // evidence (`shared=0`) rather than inferring policy from a missing line.
+    tracing::info!(shared, private = count - shared, "M2: shared weight ranges");
     // Non-VMM golden allocations (`cudaMalloc` — a plain-torch golden keeps ALL
     // its tensors here): copy each from the daemon's staged export into a fresh
     // private buffer and record a POINTER TRANSLATION, exactly like the
@@ -1180,8 +1579,10 @@ fn reconstruct_golden_memory(
         // poisons the context: e=700 on every later op — found via QA-1l,
         // first-ever cuBLAS init inside a clone).
         for &(b0, sz, _) in &regions {
-            if let Err(e) = b.mem_address_reserve_fixed(sz, 0, b0) {
-                tracing::warn!(e, va = b0, size = sz, "M2-alloc: VA guard reserve failed");
+            if !range_is_reserved(pre_reserved, b0, sz)
+                && !reserve_clone_address_exact(b, b0, sz, 0)
+            {
+                tracing::warn!(va = b0, size = sz, "M2-alloc: VA guard reserve failed");
             }
         }
         let total: u64 = regions.iter().map(|r| r.1).sum();
@@ -1522,6 +1923,40 @@ fn clone_worker_registry() -> &'static Mutex<std::collections::HashMap<(u64, u64
     REG.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
+#[cfg(unix)]
+fn unique_live_clone_worker(
+    reg: &std::collections::HashMap<(u64, u64), CloneWorkerEntry>,
+    clone_id: u64,
+    mut is_live: impl FnMut(u32) -> bool,
+) -> Result<Option<CloneWorkerEntry>, usize> {
+    let mut live = reg
+        .iter()
+        .filter_map(|(&(_, cid), &entry)| (cid == clone_id && is_live(entry.0)).then_some(entry))
+        .collect::<Vec<_>>();
+    match live.len() {
+        0 => Ok(None),
+        1 => Ok(live.pop()),
+        n => Err(n),
+    }
+}
+
+fn clone_worker_share_env(requested: bool, configured: Option<&str>) -> Option<&'static str> {
+    if matches!(configured, Some("0" | "false" | "off")) {
+        Some("0")
+    } else if requested {
+        Some("1")
+    } else {
+        None
+    }
+}
+
+/// Decide whether a clone-marked connection should bypass worker routing when
+/// worker mode is disabled. Real channels fall through to ordinary serving;
+/// warm dials carry no Init and must be consumed instead of parking forever.
+fn disabled_worker_route(flags: u8, workers: bool, isolate: bool) -> Option<bool> {
+    (!workers || !isolate).then_some(flags & 2 != 0)
+}
+
 /// Route one just-accepted connection: strip the clone preamble (always), and
 /// when it marks an isolating fork clone, spawn/refuse its worker. Returns
 /// `true` when the connection was consumed (routed or rejected); `false` means
@@ -1537,6 +1972,20 @@ fn route_clone_connection(
     let Some((clone_id, flags)) = consume_clone_preamble(fd) else {
         return false;
     };
+    // The preamble must always be stripped, but a warm-dial connection must
+    // not bypass the worker-mode gate below. Previously the warm branch spawned
+    // a Path-3 worker unconditionally, so `SMOLVM_CUDA_FORK_WORKERS` unset still
+    // mixed worker contexts into the legacy single-context path.
+    if let Some(consumed) = disabled_worker_route(
+        flags,
+        std::env::var_os("SMOLVM_CUDA_FORK_WORKERS").is_some(),
+        std::env::var_os("SMOLVM_CUDA_FORK_ISOLATE").is_some(),
+    ) {
+        // Real clone connections still fall through to the shared-context
+        // server. A warm dial has no Init payload, so consume it instead of
+        // parking an otherwise permanent server thread on an idle socket.
+        return consumed;
+    }
     let share_weights = flags & 1 != 0;
     // Warm dial (flag bit 1): the clone VM's proxy dials at STARTUP so worker
     // spawn (CUDA init + memory reconstruction + module/graph pre-warm) runs
@@ -1553,7 +2002,7 @@ fn route_clone_connection(
         });
         if let Some((_pid, ctrl)) = live {
             // Worker already up (a real channel won the race): park there.
-            let _ = send_fd(ctrl, fd);
+            let _ = send_fd(ctrl, fd, procmem.as_ref());
             return true;
         }
         let tokens = smolvm_cuda::host::layout_tokens();
@@ -1585,18 +2034,32 @@ fn route_clone_connection(
     let Some(token) = peek_clone_token(fd) else {
         // A clone VM's connection whose Init carries no lineage token. The
         // guest treats CUDA state as process-global, so if this clone already
-        // has a live worker, the channel MUST serve there: a cuBLAS handle
-        // created through an in-daemon session is invisible to the worker's
-        // sessions (vh-miss → NOT_INITIALIZED on the compute channel). Only
-        // when no worker exists is in-daemon serving correct (genuinely
-        // fresh post-fork work before any isolating resume).
+        // has exactly one live worker, the channel MUST serve there: a cuBLAS
+        // handle created through an in-daemon session is invisible to the
+        // worker's sessions (vh-miss → NOT_INITIALIZED on the compute
+        // channel). A real VM can contain multiple CUDA processes and thus
+        // multiple workers, however. With no token there is no safe way to
+        // select between them; reject that ambiguous connection rather than
+        // silently grafting it onto an unrelated process/context.
         let reg = clone_worker_registry().lock().unwrap();
-        let live = reg.iter().find_map(|(&(_, cid), &(pid, ctrl))| {
+        let live = unique_live_clone_worker(&reg, clone_id, |pid| {
             // SAFETY: kill(pid, 0) — pure liveness probe, no signal delivered.
-            (cid == clone_id && unsafe { libc::kill(pid as i32, 0) } == 0).then_some((pid, ctrl))
+            unsafe { libc::kill(pid as i32, 0) == 0 }
         });
-        if let Some((pid, ctrl)) = live {
-            match send_fd(ctrl, fd) {
+        let (pid, ctrl) = match live {
+            Err(workers) => {
+                tracing::warn!(
+                    clone_id,
+                    workers,
+                    "rejecting ambiguous token-less clone channel"
+                );
+                return true;
+            }
+            Ok(None) => return false,
+            Ok(Some(worker)) => worker,
+        };
+        {
+            match send_fd(ctrl, fd, procmem.as_ref()) {
                 Ok(()) => {
                     tracing::info!(
                         clone_id,
@@ -1610,12 +2073,12 @@ fn route_clone_connection(
                         error = %e,
                         clone_id,
                         worker_pid = pid,
-                        "token-less channel attach failed; serving in-daemon"
+                        "token-less channel attach failed; rejecting the connection"
                     );
+                    return true;
                 }
             }
         }
-        return false;
     };
     let mut reg = clone_worker_registry().lock().unwrap();
     if let Some(&(pid, ctrl)) = reg.get(&(token, clone_id)) {
@@ -1652,7 +2115,7 @@ fn route_clone_connection(
             // worker so the channel serves in the clone's context; a fresh
             // worker would silently reset the clone's GPU state, and serving
             // in-daemon would split the guest across two UVA spaces.
-            match send_fd(ctrl, fd) {
+            match send_fd(ctrl, fd, procmem.as_ref()) {
                 Ok(()) => {
                     tracing::info!(
                         token,
@@ -1678,17 +2141,22 @@ fn route_clone_connection(
         // SAFETY: control fd of a dead/reaped worker.
         unsafe { libc::close(ctrl) };
     }
-    // A warm-dial worker may be registered under an INFERRED token. A clone
-    // has exactly one golden lineage, so any live worker for this clone_id is
-    // the right one — attach rather than spawning a duplicate (which would
-    // split the clone's CUDA state across two processes).
+    // A warm-dial worker may be registered under an INFERRED token. Attach
+    // across tokens only when both tokens share the same process-scoped
+    // GoldenLayout. Real workloads can have several CUDA processes inside one
+    // VM (observed with Unsloth SFT preprocessing); blindly attaching the
+    // trainer to the preprocessing worker reconstructs the wrong address space
+    // and crashes the worker.
     let live = reg.iter().find_map(|(&(t, cid), &(pid, ctrl))| {
         // SAFETY: kill(pid, 0) — pure liveness probe, no signal delivered.
-        (cid == clone_id && t != token && unsafe { libc::kill(pid as i32, 0) } == 0)
+        (cid == clone_id
+            && t != token
+            && smolvm_cuda::host::layout_handoff_same_process(t, token)
+            && unsafe { libc::kill(pid as i32, 0) } == 0)
             .then_some((pid, ctrl))
     });
     if let Some((pid, ctrl)) = live {
-        match send_fd(ctrl, fd) {
+        match send_fd(ctrl, fd, procmem.as_ref()) {
             Ok(()) => {
                 tracing::info!(
                     token,
@@ -1731,13 +2199,83 @@ fn route_clone_connection(
     true
 }
 
-/// SCM_RIGHTS-send one fd over a control socketpair (one data byte as payload).
+const ATTACH_PROCMEM_MAGIC: [u8; 4] = *b"PMV1";
+
+fn encode_attach_procmem(procmem: Option<&ProcMemAdvert>) -> Vec<u8> {
+    let mut data = Vec::with_capacity(12 + procmem.map_or(0, |(_, r)| r.len() * 24));
+    data.extend_from_slice(&ATTACH_PROCMEM_MAGIC);
+    match procmem {
+        Some((pid, regions)) => {
+            data.extend_from_slice(&pid.to_le_bytes());
+            data.extend_from_slice(&(regions.len() as u32).to_le_bytes());
+            for (gpa, hva, len) in regions {
+                data.extend_from_slice(&gpa.to_le_bytes());
+                data.extend_from_slice(&hva.to_le_bytes());
+                data.extend_from_slice(&len.to_le_bytes());
+            }
+        }
+        None => {
+            data.extend_from_slice(&0u32.to_le_bytes());
+            data.extend_from_slice(&0u32.to_le_bytes());
+        }
+    }
+    data
+}
+
+fn decode_attach_procmem(data: &[u8]) -> io::Result<Option<ProcMemAdvert>> {
+    if data.len() < 12 || data[..4] != ATTACH_PROCMEM_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "invalid clone attach metadata (len={}, head={:02x?})",
+                data.len(),
+                &data[..data.len().min(12)]
+            ),
+        ));
+    }
+    let pid = u32::from_le_bytes(data[4..8].try_into().unwrap());
+    let n = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+    let expected = 12usize
+        .checked_add(n.checked_mul(24).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "clone attach region overflow")
+        })?)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "clone attach metadata overflow")
+        })?;
+    if data.len() != expected || (pid == 0) != (n == 0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "inconsistent clone attach metadata",
+        ));
+    }
+    if n == 0 {
+        return Ok(None);
+    }
+    let mut regions = Vec::with_capacity(n);
+    for chunk in data[12..].chunks_exact(24) {
+        regions.push((
+            u64::from_le_bytes(chunk[0..8].try_into().unwrap()),
+            u64::from_le_bytes(chunk[8..16].try_into().unwrap()),
+            u64::from_le_bytes(chunk[16..24].try_into().unwrap()),
+        ));
+    }
+    Ok(Some((pid, regions)))
+}
+
+/// SCM_RIGHTS-send one fd plus the accepted clone connection's live-RAM
+/// advert. A warm-spawned worker predates that advert, so forwarding it here
+/// is what lets late-attached channels use the clone's COW guest pages rather
+/// than failing every GPA copy with CUDA_ERROR_NOT_FOUND.
 #[cfg(unix)]
-fn send_fd(chan: std::os::unix::io::RawFd, fd: std::os::unix::io::RawFd) -> io::Result<()> {
-    let mut data = [0u8; 1];
+fn send_fd(
+    chan: std::os::unix::io::RawFd,
+    fd: std::os::unix::io::RawFd,
+    procmem: Option<&ProcMemAdvert>,
+) -> io::Result<()> {
+    let mut data = encode_attach_procmem(procmem);
     let mut iov = libc::iovec {
         iov_base: data.as_mut_ptr() as *mut libc::c_void,
-        iov_len: 1,
+        iov_len: data.len(),
     };
     // SAFETY: standard sendmsg with a single SCM_RIGHTS cmsg over buffers that
     // outlive the call; CMSG_* macros compute the layout.
@@ -1753,21 +2291,30 @@ fn send_fd(chan: std::os::unix::io::RawFd, fd: std::os::unix::io::RawFd) -> io::
         (*c).cmsg_type = libc::SCM_RIGHTS;
         (*c).cmsg_len = libc::CMSG_LEN(4) as _;
         std::ptr::copy_nonoverlapping(&fd as *const i32 as *const u8, libc::CMSG_DATA(c), 4);
-        if libc::sendmsg(chan, &msg, 0) < 0 {
+        let n = libc::sendmsg(chan, &msg, 0);
+        if n < 0 {
             return Err(io::Error::last_os_error());
+        }
+        if n as usize != data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short clone attach control message",
+            ));
         }
     }
     Ok(())
 }
 
-/// Blocking receive of one SCM_RIGHTS fd; `Err` on close/garbage ends the
-/// worker's attach listener.
+/// Blocking receive of one SCM_RIGHTS fd and its optional live-RAM advert;
+/// `Err` on close/garbage ends the worker's attach listener.
 #[cfg(unix)]
-fn recv_fd(chan: std::os::unix::io::RawFd) -> io::Result<std::os::unix::io::RawFd> {
-    let mut data = [0u8; 1];
+fn recv_fd(
+    chan: std::os::unix::io::RawFd,
+) -> io::Result<(std::os::unix::io::RawFd, Option<ProcMemAdvert>)> {
+    let mut data = [0u8; 4096];
     let mut iov = libc::iovec {
         iov_base: data.as_mut_ptr() as *mut libc::c_void,
-        iov_len: 1,
+        iov_len: data.len(),
     };
     // SAFETY: standard recvmsg with room for one SCM_RIGHTS cmsg; buffers
     // outlive the call.
@@ -1797,7 +2344,15 @@ fn recv_fd(chan: std::os::unix::io::RawFd) -> io::Result<std::os::unix::io::RawF
         }
         let mut fd: i32 = -1;
         std::ptr::copy_nonoverlapping(libc::CMSG_DATA(c), &mut fd as *mut i32 as *mut u8, 4);
-        Ok(fd)
+        match decode_attach_procmem(&data[..n as usize]) {
+            Ok(procmem) => Ok((fd, procmem)),
+            Err(e) => {
+                // We own the SCM_RIGHTS duplicate once recvmsg succeeds.
+                // Malformed metadata must not leak one fd per bad packet.
+                libc::close(fd);
+                Err(e)
+            }
+        }
     }
 }
 
@@ -2158,7 +2713,10 @@ fn spawn_clone_worker(
     // the worker inherits sp[1] and serves every received fd in-process.
     let mut sp = [0i32; 2];
     // SAFETY: plain socketpair; fds checked below.
-    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sp.as_mut_ptr()) } != 0 {
+    // SEQPACKET preserves the boundary between each SCM_RIGHTS fd and its
+    // variable-length proc-mem advert. A byte stream could split/coalesce the
+    // metadata and associate the next channel's live-RAM map with the wrong fd.
+    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, sp.as_mut_ptr()) } != 0 {
         return Err(io::Error::last_os_error());
     }
     // Lift the child end above the dup2 target range (3..4+nexports) so the
@@ -2189,12 +2747,13 @@ fn spawn_clone_worker(
         // against the clone VM's advertised host ring dir.
         cmd.env("SMOLVM_CUDA_CLONE_RING_DIR", rd);
     }
-    // Per-fork density: this fork asked for --share-weights (preamble flag), so
-    // the worker's reconstruction shares the golden's loaded weight physicals
-    // instead of copying them. The daemon-wide env remains the global default;
-    // the worker inherits it, so the flag only ever ADDS sharing.
-    if share_weights {
-        cmd.env("SMOLVM_CUDA_FORK_SHARE_WEIGHTS", "1");
+    // Per-fork density: --share-weights requests sharing, but the documented
+    // daemon kill switch remains authoritative. This is needed for safe
+    // all-private controls and emergency rollback; blindly replacing an
+    // inherited "0" here made SMOLVM_CUDA_FORK_SHARE_WEIGHTS=0 ineffective.
+    let configured_sharing = std::env::var("SMOLVM_CUDA_FORK_SHARE_WEIGHTS").ok();
+    if let Some(setting) = clone_worker_share_env(share_weights, configured_sharing.as_deref()) {
+        cmd.env("SMOLVM_CUDA_FORK_SHARE_WEIGHTS", setting);
     }
     if let Some(mp) = &modpath {
         cmd.env("SMOLVM_CUDA_CLONE_MODULES", mp);
@@ -2329,5 +2888,172 @@ impl Drop for FileLock {
     fn drop(&mut self) {
         use std::os::unix::io::AsRawFd;
         unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod mps_tests {
+    use super::{
+        clone_layout_reservation_envelopes, clone_worker_share_env, create_private_mps_paths,
+        decode_attach_procmem, disabled_worker_route, encode_attach_procmem, mps_enabled,
+        range_is_reserved, recv_fd, send_fd, unique_live_clone_worker,
+    };
+    use std::collections::HashMap;
+    use std::io;
+
+    #[test]
+    fn clone_attach_procmem_metadata_roundtrips() {
+        let advert = (
+            4242,
+            vec![
+                (0, 0x7f00_0000, 0x1000),
+                (0x1_0000_0000, 0x7f10_0000, 0x20_0000),
+            ],
+        );
+        assert_eq!(
+            decode_attach_procmem(&encode_attach_procmem(Some(&advert))).unwrap(),
+            Some(advert)
+        );
+        assert_eq!(
+            decode_attach_procmem(&encode_attach_procmem(None)).unwrap(),
+            None
+        );
+        assert!(decode_attach_procmem(b"bad").is_err());
+    }
+
+    #[test]
+    fn clone_attach_fd_and_procmem_stay_in_one_packet() {
+        use std::os::fd::AsRawFd;
+
+        let mut sockets = [-1; 2];
+        let rc = unsafe {
+            libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, sockets.as_mut_ptr())
+        };
+        assert_eq!(rc, 0);
+        let file = tempfile::tempfile().unwrap();
+        let advert = (4242, vec![(0x1000, 0x2000, 0x3000)]);
+
+        send_fd(sockets[0], file.as_raw_fd(), Some(&advert)).unwrap();
+        let (received, got) = recv_fd(sockets[1]).unwrap();
+
+        assert_eq!(got, Some(advert));
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(received, &mut stat) }, 0);
+        assert!(stat.st_size >= 0);
+        unsafe {
+            libc::close(received);
+            libc::close(sockets[0]);
+            libc::close(sockets[1]);
+        }
+    }
+
+    #[test]
+    fn tokenless_clone_worker_selection_fails_closed_when_ambiguous() {
+        let mut workers = HashMap::new();
+        workers.insert((10, 7), (101, 201));
+        workers.insert((20, 8), (102, 202));
+
+        assert_eq!(unique_live_clone_worker(&workers, 9, |_| true), Ok(None));
+        assert_eq!(
+            unique_live_clone_worker(&workers, 7, |_| true),
+            Ok(Some((101, 201)))
+        );
+
+        workers.insert((30, 7), (103, 203));
+        assert_eq!(unique_live_clone_worker(&workers, 7, |_| true), Err(2));
+        assert_eq!(
+            unique_live_clone_worker(&workers, 7, |pid| pid == 103),
+            Ok(Some((103, 203)))
+        );
+    }
+
+    #[test]
+    fn clone_share_kill_switch_overrides_fork_request() {
+        assert_eq!(clone_worker_share_env(true, None), Some("1"));
+        assert_eq!(clone_worker_share_env(true, Some("0")), Some("0"));
+        assert_eq!(clone_worker_share_env(true, Some("false")), Some("0"));
+        assert_eq!(clone_worker_share_env(true, Some("off")), Some("0"));
+        assert_eq!(clone_worker_share_env(false, None), None);
+    }
+
+    #[test]
+    fn disabled_worker_mode_consumes_only_warm_dials() {
+        assert_eq!(disabled_worker_route(1, false, true), Some(false));
+        assert_eq!(disabled_worker_route(3, false, true), Some(true));
+        assert_eq!(disabled_worker_route(3, true, false), Some(true));
+        assert_eq!(disabled_worker_route(3, true, true), None);
+    }
+
+    #[test]
+    fn clone_address_envelopes_align_merge_and_cover_original_ranges() {
+        let layout = concat!(
+            "resv=312400000:200000,314000000:1400000,|maps=|",
+            "aregions=7a5ed2400000:200000:0,7a5ed2600000:200000:200000,"
+        );
+        let ranges = clone_layout_reservation_envelopes(layout, 0x2000000);
+
+        assert_eq!(
+            ranges,
+            vec![(0x312000000, 0x4000000), (0x7a5ed2000000, 0x2000000)]
+        );
+        assert!(range_is_reserved(&ranges, 0x312400000, 0x200000));
+        assert!(range_is_reserved(&ranges, 0x314000000, 0x1400000));
+        assert!(range_is_reserved(&ranges, 0x7a5ed2600000, 0x200000));
+        assert!(!range_is_reserved(&ranges, 0x316000000, 0x200000));
+    }
+
+    #[test]
+    fn mps_defaults_to_fork_worker_pools() {
+        assert!(mps_enabled(None, true));
+        assert!(!mps_enabled(None, false));
+    }
+
+    #[test]
+    fn explicit_mps_mode_overrides_pool_default() {
+        for off in ["0", "off", "FALSE", " no "] {
+            assert!(!mps_enabled(Some(off), true), "{off}");
+        }
+        for on in ["1", "on", "TRUE", " yes ", "force"] {
+            assert!(mps_enabled(Some(on), false), "{on}");
+        }
+    }
+
+    #[test]
+    fn private_mps_paths_are_new_and_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let pipe = tmp.path().join("pipe");
+        let log_root = tmp.path().join("log-root");
+        let logs = log_root.join("123");
+
+        create_private_mps_paths(&pipe, &log_root, &logs).unwrap();
+
+        assert!(pipe.is_dir());
+        assert!(logs.is_dir());
+        assert_eq!(
+            std::fs::metadata(&pipe).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&logs).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn private_mps_path_collision_is_preserved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pipe = tmp.path().join("pipe");
+        let log_root = tmp.path().join("log-root");
+        let logs = log_root.join("123");
+        std::fs::create_dir(&pipe).unwrap();
+        std::fs::write(pipe.join("owner-sentinel"), b"keep").unwrap();
+
+        let error = create_private_mps_paths(&pipe, &log_root, &logs).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(pipe.join("owner-sentinel")).unwrap(), b"keep");
+        assert!(!logs.exists());
     }
 }

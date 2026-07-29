@@ -38,7 +38,19 @@ const CU_ATTR_CC_MINOR: c_int = 76;
 /// then falls back to its static answer.
 #[cfg(unix)]
 unsafe fn cu_sym(name: &std::ffi::CStr) -> Option<*mut std::ffi::c_void> {
-    let p = libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr());
+    let mut p = libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr());
+    if p.is_null() {
+        // CUDA is commonly loaded with RTLD_LOCAL (including by torch), which
+        // keeps its symbols out of RTLD_DEFAULT. Open the staged driver shim
+        // explicitly so NVML queries still reflect the remoted hardware.
+        static DRIVER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let handle = *DRIVER.get_or_init(|| {
+            libc::dlopen(c"libcuda.so.1".as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) as usize
+        }) as *mut std::ffi::c_void;
+        if !handle.is_null() {
+            p = libc::dlsym(handle, name.as_ptr());
+        }
+    }
     if p.is_null() {
         None
     } else {
@@ -88,7 +100,8 @@ fn cu_device_name(ord: c_int) -> Option<String> {
         let dev = cu_device(ord)?;
         let f = cu_sym(c"cuDeviceGetName")?;
         let f: extern "C" fn(*mut c_char, c_int, c_int) -> c_int = std::mem::transmute(f);
-        let mut buf = [0i8; 256];
+        // c_char, not i8: they differ on aarch64 Linux, where c_char is u8.
+        let mut buf: [c_char; 256] = [0; 256];
         (f(buf.as_mut_ptr(), buf.len() as c_int, dev) == 0).then(|| {
             let cstr = std::ffi::CStr::from_ptr(buf.as_ptr());
             cstr.to_string_lossy().into_owned()
@@ -148,7 +161,9 @@ unsafe fn write_cstr(dst: *mut c_char, len: c_uint, s: &str) {
     let cap = len as usize - 1;
     let bytes = s.as_bytes();
     let n = bytes.len().min(cap);
-    std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, dst, n);
+    // `.cast()`: c_char is u8 on aarch64 Linux (making `as` a no-op cast clippy
+    // rejects) but i8 elsewhere.
+    std::ptr::copy_nonoverlapping(bytes.as_ptr().cast::<c_char>(), dst, n);
     *dst.add(n) = 0;
 }
 
