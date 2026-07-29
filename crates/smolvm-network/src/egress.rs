@@ -237,6 +237,8 @@ fn is_reserved_v4(v4: Ipv4Addr) -> bool {
         || v4.is_private()    // 10/8, 172.16/12, 192.168/16 — host/control internal subnet
         || v4.is_unspecified()
         || v4.is_broadcast()
+        // 224.0.0.0/4 — host LAN segment the floor exists to block
+        || v4.is_multicast()
         // 100.64.0.0/10 (CGNAT) — the gateway's own guest/gateway addresses live here.
         || matches!(v4.octets(), [100, b, ..] if (64..=127).contains(&b))
 }
@@ -252,6 +254,7 @@ fn is_floored(ip: IpAddr, mode: FloorMode) -> bool {
             IpAddr::V6(v6) => {
                 v6.is_loopback()
                     || v6.is_unspecified()
+                    || v6.is_multicast() // ff00::/8, incl. ff02::1 — see is_reserved_v4
                     || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
                     || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
                     || v6.to_ipv4_mapped().is_some_and(is_reserved_v4)
@@ -513,6 +516,12 @@ impl EgressPolicy {
         let now = Instant::now();
         learned.retain(|_, expires_at| *expires_at > now);
         for (ip, ttl) in records {
+            // Learned addresses are attacker-controlled — floor them too.
+            // Also exclude HOST_SENTINEL so a static `to: host` record can
+            // publish it without letting every allowed name reach the host loopback.
+            if is_floored(*ip, self.floor) || *ip == HOST_SENTINEL {
+                continue;
+            }
             let ttl = u64::from(*ttl).clamp(MIN_LEARNED_TTL, MAX_LEARNED_TTL);
             let expires_at = now + Duration::from_secs(ttl);
             for grant in &grants {
@@ -924,6 +933,37 @@ mod tests {
             ..Default::default()
         });
         assert!(by_cidr.allows(v4(10, 0, 0, 5), Some(8080)));
+    }
+
+    #[test]
+    fn a_dns_answer_cannot_publish_the_host_sentinel() {
+        // A DNS answer for an allowed name must not earn a grant on the sentinel
+        // — that would give every allowed name access to the host loopback.
+        let p = statics(
+            Some(&["db.local:5432", "api.test"]),
+            &[("db.local", StaticTarget::Host)],
+        );
+        p.learn_named("api.test", &[(HOST_SENTINEL, 300)]);
+        assert!(!p.allows(HOST_SENTINEL, Some(22)));
+        assert!(!p.allows(HOST_SENTINEL, None));
+        // The record's own grant is untouched.
+        assert!(p.allows(HOST_SENTINEL, Some(5432)));
+    }
+
+    #[test]
+    fn the_floor_covers_multicast() {
+        // Floor-only (no allow-list) must block multicast from the host LAN.
+        let p = EgressPolicy::new(EgressConfig {
+            floor: Some(FloorMode::Strict),
+            ..Default::default()
+        });
+        for addr in ["224.0.0.1", "239.255.255.250", "224.0.0.251", "ff02::1"] {
+            let ip: IpAddr = addr.parse().unwrap();
+            assert!(!p.allows(ip, Some(1900)), "reached {addr}");
+        }
+        // …including the IPv4-mapped spelling, which `Ipv6Addr::is_multicast`
+        // answers `false` for on its own.
+        assert!(!p.allows("::ffff:239.255.255.250".parse().unwrap(), Some(1900)));
     }
 
     #[test]
