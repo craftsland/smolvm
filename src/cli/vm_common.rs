@@ -688,6 +688,11 @@ pub struct ForkLaunch {
     /// Clone boot only: share the golden's loaded CUDA weights instead of
     /// copying them (`machine fork --share-weights`).
     pub share_weights: bool,
+    /// Planned number of runnable CUDA clones. Set only when starting a golden;
+    /// the value is persisted on its record and inherited by clone records.
+    pub pool_size: Option<u32>,
+    /// Optional explicit logical VRAM limit per golden/clone session.
+    pub vram_limit_mib: Option<u64>,
 }
 
 /// Fork parameters for starting a machine as a forkable base (memfd RAM), so
@@ -698,6 +703,8 @@ pub fn forkable_launch() -> ForkLaunch {
         forkable: true,
         snapshot_dir: None,
         share_weights: false,
+        pool_size: None,
+        vram_limit_mib: None,
     }
 }
 
@@ -867,6 +874,21 @@ pub fn start_vm_named(
         }
     }
 
+    if let Some(pool_size) = fork.pool_size {
+        if !record.cuda {
+            return Err(Error::config(
+                "fork pool",
+                "--fork-pool-size requires a CUDA-enabled machine",
+            ));
+        }
+        record.cuda_fork_pool_size = Some(pool_size);
+        db.update_vm(name, |r| r.cuda_fork_pool_size = Some(pool_size))?;
+    }
+    if let Some(limit_mib) = fork.vram_limit_mib {
+        record.cuda_vram_limit_mib = Some(limit_mib);
+        db.update_vm(name, |r| r.cuda_vram_limit_mib = Some(limit_mib))?;
+    }
+
     let mounts = record.host_mounts();
     let ports = record.port_mappings();
     let mut resources = record.vm_resources();
@@ -961,6 +983,8 @@ pub fn start_vm_named(
     features.forkable = fork.forkable;
     features.snapshot_dir = fork.snapshot_dir;
     features.cuda_share_weights = fork.share_weights;
+    features.cuda_fork_pool_size = record.cuda_fork_pool_size;
+    features.cuda_vram_limit_mib = record.cuda_vram_limit_mib;
     // A machine created from a local image archive/dir persists a `local:…`
     // reference; re-derive its virtiofs mount dir so the guest assembles the
     // rootfs from it instead of pulling.

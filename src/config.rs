@@ -517,6 +517,15 @@ pub struct VmRecord {
     #[serde(default)]
     pub cuda: bool,
 
+    /// Planned number of runnable CUDA fork clones. Persisted so every clone
+    /// receives the same pre-initialization VRAM policy as its golden.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cuda_fork_pool_size: Option<u32>,
+
+    /// Explicit logical VRAM limit applied to the golden and every clone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cuda_vram_limit_mib: Option<u64>,
+
     /// Expose the guest's Docker daemon socket to the host as a Unix socket in
     /// the VM data dir, so a host client can drive it with `DOCKER_HOST=unix://…`.
     #[serde(default)]
@@ -629,6 +638,8 @@ impl VmRecord {
             health_startup_grace_secs: None,
             ssh_agent: false,
             cuda: false,
+            cuda_fork_pool_size: None,
+            cuda_vram_limit_mib: None,
             docker_socket: false,
             dns_filter_hosts: None,
             ephemeral: false,
@@ -686,6 +697,8 @@ impl VmRecord {
             health_startup_grace_secs: None,
             ssh_agent: false,
             cuda: false,
+            cuda_fork_pool_size: None,
+            cuda_vram_limit_mib: None,
             docker_socket: false,
             dns_filter_hosts: None,
             ephemeral: false,
@@ -1136,6 +1149,35 @@ mod tests {
         let default_record = VmRecord::new("default".to_string(), 1, 512, vec![], vec![], false);
         assert_eq!(default_record.gpu, None);
         assert!(!default_record.vm_resources().gpu);
+    }
+
+    #[test]
+    fn cuda_fork_capacity_policy_roundtrips_and_defaults_absent() {
+        let mut record = VmRecord::new("cuda-pool".to_string(), 4, 4096, vec![], vec![], false);
+        record.cuda = true;
+        record.cuda_fork_pool_size = Some(4);
+        record.cuda_vram_limit_mib = Some(10240);
+
+        let encoded = serde_json::to_vec(&record).unwrap();
+        let decoded: VmRecord = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.cuda_fork_pool_size, Some(4));
+        assert_eq!(decoded.cuda_vram_limit_mib, Some(10240));
+
+        let mut legacy_value = serde_json::to_value(VmRecord::new(
+            "legacy".to_string(),
+            1,
+            512,
+            vec![],
+            vec![],
+            false,
+        ))
+        .unwrap();
+        let legacy_object = legacy_value.as_object_mut().unwrap();
+        legacy_object.remove("cuda_fork_pool_size");
+        legacy_object.remove("cuda_vram_limit_mib");
+        let legacy: VmRecord = serde_json::from_value(legacy_value).unwrap();
+        assert_eq!(legacy.cuda_fork_pool_size, None);
+        assert_eq!(legacy.cuda_vram_limit_mib, None);
     }
 
     #[test]

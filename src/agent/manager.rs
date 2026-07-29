@@ -1712,6 +1712,12 @@ impl AgentManager {
                 // golden's loaded weights instead of copying them.
                 v.push(("SMOLVM_CUDA_CLONE_SHARE", "1".to_string()));
             }
+            if let Some(pool_size) = features.cuda_fork_pool_size {
+                v.push(("SMOLVM_CUDA_FORK_POOL_SIZE", pool_size.to_string()));
+            }
+            if let Some(limit_mib) = features.cuda_vram_limit_mib {
+                v.push(("SMOLVM_CUDA_VRAM_LIMIT_MB", limit_mib.to_string()));
+            }
             // A CUDA fork clone must stay ptrace-readable by the same-uid daemon
             // /worker: the proc-mem live-RAM transport preads /proc/<pid>/mem for
             // D2H/H2D, so the clone must NOT harden to dumpable=0. Same same-uid

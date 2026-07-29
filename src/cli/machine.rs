@@ -1858,6 +1858,35 @@ mod tests {
         assert!(cmd.detach);
     }
 
+    #[test]
+    fn start_cuda_pool_flags_parse_and_limit_requires_pool() {
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "start",
+            "--name",
+            "golden",
+            "--fork-pool-size",
+            "4",
+            "--cuda-vram-limit-mib",
+            "10240",
+        ]);
+        let MachineCmd::Start(cmd) = cli.command else {
+            panic!("expected machine start command");
+        };
+        assert_eq!(cmd.fork_pool_size.map(|v| v.get()), Some(4));
+        assert_eq!(cmd.cuda_vram_limit_mib.map(|v| v.get()), Some(10240));
+
+        assert!(TestMachineCli::try_parse_from([
+            "machine",
+            "start",
+            "--name",
+            "golden",
+            "--cuda-vram-limit-mib",
+            "10240",
+        ])
+        .is_err());
+    }
+
     // Documents the clap parsing behaviour: positionals before "--" land in
     // `command`, not `image`.  is_likely_image_ref() catches the unambiguous
     // cases before a VM is booted.
@@ -2792,6 +2821,18 @@ pub struct StartCmd {
     #[arg(long)]
     pub forkable: bool,
 
+    /// Plan a CUDA fork pool with this many runnable clones. Smolvm reports a
+    /// safe per-session VRAM share before the golden initializes, so vLLM and
+    /// similar runtimes size private caches without workload changes. Implies
+    /// --forkable.
+    #[arg(long, value_name = "CLONES")]
+    pub fork_pool_size: Option<std::num::NonZeroU32>,
+
+    /// Override the automatic logical VRAM budget for each golden/clone CUDA
+    /// session. The workload still needs no changes. Requires --fork-pool-size.
+    #[arg(long, value_name = "MIB", requires = "fork_pool_size")]
+    pub cuda_vram_limit_mib: Option<std::num::NonZeroU64>,
+
     #[command(flatten, next_help_heading = "Network")]
     pub proxy_opts: crate::cli::proxy_opts::ProxyOpts,
 }
@@ -2804,8 +2845,11 @@ impl StartCmd {
         let no_proxy = self.proxy_opts.no_proxy();
         // Forkable start: memfd-back guest RAM and register a control socket at a
         // known path so `machine fork` can later freeze this machine as a CoW base.
-        let fork = if self.forkable {
-            vm_common::forkable_launch()
+        let fork = if self.forkable || self.fork_pool_size.is_some() {
+            let mut launch = vm_common::forkable_launch();
+            launch.pool_size = self.fork_pool_size.map(std::num::NonZeroU32::get);
+            launch.vram_limit_mib = self.cuda_vram_limit_mib.map(std::num::NonZeroU64::get);
+            launch
         } else {
             vm_common::ForkLaunch::default()
         };

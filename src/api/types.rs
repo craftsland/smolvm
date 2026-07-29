@@ -627,6 +627,12 @@ pub struct MachineInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 2)]
     pub overlay_gb: Option<u64>,
+    /// Planned runnable CUDA clone count used for automatic capacity budgeting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cuda_fork_pool_size: Option<u32>,
+    /// Explicit logical CUDA memory limit per golden/clone session, in MiB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cuda_vram_limit_mib: Option<u64>,
     /// Cumulative guest-outbound (egress) bytes since boot, for billing. Present
     /// only for virtio-net machines that have reported a value; omitted for TSI
     /// or machines that haven't flushed yet. Surfaced the same way `storage_gb`
@@ -723,6 +729,14 @@ pub struct StartMachineQuery {
     /// with `POST /machines/{name}/fork`. The golden freezes after its first fork.
     #[serde(default)]
     pub forkable: bool,
+    /// Number of runnable CUDA fork clones planned for this golden. Supplying
+    /// it enables forkable launch and transparent pre-initialization VRAM
+    /// budgeting for cache-sizing frameworks.
+    #[serde(default, rename = "forkPoolSize")]
+    pub fork_pool_size: Option<u32>,
+    /// Explicit logical VRAM limit per golden/clone session, in MiB.
+    #[serde(default, rename = "cudaVramLimitMib")]
+    pub cuda_vram_limit_mib: Option<u64>,
 }
 
 /// Credentials for the registry a machine's image lives in.

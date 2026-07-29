@@ -105,6 +105,8 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         // when unset.
         storage_gb: Some(record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GIB)),
         overlay_gb: Some(record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB)),
+        cuda_fork_pool_size: record.cuda_fork_pool_size,
+        cuda_vram_limit_mib: record.cuda_vram_limit_mib,
         // Cumulative egress, read from the per-VM telemetry file the subprocess
         // flushes. Surfaced here so the control plane reads it from the machine
         // list exactly like disk size — no bespoke endpoint.
@@ -170,6 +172,8 @@ fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> Machin
         network: record.network,
         secret_refs: record.secret_refs.clone(),
         source_smolmachine: record.source_smolmachine.clone(),
+        cuda_fork_pool_size: record.cuda_fork_pool_size,
+        cuda_vram_limit_mib: record.cuda_vram_limit_mib,
     }
 }
 
@@ -902,7 +906,9 @@ fn validate_workload_image_source(
     tag = "Machines",
     params(
         ("name" = String, Path, description = "Machine name"),
-        ("forkable" = Option<bool>, Query, description = "Start as a fork base (memfd RAM + control socket)")
+        ("forkable" = Option<bool>, Query, description = "Start as a fork base (memfd RAM + control socket)"),
+        ("forkPoolSize" = Option<u32>, Query, description = "Planned runnable CUDA clones; implies forkable and enables automatic VRAM budgeting"),
+        ("cudaVramLimitMib" = Option<u64>, Query, description = "Optional logical VRAM limit per golden/clone session; requires forkPoolSize")
     ),
     responses(
         (status = 200, description = "Machine started", body = MachineInfo),
@@ -932,7 +938,7 @@ pub async fn start_machine(
     let _guard = lifecycle.lock().await;
 
     // Get VM record from database (off the reactor)
-    let record = state
+    let mut record = state
         .lookup_vm(&name)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
@@ -989,6 +995,41 @@ pub async fn start_machine(
         .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
     }
 
+    if let Some(pool_size) = query.fork_pool_size {
+        if pool_size == 0 {
+            return Err(ApiError::BadRequest(
+                "forkPoolSize must be greater than zero".to_string(),
+            ));
+        }
+        if !record.cuda {
+            return Err(ApiError::BadRequest(
+                "forkPoolSize requires a CUDA-enabled machine".to_string(),
+            ));
+        }
+        record.cuda_fork_pool_size = Some(pool_size);
+        state
+            .update_vm(&name, move |r| r.cuda_fork_pool_size = Some(pool_size))
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+    }
+    if let Some(limit_mib) = query.cuda_vram_limit_mib {
+        if limit_mib == 0 {
+            return Err(ApiError::BadRequest(
+                "cudaVramLimitMib must be greater than zero".to_string(),
+            ));
+        }
+        if query.fork_pool_size.is_none() {
+            return Err(ApiError::BadRequest(
+                "cudaVramLimitMib requires forkPoolSize".to_string(),
+            ));
+        }
+        record.cuda_vram_limit_mib = Some(limit_mib);
+        state
+            .update_vm(&name, move |r| r.cuda_vram_limit_mib = Some(limit_mib))
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+    }
+
     let mounts = record.host_mounts();
     let ports = record.port_mappings();
     let resources = record.vm_resources();
@@ -1001,7 +1042,9 @@ pub async fn start_machine(
     let source_smolmachine = record.source_smolmachine.clone();
     let dns_filter_hosts = record.dns_filter_hosts.clone();
     let record_golden = record.golden.clone();
-    let forkable = query.forkable;
+    let cuda_fork_pool_size = record.cuda_fork_pool_size;
+    let cuda_vram_limit_mib = record.cuda_vram_limit_mib;
+    let forkable = query.forkable || query.fork_pool_size.is_some();
     let (manager, pid) = tokio::task::spawn_blocking(move || {
         let manager = AgentManager::for_vm_with_sizes(&name_clone, storage_gb, overlay_gb)
             .map_err(|e| format!("failed to create agent manager: {}", e))?;
@@ -1026,6 +1069,8 @@ pub async fn start_machine(
         if forkable {
             features.forkable = true;
         }
+        features.cuda_fork_pool_size = cuda_fork_pool_size;
+        features.cuda_vram_limit_mib = cuda_vram_limit_mib;
         let _ = manager
             .ensure_running_via_subprocess(mounts, ports, resources, features)
             .map_err(|e| format!("failed to start machine: {}", e))?;
@@ -1304,6 +1349,8 @@ pub async fn fork_machine(
         // Boot from the golden's snapshot instead of cold-booting.
         features.snapshot_dir = Some(prep.snapshot_dir);
         features.cuda_share_weights = req_share_weights;
+        features.cuda_fork_pool_size = record.cuda_fork_pool_size;
+        features.cuda_vram_limit_mib = record.cuda_vram_limit_mib;
 
         if let Err(e) = manager.ensure_running_via_subprocess(mounts, ports, resources, features) {
             // Boot failed: roll back the clone registration so a failed fork

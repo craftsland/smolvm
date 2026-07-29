@@ -89,6 +89,12 @@ fn start_vm_from_record(record: &VmRecord) -> Result<VmHandle> {
 /// the plain, forkable-golden, and fork-clone start paths so they can't drift.
 fn launch_from_record(record: &VmRecord, features: LaunchFeatures) -> Result<VmHandle> {
     let mut features = features;
+    if features.cuda_fork_pool_size.is_none() {
+        features.cuda_fork_pool_size = record.cuda_fork_pool_size;
+    }
+    if features.cuda_vram_limit_mib.is_none() {
+        features.cuda_vram_limit_mib = record.cuda_vram_limit_mib;
+    }
     // A fork clone shares its golden's uid; resolve it explicitly so a cold
     // (re)start — where no snapshot path exists to infer it — can still open
     // the golden's copy-on-write disk backing behind its 0700 data dir.

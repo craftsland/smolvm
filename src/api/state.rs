@@ -92,6 +92,11 @@ pub struct MachineEntry {
     /// virtiofs instead of having the guest pull from a registry. `None` for
     /// image/registry-sourced machines. Mirrors `VmRecord::source_smolmachine`.
     pub source_smolmachine: Option<String>,
+    /// Planned CUDA clone count used to restore the same virtual-VRAM policy
+    /// on implicit starts.
+    pub cuda_fork_pool_size: Option<u32>,
+    /// Explicit logical CUDA memory limit restored on implicit starts.
+    pub cuda_vram_limit_mib: Option<u64>,
 }
 
 /// Parameters for registering a new machine.
@@ -385,6 +390,8 @@ impl ApiState {
                             network: record.network,
                             secret_refs: record.secret_refs.clone(),
                             source_smolmachine: record.source_smolmachine.clone(),
+                            cuda_fork_pool_size: record.cuda_fork_pool_size,
+                            cuda_vram_limit_mib: record.cuda_vram_limit_mib,
                         })),
                     );
                     loaded.push(name.clone());
@@ -858,6 +865,8 @@ impl ApiState {
                         network: reg.network,
                         secret_refs: reg.secret_refs,
                         source_smolmachine: reg.source_smolmachine,
+                        cuda_fork_pool_size: None,
+                        cuda_vram_limit_mib: None,
                     })),
                 );
                 Ok(())
@@ -1154,7 +1163,7 @@ pub async fn ensure_machine_running(
         // packed layers itself (see `rewire_packed_layers_if_extracted`), so the
         // restart keeps using them instead of falling back to a registry pull.
         let already_up = entry.manager.try_connect_existing().is_some();
-        let features = if already_up {
+        let mut features = if already_up {
             crate::agent::LaunchFeatures::default()
         } else {
             build_launch_features(
@@ -1163,6 +1172,8 @@ pub async fn ensure_machine_running(
                 entry.resources.allowed_hosts.clone(),
             )?
         };
+        features.cuda_fork_pool_size = entry.cuda_fork_pool_size;
+        features.cuda_vram_limit_mib = entry.cuda_vram_limit_mib;
         entry
             .manager
             .ensure_running_via_subprocess(mounts, ports, resources, features)?;
@@ -1222,6 +1233,8 @@ pub async fn ensure_running_and_persist(
         e.resources.cpus = Some(record.cpus);
         e.resources.memory_mb = Some(record.mem);
         e.network = record.network;
+        e.cuda_fork_pool_size = record.cuda_fork_pool_size;
+        e.cuda_vram_limit_mib = record.cuda_vram_limit_mib;
     }
 
     let freshly_booted = ensure_machine_running(entry).await?;
@@ -1490,6 +1503,8 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
         allowed_hosts: entry.resources.allowed_hosts.clone(),
         storage_gb: entry.resources.storage_gb,
         overlay_gb: entry.resources.overlay_gb,
+        cuda_fork_pool_size: entry.cuda_fork_pool_size,
+        cuda_vram_limit_mib: entry.cuda_vram_limit_mib,
         egress_bytes,
         cpu_seconds,
         cpu_millis,
@@ -1611,6 +1626,8 @@ mod tests {
                 network: false,
                 secret_refs: Default::default(),
                 source_smolmachine: None,
+                cuda_fork_pool_size: None,
+                cuda_vram_limit_mib: None,
             },
         );
 
@@ -1674,6 +1691,8 @@ mod tests {
                 network: false,
                 secret_refs: Default::default(),
                 source_smolmachine: None,
+                cuda_fork_pool_size: None,
+                cuda_vram_limit_mib: None,
             },
         );
 
