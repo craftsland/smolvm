@@ -497,7 +497,7 @@ fn signal_ready_to_host() {
     let paths = [format!("/oldroot/{}", marker), format!("/{}", marker)];
 
     for path in &paths {
-        if Path::new(path).parent().map_or(false, |p| p.exists()) {
+        if Path::new(path).parent().is_some_and(|p| p.exists()) {
             // Write + fsync so the host sees the marker immediately. A plain
             // write() can sit in the guest's virtiofs writeback cache for
             // seconds before the host fs backend observes it, leaving the host's
@@ -3297,13 +3297,29 @@ fn handle_run_detached(
         "starting detached container"
     );
 
-    let prepared = match storage::prepare_for_run_persistent(&image, &overlay_id) {
-        Ok(p) => p,
-        Err(e) => {
-            send_response(stream, &AgentResponse::from_err(e, error_codes::RUN_FAILED))?;
-            return Ok(());
-        }
+    let progress = |phase: &str, bytes: u64| {
+        let message = if bytes == 0 {
+            phase.to_string()
+        } else {
+            format!("{phase} ({} MiB)", bytes / (1024 * 1024))
+        };
+        let _ = send_response(
+            stream,
+            &AgentResponse::Progress {
+                message,
+                percent: None,
+                layer: None,
+            },
+        );
     };
+    let prepared =
+        match storage::prepare_for_run_persistent_with_progress(&image, &overlay_id, progress) {
+            Ok(p) => p,
+            Err(e) => {
+                send_response(stream, &AgentResponse::from_err(e, error_codes::RUN_FAILED))?;
+                return Ok(());
+            }
+        };
 
     // Resolve the container's launch settings from the image's OCI config
     // (command, Env, WorkingDir, User) with the request layered on top.
@@ -3381,6 +3397,14 @@ fn handle_run_detached(
         workload_id = %workload_id,
         "running detached container"
     );
+    send_response(
+        stream,
+        &AgentResponse::Progress {
+            message: "starting detached container".to_string(),
+            percent: None,
+            layer: None,
+        },
+    )?;
 
     // Use `crun create` + `crun start` (two-step OCI lifecycle) instead of
     // `crun run --detach` which hangs in the smolvm VM environment. The
@@ -4992,7 +5016,6 @@ fn cap_exec_response(resp: AgentResponse) -> AgentResponse {
     resp
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Run a non-interactive command inside the machine's long-lived keep-alive
 /// container (establishing it on first use), capturing its output. Joining the
 /// keep-alive container — rather than spawning a fresh one per exec — is what
@@ -5118,6 +5141,9 @@ fn run_in_keepalive_container(
     })
 }
 
+// Mirrors `storage::run_command`'s workload parameter list one-for-one; both
+// want folding into a shared spec struct rather than trimming here.
+#[allow(clippy::too_many_arguments)]
 fn handle_run(
     image: &str,
     command: &[String],
@@ -6326,9 +6352,9 @@ mod tests {
 
         let got = std::fs::read(&target).unwrap();
         let mut expected = Vec::with_capacity(total);
-        expected.extend(std::iter::repeat(b'A').take(400));
-        expected.extend(std::iter::repeat(b'B').take(400));
-        expected.extend(std::iter::repeat(b'C').take(224));
+        expected.extend(std::iter::repeat_n(b'A', 400));
+        expected.extend(std::iter::repeat_n(b'B', 400));
+        expected.extend(std::iter::repeat_n(b'C', 224));
         assert_eq!(got, expected);
         assert!(staging_files_in(tmp.path()).is_empty());
     }
