@@ -1969,6 +1969,13 @@ pub async fn resize_machine(
     Ok(Json(record_to_info(&name, &record)))
 }
 
+/// Where the export subprocess writes its executable stub. `pack create -o X` derives the
+/// real artifact as `X.smolmachine`, so this must NOT already end in that extension or the
+/// CLI rejects it outright.
+fn export_stub_path(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("export")
+}
+
 /// Export a stopped machine to a `.smolmachine` and push it directly to a
 /// registry.
 ///
@@ -2029,11 +2036,12 @@ pub async fn export_machine(
     // Build the .smolmachine by subprocessing this binary's tested export path.
     // The serve handlers and the pack CLI share the same on-disk SmolvmDb, so
     // `pack create --from-vm <name>` sees the serve-managed machine.
-    let tmp = tempfile::Builder::new()
-        .suffix(".smolmachine")
-        .tempfile()
-        .map_err(|e| ApiError::internal(format!("create temp file: {}", e)))?;
-    let tmp_path = tmp.path().to_path_buf();
+    // `pack create -o X` names the executable STUB and derives the sidecar as
+    // X.smolmachine, rejecting an `-o` that already carries that extension. Stage both
+    // inside a temp dir so the sidecar is cleaned up with the stub rather than left behind.
+    let tmp_dir =
+        tempfile::tempdir().map_err(|e| ApiError::internal(format!("create temp dir: {}", e)))?;
+    let tmp_path = export_stub_path(tmp_dir.path());
     let exe =
         std::env::current_exe().map_err(|e| ApiError::internal(format!("current_exe: {}", e)))?;
 
@@ -2223,9 +2231,31 @@ fn merge_request_env(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::db::SmolvmDb;
     use tempfile::TempDir;
+
+    #[test]
+    fn export_stub_path_is_not_the_sidecar_name() {
+        // Regression: the handler used to hand `pack create` a temp file that already
+        // ended in `.smolmachine`, which the CLI rejects because `-o` names the stub.
+        let dir = std::path::Path::new("/tmp/export-test");
+        let stub = export_stub_path(dir);
+        assert!(
+            stub.extension()
+                .is_none_or(|e| !e.eq_ignore_ascii_case("smolmachine")),
+            "-o must name the stub, not the sidecar: {}",
+            stub.display()
+        );
+        let sidecar = smolvm_pack::sidecar_path_for(&stub);
+        assert_eq!(
+            sidecar.extension().and_then(|e| e.to_str()),
+            Some("smolmachine"),
+            "the derived sidecar must be the .smolmachine artifact"
+        );
+        assert_ne!(stub, sidecar);
+    }
 
     #[test]
     fn classify_fork_error_maps_precondition_failures_to_conflict() {
