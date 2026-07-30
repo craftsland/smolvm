@@ -1336,6 +1336,78 @@ pub fn set_vmm_trans(map: HashMap<u64, u64>) {
     VMM_TRANS.with(|m| *m.borrow_mut() = Some(map));
 }
 
+/// Address ranges whose reconstructed physical allocation is shared with the
+/// frozen golden. Clone resume can replay the golden allocator's original
+/// `cuMemSetAccess(...READWRITE)` calls after reconstruction; those replays
+/// must not silently undo the read-only mapping installed by the worker.
+static WORKER_SHARED_VMM_RANGES: std::sync::Mutex<Vec<(u64, u64)>> =
+    std::sync::Mutex::new(Vec::new());
+
+pub fn set_worker_shared_vmm_ranges(ranges: Vec<(u64, u64)>) {
+    *WORKER_SHARED_VMM_RANGES.lock().unwrap() = ranges;
+}
+
+fn vmm_access_partitions(va: u64, size: u64, shared: &[(u64, u64)]) -> Vec<(u64, u64, bool)> {
+    let Some(end) = va.checked_add(size) else {
+        return vec![(va, size, false)];
+    };
+    let mut intersections: Vec<(u64, u64)> = shared
+        .iter()
+        .filter_map(|&(base, len)| {
+            let shared_end = base.checked_add(len)?;
+            let start = va.max(base);
+            let stop = end.min(shared_end);
+            (start < stop).then_some((start, stop))
+        })
+        .collect();
+    intersections.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for (start, stop) in intersections {
+        if let Some(last) = merged.last_mut().filter(|last| start <= last.1) {
+            last.1 = last.1.max(stop);
+        } else {
+            merged.push((start, stop));
+        }
+    }
+    let mut result = Vec::new();
+    let mut cursor = va;
+    for (start, stop) in merged {
+        if cursor < start {
+            result.push((cursor, start - cursor, false));
+        }
+        result.push((start, stop - start, true));
+        cursor = stop;
+    }
+    if cursor < end {
+        result.push((cursor, end - cursor, false));
+    }
+    result
+}
+
+fn forget_worker_shared_vmm_range(va: u64, size: u64) {
+    let Some(end) = va.checked_add(size) else {
+        return;
+    };
+    let mut ranges = WORKER_SHARED_VMM_RANGES.lock().unwrap();
+    let mut retained = Vec::with_capacity(ranges.len() + 1);
+    for &(base, len) in ranges.iter() {
+        let Some(shared_end) = base.checked_add(len) else {
+            continue;
+        };
+        if shared_end <= va || base >= end {
+            retained.push((base, len));
+            continue;
+        }
+        if base < va {
+            retained.push((base, va - base));
+        }
+        if shared_end > end {
+            retained.push((end, shared_end - end));
+        }
+    }
+    *ranges = retained;
+}
+
 /// Worker-mode: private copies of the golden's non-VMM (`cudaMalloc`)
 /// allocations, made during reconstruction — `(golden_dptr, size, copy)`.
 /// Process-global and NON-draining: every serving thread's isolate session
@@ -1841,6 +1913,89 @@ fn cow_written(sess: &mut Session, b: &mut dyn Backend, req: &Request) {
             cow_one(sess, b, *dst)
         }
         _ => {}
+    }
+}
+
+/// Address-preserving COW for shared VMM chunks in a clone worker. An
+/// expandable-segment chunk can be reused for mutable training data after the
+/// snapshot, so its first explicit write must replace the shared mapping with
+/// private physical memory at the same virtual address.
+fn cow_worker_vmm_range(
+    sess: &Session,
+    b: &mut dyn Backend,
+    dptr: u64,
+    bytes: u64,
+) -> CuResult<()> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    let write_end = dptr.saturating_add(bytes);
+    let mut ranges = WORKER_SHARED_VMM_RANGES.lock().unwrap();
+    let device = if sess.device_pinned {
+        sess.device_base
+    } else {
+        0
+    };
+    while let Some(index) = ranges.iter().position(|&(base, size)| {
+        let end = base.saturating_add(size);
+        dptr < end && base < write_end
+    }) {
+        let (base, size) = ranges[index];
+        let private = b.mem_create(size, device)?;
+        let snapshot = match b.memcpy_dtoh(base, size, 0) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let _ = b.mem_release(private);
+                return Err(error);
+            }
+        };
+        if let Err(error) = b.ctx_synchronize() {
+            let _ = b.mem_release(private);
+            return Err(error);
+        }
+        if let Err(error) = b.mem_unmap(base, size) {
+            let _ = b.mem_release(private);
+            return Err(error);
+        }
+        if let Err(error) = b.mem_map(base, size, 0, private) {
+            let _ = b.mem_release(private);
+            return Err(error);
+        }
+        if let Err(error) = b.mem_set_access(base, size, device) {
+            let _ = b.mem_release(private);
+            return Err(error);
+        }
+        // The mapping retains the allocation. The old imported handle remains
+        // in VMM_TRANS so the guest can release its inherited handle normally.
+        let _ = b.mem_release(private);
+        b.memcpy_htod(base, &snapshot, 0)?;
+        b.ctx_synchronize()?;
+        ranges.swap_remove(index);
+    }
+    Ok(())
+}
+
+fn cow_worker_vmm_written(sess: &Session, b: &mut dyn Backend, req: &Request) -> CuResult<()> {
+    let written = match req {
+        Request::MemcpyHtoD { dptr, data, .. } => Some((*dptr, data.len() as u64)),
+        Request::MemsetD8 { dptr, bytes, .. } | Request::MemsetD8Async { dptr, bytes, .. } => {
+            Some((*dptr, *bytes))
+        }
+        Request::MemcpyShmHtoD { dptr, size, .. } => Some((*dptr, *size)),
+        Request::MemcpyGpaHtoD { dptr, segments, .. } => {
+            let bytes = segments
+                .iter()
+                .fold(0_u64, |total, (_, len)| total.saturating_add(*len));
+            Some((*dptr, bytes))
+        }
+        Request::MemcpyDtoD { dst, bytes, .. } | Request::MemcpyDtoDAsync { dst, bytes, .. } => {
+            Some((*dst, *bytes))
+        }
+        _ => None,
+    };
+    match written {
+        Some((dptr, bytes)) => cow_worker_vmm_range(sess, b, dptr, bytes),
+        None => Ok(()),
     }
 }
 
@@ -3225,6 +3380,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
     // Copy-on-write any shared weight buffer this request writes, then rewrite
     // inherited device pointers to this clone's private copies (both no-ops
     // unless this is an isolating clone).
+    if let Err(code) = cow_worker_vmm_written(sess, b, &req) {
+        return (code, Response::Ok);
+    }
     cow_written(sess, b, &req);
     let req = translate_dptrs(&sess.dptr_trans, req);
     let trace = optrace_summary(&req);
@@ -4360,14 +4518,26 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 Response::Ok
             })
         }
-        Request::MemSetAccess { va, size, device } => b
-            .mem_set_access(va, size, dev(sess, device))
-            .map(|_| Response::Ok),
+        Request::MemSetAccess { va, size, device } => {
+            let partitions =
+                vmm_access_partitions(va, size, &WORKER_SHARED_VMM_RANGES.lock().unwrap());
+            for (part_va, part_size, read_only) in partitions {
+                if read_only {
+                    b.mem_set_access_ro(part_va, part_size, dev(sess, device))?;
+                } else {
+                    b.mem_set_access(part_va, part_size, dev(sess, device))?;
+                }
+            }
+            Ok(Response::Ok)
+        }
         Request::MemUnmap { va, size } => {
             sess.owned_vmm_maps.remove(&va);
             sess.vmm_ranges.lock().unwrap().remove(&va);
             sess.golden_layout.lock().unwrap().maps.remove(&va);
-            b.mem_unmap(va, size).map(|_| Response::Ok)
+            b.mem_unmap(va, size).map(|_| {
+                forget_worker_shared_vmm_range(va, size);
+                Response::Ok
+            })
         }
         Request::MemRelease { handle } => {
             // Burst create: resolve (and retire) the session's virtual handle.
@@ -4777,6 +4947,24 @@ mod tests {
     use super::*;
     use crate::client::Client;
     use std::io::{Read, Write};
+
+    #[test]
+    fn replayed_vmm_access_preserves_only_shared_intersections() {
+        assert_eq!(
+            vmm_access_partitions(0x1000, 0x5000, &[(0x2000, 0x1000), (0x4000, 0x1000)]),
+            vec![
+                (0x1000, 0x1000, false),
+                (0x2000, 0x1000, true),
+                (0x3000, 0x1000, false),
+                (0x4000, 0x1000, true),
+                (0x5000, 0x1000, false),
+            ]
+        );
+        assert_eq!(
+            vmm_access_partitions(0x2000, 0x2000, &[(0x1000, 0x4000)]),
+            vec![(0x2000, 0x2000, true)]
+        );
+    }
 
     #[test]
     fn golden_capacity_can_load_the_shared_model_at_high_fanout() {

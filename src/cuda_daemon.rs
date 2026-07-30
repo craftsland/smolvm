@@ -57,6 +57,10 @@ fn golden_eviction_enabled(mode: Option<&str>, fork_pool_size: Option<u32>) -> b
     }
 }
 
+fn fork_snapshot_enabled(golden_eviction: bool, share_weights: bool) -> bool {
+    golden_eviction || share_weights
+}
+
 #[cfg(target_os = "linux")]
 fn host_snapshot_fits(required: u64, meminfo: &str) -> bool {
     let available_kib = meminfo.lines().find_map(|line| {
@@ -415,6 +419,12 @@ fn spawn_child_reaper() {
                     break;
                 }
             }
+            // Snapshot cleanup must not depend on the optional idle watchdog.
+            // Long-lived daemons use IDLE_SECS=0, but their completed fork
+            // lineages must still release retained descriptors and metadata.
+            prune_dead_metadata_layout_waiters();
+            let _ = live_clone_worker_count();
+            let _ = live_host_snapshot_count();
             thread::sleep(Duration::from_secs(2));
         })
         .ok();
@@ -1873,6 +1883,7 @@ fn reconstruct_golden_memory(
     }
     let share_weights = smolvm_cuda::host::path3_share_weights_enabled();
     let (mut count, mut shared) = (0, 0);
+    let mut shared_ranges = Vec::new();
     for e in maps_s.split(',').filter(|s| !s.is_empty()) {
         let f: Vec<&str> = e.split(':').collect();
         if f.len() < 3 {
@@ -1887,40 +1898,19 @@ fn reconstruct_golden_memory(
         let golden_h = f.get(4).and_then(|s| hx(s));
         let host_offset = f.get(5).and_then(|s| hx(s));
 
-        // DENSITY (opt-in, SMOLVM_CUDA_FORK_SHARE_WEIGHTS): a loaded weight range is
-        // read-only during frozen-base fine-tuning (LoRA freezes the base; only the
-        // clone's PRIVATE adapters train), so SHARE the golden's physical at its VA —
-        // every clone imports the same physical, so one weight set lives in VRAM.
-        // Mapped READ-WRITE: unsloth's fix_untrained_tokens writes the embedding at
-        // trainer setup, and that write is identical across clones (same base → same
-        // fix), so sharing stays correct for this use case (verified by each clone
-        // still learning its distinct task). On ANY share failure, fall through to a
-        // private copy — never leave the VA unmapped (a hole faults the clone).
+        // A fully loaded range is frozen at the snapshot boundary, so every
+        // clone can import the same physical memory at the golden VA. Shared
+        // mappings remain read-only until an explicit post-fork write replaces
+        // the affected VMM chunk with a private, address-preserving copy.
         if share_weights && loaded {
             let mut ok = false;
             if let Ok(gh) = import_with_retry(b, 4 + idx) {
                 match map_import_with_retry(b, va, size, 0, gh) {
                     Ok(()) => {
-                        // READ-ONLY by default. A shared chunk is one the golden's
-                        // H2Ds wrote and nothing has touched since (verified at fork
-                        // time), so a clone has no business writing it. Mapping it
-                        // read-write means a post-fork base write — unsloth's
-                        // embedding fixup is a KERNEL write, invisible to the COW
-                        // path, which only sees explicit mem ops — silently races
-                        // across every clone sharing that physical (loss=nan).
-                        // Read-only makes that fail-stop instead: the write faults,
-                        // and since each clone worker owns its context the blast
-                        // radius is that one clone, with the shared bytes intact for
-                        // its siblings. A warmed golden never trips it (its writes
-                        // happen pre-fork, so verification already marked those
-                        // chunks private): measured 8/8 clean, 0 faults, same
-                        // 260-shared/160-private split as read-write.
-                        // SMOLVM_CUDA_SHARE_RO=0 restores read-write sharing.
-                        let set = if std::env::var("SMOLVM_CUDA_SHARE_RO").as_deref() == Ok("0") {
-                            b.mem_set_access(va, size, device)
-                        } else {
-                            b.mem_set_access_ro(va, size, device)
-                        };
+                        // Kernel writes cannot be intercepted for COW, so keep
+                        // shared physical memory read-only and fail locally instead
+                        // of allowing one clone to corrupt its siblings.
+                        let set = b.mem_set_access_ro(va, size, device);
                         if set.is_ok() {
                             ok = true;
                         } else {
@@ -1949,6 +1939,7 @@ fn reconstruct_golden_memory(
                 }
             }
             if ok {
+                shared_ranges.push((va, size));
                 shared += 1;
                 count += 1;
                 continue;
@@ -2044,6 +2035,7 @@ fn reconstruct_golden_memory(
     // Emit the verdict in both modes. Private-copy controls need positive
     // evidence (`shared=0`) rather than inferring policy from a missing line.
     tracing::info!(shared, private = count - shared, "M2: shared weight ranges");
+    smolvm_cuda::host::set_worker_shared_vmm_ranges(shared_ranges);
     // Non-VMM golden allocations (`cudaMalloc` — a plain-torch golden keeps ALL
     // its tensors here): copy each from the daemon's staged export into a fresh
     // private buffer and record a POINTER TRANSLATION, exactly like the
@@ -2785,6 +2777,14 @@ fn metadata_layout_waiters(
 
 #[cfg(unix)]
 fn retain_metadata_layout_for_clone(token: u64, clone_id: u64, vm_pid: u32) -> bool {
+    // A frozen memory-bearing layout is also held strongly by the metadata
+    // cache after golden eviction, but its ordinary-allocation handoff has
+    // already moved into host_snapshot_cache. Do not reclassify that layout as
+    // a metadata-only helper: completing the resulting waiter set would drop
+    // the module/function/handle metadata needed by later pool replacements.
+    if cached_host_snapshot(token).is_some() {
+        return false;
+    }
     let mut waiters = metadata_layout_waiters().lock().unwrap();
     if !smolvm_cuda::host::cache_metadata_only_layout(token) {
         return false;
@@ -3498,6 +3498,34 @@ impl Drop for CachedHostSnapshot {
     }
 }
 
+/// Move owned descriptor sources above every `dup2` destination used by a
+/// clone worker. Otherwise an early `dup2` can overwrite a later source and
+/// make the worker import the wrong GPU allocation.
+#[cfg(unix)]
+fn lift_owned_fds(fds: Vec<std::os::unix::io::RawFd>, minimum: i32) -> io::Result<Vec<i32>> {
+    let mut lifted = Vec::with_capacity(fds.len());
+    for &fd in &fds {
+        // CLOEXEC is intentional on the temporary source. `dup2` creates the
+        // final destination and the child explicitly clears CLOEXEC there.
+        let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, minimum) };
+        if duplicate < 0 {
+            let error = io::Error::last_os_error();
+            for duplicate in lifted {
+                unsafe { libc::close(duplicate) };
+            }
+            for fd in fds {
+                unsafe { libc::close(fd) };
+            }
+            return Err(error);
+        }
+        lifted.push(duplicate);
+    }
+    for fd in fds {
+        unsafe { libc::close(fd) };
+    }
+    Ok(lifted)
+}
+
 #[cfg(unix)]
 fn host_snapshot_cache() -> &'static Mutex<std::collections::HashMap<u64, Arc<CachedHostSnapshot>>>
 {
@@ -3524,6 +3552,31 @@ fn bind_host_snapshot_owner(token: u64, pid: u32) {
             .golden_pid
             .compare_exchange(0, pid, Ordering::SeqCst, Ordering::SeqCst);
     }
+}
+
+#[cfg(unix)]
+fn bind_host_snapshot_to_golden(token: u64) -> Option<u32> {
+    let (matching, registered) = {
+        let registry = golden_connection_registry().lock().unwrap();
+        let matching = registry
+            .iter()
+            .filter_map(|(&pid, entries)| {
+                entries
+                    .iter()
+                    .any(|entry| {
+                        entry.token == token
+                            || smolvm_cuda::host::layout_handoff_same_process(entry.token, token)
+                    })
+                    .then_some(pid)
+            })
+            .collect();
+        (matching, registry.keys().copied().collect::<Vec<_>>())
+    };
+    let known_owner = golden_token_owners().lock().unwrap().get(&token).copied();
+    let owner = select_golden_owner(matching, known_owner, &registered)?;
+    golden_token_owners().lock().unwrap().insert(token, owner);
+    bind_host_snapshot_owner(token, owner);
+    Some(owner)
 }
 
 #[cfg(unix)]
@@ -3630,12 +3683,15 @@ fn spawn_clone_worker(
     options: ServeOptions,
 ) -> io::Result<(u32, std::os::unix::io::RawFd)> {
     use std::os::unix::process::CommandExt;
+    let exe = std::env::current_exe()?;
     let eviction_mode = std::env::var("SMOLVM_CUDA_GOLDEN_EVICT").ok();
-    let snapshot_requested =
-        golden_eviction_enabled(eviction_mode.as_deref(), options.fork_pool_size);
     let configured_sharing = std::env::var("SMOLVM_CUDA_FORK_SHARE_WEIGHTS").ok();
     let sharing_active =
         share_weights && !matches!(configured_sharing.as_deref(), Some("0" | "false" | "off"));
+    let snapshot_requested = fork_snapshot_enabled(
+        golden_eviction_enabled(eviction_mode.as_deref(), options.fork_pool_size),
+        sharing_active,
+    );
     let (golden_dev, layout, export_fds) = if let Some(cached) = cached_host_snapshot(token) {
         tracing::info!(
             token,
@@ -3868,12 +3924,25 @@ fn spawn_clone_worker(
         }
         if snapshot_complete {
             match retain_host_snapshot(token, &layout, golden_dev, &export_fds, snapshot_offset) {
-                Ok(()) => tracing::info!(
-                    token,
-                    fds = export_fds.len(),
-                    host_bytes = snapshot_offset,
-                    "retained golden host snapshot for pool replenishment"
-                ),
+                Ok(()) => {
+                    let owner = bind_host_snapshot_to_golden(token);
+                    if owner.is_some() {
+                        tracing::info!(
+                            token,
+                            ?owner,
+                            fds = export_fds.len(),
+                            host_bytes = snapshot_offset,
+                            "retained golden host snapshot for clone reuse"
+                        );
+                    } else {
+                        host_snapshot_cache().lock().unwrap().remove(&token);
+                        smolvm_cuda::host::release_metadata_only_layout(token);
+                        tracing::warn!(
+                            token,
+                            "golden snapshot owner is ambiguous; disabling snapshot reuse"
+                        );
+                    }
+                }
                 Err(error) => {
                     tracing::warn!(
                         %error,
@@ -4009,21 +4078,39 @@ fn spawn_clone_worker(
     // variable-length proc-mem advert. A byte stream could split/coalesce the
     // metadata and associate the next channel's live-RAM map with the wrong fd.
     if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, sp.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        for fd in export_fds {
+            unsafe { libc::close(fd) };
+        }
+        return Err(error);
     }
-    // Lift the child end above the dup2 target range (3..4+nexports) so the
-    // fd shuffle in pre_exec can't clobber it before it's dup2'd into place.
-    // SAFETY: F_DUPFD to >=64 on an fd we own; original closed right after.
-    let ctrl_child = unsafe { libc::fcntl(sp[1], libc::F_DUPFD, 64) };
+    let ctrl_slot = 4 + export_fds.len() as i32;
+    let source_minimum = ctrl_slot + 1;
+    // Lift the control source and every exported-memory source above the whole
+    // dup2 destination range. Hundreds of VMM chunks can extend beyond any
+    // fixed descriptor floor.
+    let ctrl_child = unsafe { libc::fcntl(sp[1], libc::F_DUPFD_CLOEXEC, source_minimum) };
     // SAFETY: closing our original child-end copy.
     unsafe { libc::close(sp[1]) };
     if ctrl_child < 0 {
+        let error = io::Error::last_os_error();
         // SAFETY: closing the parent end we created above.
         unsafe { libc::close(sp[0]) };
-        return Err(io::Error::last_os_error());
+        for fd in export_fds {
+            unsafe { libc::close(fd) };
+        }
+        return Err(error);
     }
-    let ctrl_slot = 4 + export_fds.len() as i32;
-    let exe = std::env::current_exe()?;
+    let export_fds = match lift_owned_fds(export_fds, source_minimum) {
+        Ok(fds) => fds,
+        Err(error) => {
+            unsafe {
+                libc::close(sp[0]);
+                libc::close(ctrl_child);
+            }
+            return Err(error);
+        }
+    };
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("_cuda-clone-worker").arg("3");
     cmd.env("SMOLVM_CUDA_CLONE_LAYOUT", layout);
@@ -4195,16 +4282,39 @@ mod mps_tests {
         clone_worker_idle_timeout_from, clone_worker_share_env, clone_worker_vm_is_alive,
         consume_procmem_preamble, create_host_snapshot_memfd, create_private_mps_paths,
         daemon_has_live_cuda_clients, decode_attach_procmem, disabled_worker_route,
-        encode_attach_procmem, golden_eviction_enabled, host_snapshot_fits,
-        host_snapshot_reconstructable, mps_enabled, ordinary_regions_are_reserved,
-        range_is_reserved, read_host_snapshot, recv_fd, seal_host_snapshot, select_golden_owner,
-        send_fd, spawn_clone_attach_listener_with_timeout, unique_live_clone_worker,
+        encode_attach_procmem, fork_snapshot_enabled, golden_eviction_enabled, host_snapshot_fits,
+        host_snapshot_reconstructable, lift_owned_fds, live_host_snapshot_count, mps_enabled,
+        ordinary_regions_are_reserved, range_is_reserved, read_host_snapshot, recv_fd,
+        seal_host_snapshot, select_golden_owner, send_fd, spawn_clone_attach_listener_with_timeout,
+        unique_live_clone_worker,
     };
     use std::collections::HashMap;
     use std::io;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn worker_fd_sources_are_lifted_above_every_dup_destination() {
+        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+        use std::os::fd::{FromRawFd as _, IntoRawFd as _};
+
+        let mut sources = Vec::new();
+        for value in [11_u8, 22, 33] {
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(&[value]).unwrap();
+            sources.push(file.into_raw_fd());
+        }
+        let lifted = lift_owned_fds(sources, 512).unwrap();
+        assert!(lifted.iter().all(|&fd| fd >= 512));
+        for (fd, value) in lifted.into_iter().zip([11_u8, 22, 33]) {
+            let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+            file.seek(SeekFrom::Start(0)).unwrap();
+            let mut got = [0_u8; 1];
+            file.read_exact(&mut got).unwrap();
+            assert_eq!(got, [value]);
+        }
+    }
 
     #[test]
     fn capacity_policy_preamble_roundtrips() {
@@ -4269,6 +4379,13 @@ mod mps_tests {
     }
 
     #[test]
+    fn shared_forks_retain_one_reusable_snapshot_without_requiring_a_pool() {
+        assert!(fork_snapshot_enabled(false, true));
+        assert!(fork_snapshot_enabled(true, false));
+        assert!(!fork_snapshot_enabled(false, false));
+    }
+
+    #[test]
     fn golden_eviction_requires_one_unambiguous_vm_owner() {
         assert_eq!(select_golden_owner(vec![7], None, &[7, 8]), Some(7));
         assert_eq!(select_golden_owner(Vec::new(), Some(8), &[7, 8]), Some(8));
@@ -4292,6 +4409,53 @@ mod mps_tests {
         assert!(!host_snapshot_reconstructable(0, 0));
         assert!(host_snapshot_reconstructable(1, 0));
         assert!(host_snapshot_reconstructable(0, 1));
+    }
+
+    #[test]
+    fn frozen_memory_layout_is_not_reclassified_as_metadata_only() {
+        let token = u64::MAX - 41;
+        super::host_snapshot_cache().lock().unwrap().insert(
+            token,
+            Arc::new(super::CachedHostSnapshot {
+                layout: String::new(),
+                device: 0,
+                fds: Vec::new(),
+                host_bytes: 1,
+                golden_pid: std::sync::atomic::AtomicU32::new(0),
+            }),
+        );
+
+        assert!(!super::retain_metadata_layout_for_clone(token, 7, 11));
+        assert!(!super::metadata_layout_waiters()
+            .lock()
+            .unwrap()
+            .contains_key(&token));
+
+        super::host_snapshot_cache().lock().unwrap().remove(&token);
+    }
+
+    #[test]
+    fn dead_golden_snapshot_is_released_without_the_idle_watchdog() {
+        let token = u64::MAX - 42;
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        super::host_snapshot_cache().lock().unwrap().insert(
+            token,
+            Arc::new(super::CachedHostSnapshot {
+                layout: String::new(),
+                device: 0,
+                fds: Vec::new(),
+                host_bytes: 1,
+                golden_pid: std::sync::atomic::AtomicU32::new(pid),
+            }),
+        );
+
+        assert_eq!(live_host_snapshot_count(), 0);
+        assert!(!super::host_snapshot_cache()
+            .lock()
+            .unwrap()
+            .contains_key(&token));
     }
 
     #[test]
