@@ -29,6 +29,12 @@ pub const GPU: &str = "SMOLVM_GPU";
 /// containers and the runtime shim uses it to enable guest-RAM zero-copy.
 pub const CUDA_ZEROCOPY: &str = "SMOLVM_CUDA_ZEROCOPY";
 
+/// The VM was started as a live-fork golden.
+///
+/// The guest agent uses this to expose the workload-facing forkpoint helper.
+/// Fork clones inherit the already-running helper from the golden snapshot.
+pub const FORKABLE: &str = "SMOLVM_FORKABLE";
+
 /// Planned CUDA fork-pool size passed to the guest agent.
 ///
 /// The agent uses this to select fork-friendly workload defaults only when a

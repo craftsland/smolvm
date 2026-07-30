@@ -1085,8 +1085,8 @@ pub fn free_vm_uid(_registry_dir: &std::path::Path, _key_dir: &std::path::Path) 
 ///   privileged, the same contract as `drop_privileges`).
 /// - `Some(Ok((uid, gid)))` — drop to this id.
 ///
-/// A fork clone (`snapshot_dir` set, laid out as
-/// `<golden_dir>/fork-snapshots/<clone>`) resolves to the GOLDEN's uid so it can
+/// A fork clone (`snapshot_dir` set, laid out as `<golden_dir>/s/<snapshot-id>`)
+/// resolves to the GOLDEN's uid so it can
 /// map the golden's memfd. gid mirrors uid (a per-VM group).
 ///
 /// `share_uid_with` (when set) overrides the key resolution entirely: the VM

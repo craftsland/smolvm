@@ -1711,7 +1711,7 @@ impl AgentManager {
         let fork_env: Vec<(&str, String)> = {
             let mut v = Vec::new();
             if features.forkable {
-                v.push(("SMOLVM_FORKABLE", "1".to_string()));
+                v.push((smolvm_protocol::guest_env::FORKABLE, "1".to_string()));
             }
             // Embedder override for the control socket path; without it the
             // launcher defaults to control.sock in the per-VM dir.
@@ -2480,9 +2480,14 @@ impl AgentManager {
                     let mut inner = self.inner.lock();
                     if let Some(ref mut child) = inner.child {
                         if !child.is_running() {
+                            let exit_code = child.exit_code();
+                            let log = std::fs::read_to_string(&self.startup_error_log)
+                                .ok()
+                                .map(|content| content.trim().to_string())
+                                .filter(|content| !content.is_empty());
                             return Err(Error::agent(
                                 "monitor agent",
-                                "clone agent process exited during startup".to_string(),
+                                boot_failure_reason(exit_code, log.as_deref()),
                             ));
                         }
                     }

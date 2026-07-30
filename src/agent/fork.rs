@@ -14,7 +14,9 @@ use crate::config::VmRecord;
 use crate::data::validate_vm_name;
 use crate::db::SmolvmDb;
 use crate::{Error, Result};
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Path to a forkable machine's control socket (pause/resume/checkpoint/FORK).
 pub fn control_socket_path(name: &str) -> PathBuf {
@@ -51,6 +53,95 @@ pub fn control_socket_cmd(sock: &Path, cmd: &str) -> Result<String> {
     Ok(reply)
 }
 
+/// Wait until the golden workload reaches the standard live-fork boundary.
+///
+/// The workload signals this by calling `smolvm-fork-ready`, which writes the
+/// marker and blocks. Keeping the wait in the VM namespace avoids coupling the
+/// host to container logs, PIDs, or workload-specific files.
+pub fn wait_for_forkpoint(golden: &str, timeout: Duration) -> Result<()> {
+    let socket = vm_data_dir(golden).join("agent.sock");
+    let mut client = AgentClient::connect_with_retry(&socket)
+        .map_err(|e| Error::agent("wait for forkpoint", format!("agent connect: {e}")))?;
+    let script = format!(
+        "while [ ! -f '{}' ]; do sleep 0.05; done",
+        smolvm_protocol::forkpoint::READY_PATH
+    );
+    match client.vm_exec(
+        vec!["/bin/sh".into(), "-c".into(), script],
+        vec![],
+        None,
+        Some(timeout),
+        None,
+    ) {
+        Ok((0, _, _)) => Ok(()),
+        Ok((code, _, stderr)) => Err(Error::agent(
+            "wait for forkpoint",
+            format!(
+                "golden '{golden}' did not become ready within {}s (exit {code}): {}",
+                timeout.as_secs_f64(),
+                String::from_utf8_lossy(&stderr).trim()
+            ),
+        )),
+        Err(e) => Err(Error::agent(
+            "wait for forkpoint",
+            format!(
+                "golden '{golden}' did not become ready within {}s: {e}",
+                timeout.as_secs_f64()
+            ),
+        )),
+    }
+}
+
+/// Release the workload restored in `clone` after its identity and per-fork
+/// environment are installed. The state directory is private guest RAM, so a
+/// release marker wakes only this clone even though every clone inherited the
+/// same blocked helper process.
+pub fn release_forkpoint(clone: &str) -> Result<()> {
+    let socket = vm_data_dir(clone).join("agent.sock");
+    let mut client = AgentClient::connect_with_retry(&socket)
+        .map_err(|e| Error::agent("release forkpoint", format!("agent connect: {e}")))?;
+    let script = format!(
+        "set -e; mkdir -p '{dir}'; umask 077; printf '%s\\n' smolvm-forkpoint-release-v1 > '{release}.tmp'; mv '{release}.tmp' '{release}'",
+        dir = smolvm_protocol::forkpoint::STATE_DIR,
+        release = smolvm_protocol::forkpoint::RELEASE_PATH,
+    );
+    match client.vm_exec(
+        vec!["/bin/sh".into(), "-c".into(), script],
+        vec![],
+        None,
+        Some(Duration::from_secs(10)),
+        None,
+    ) {
+        Ok((0, _, _)) => Ok(()),
+        Ok((code, _, stderr)) => Err(Error::agent(
+            "release forkpoint",
+            format!(
+                "clone '{clone}' release exited {code}: {}",
+                String::from_utf8_lossy(&stderr).trim()
+            ),
+        )),
+        Err(e) => Err(Error::agent(
+            "release forkpoint",
+            format!("clone '{clone}': {e}"),
+        )),
+    }
+}
+
+/// Resume a golden after every clone prepared from its snapshot has been torn
+/// down. This is used only for failed transactional batch forks; a successful
+/// fork keeps the golden frozen as the copy-on-write base.
+pub fn resume_golden(golden: &str) -> Result<()> {
+    let reply = control_socket_cmd(&control_socket_path(golden), "RESUME")?;
+    if reply.starts_with("OK") {
+        Ok(())
+    } else {
+        Err(Error::agent(
+            "resume golden",
+            format!("golden '{golden}' RESUME failed: {reply}"),
+        ))
+    }
+}
+
 /// The result of preparing a fork: the golden is frozen + snapshotted and the
 /// clone's DB record + copy-on-write disks exist on disk. The caller boots the
 /// clone from `snapshot_dir`, then calls [`rejuvenate_clone`].
@@ -64,6 +155,20 @@ pub struct PreparedFork {
     /// caller to log. Empty when the golden has no forwards. When ports were
     /// pinned, `golden_host == clone_host`.
     pub port_remaps: Vec<(u16, u16, u16)>,
+}
+
+/// Parameters for one clone in a single-snapshot fork operation.
+pub struct ForkSpec<'a> {
+    /// New machine name.
+    pub clone: &'a str,
+    /// Explicit inbound port mappings, or empty to remap the golden's ports.
+    pub pinned_ports: &'a [(u16, u16)],
+    /// Whether the clone should itself be forkable.
+    pub clone_forkable: bool,
+    /// Per-clone environment delivered before the workload is released.
+    pub fork_env: &'a [(String, String)],
+    /// Per-clone secret references resolved by later execs.
+    pub fork_secrets: &'a BTreeMap<String, crate::secrets::SecretRef>,
 }
 
 /// Freeze a running, forkable `golden`, snapshot it, register `clone` in the DB
@@ -82,32 +187,70 @@ pub fn prepare_fork(
     pinned_ports: &[(u16, u16)],
     clone_forkable: bool,
     fork_env: &[(String, String)],
-    fork_secrets: &std::collections::BTreeMap<String, crate::secrets::SecretRef>,
+    fork_secrets: &BTreeMap<String, crate::secrets::SecretRef>,
 ) -> Result<PreparedFork> {
-    validate_vm_name(clone, "clone name").map_err(|e| Error::config("clone name", e))?;
-    validate_fork_env(fork_env)?;
+    let mut prepared = prepare_forks(
+        db,
+        golden,
+        &[ForkSpec {
+            clone,
+            pinned_ports,
+            clone_forkable,
+            fork_env,
+            fork_secrets,
+        }],
+    )?;
+    Ok(prepared.remove(0))
+}
 
-    // Nested fork is unsupported: a clone boots from a copy-on-write MAP_PRIVATE
-    // mapping of the golden's RAM, not a fresh memfd, so it cannot itself be
-    // re-forked (its FORK would fail with "no memfd-backed RAM"). Reject
-    // `forkable` up front instead of producing a clone that looks forkable but
-    // isn't.
-    if clone_forkable {
-        return Err(Error::agent(
-            "fork",
-            "nested fork is not supported: a clone cannot be re-forked, so `forkable` \
-             on a fork has no effect (drop it)",
-        ));
+/// Freeze a golden once and prepare every requested clone from the same RAM
+/// snapshot. Preparation is transactional: if any clone fails, all clone
+/// records and disks created by this call are removed.
+pub fn prepare_forks(
+    db: &SmolvmDb,
+    golden: &str,
+    specs: &[ForkSpec<'_>],
+) -> Result<Vec<PreparedFork>> {
+    if specs.is_empty() {
+        return Err(Error::config("fork", "at least one clone is required"));
+    }
+
+    let mut names = HashSet::with_capacity(specs.len());
+    let mut reserved_ports = HashSet::new();
+    for spec in specs {
+        validate_vm_name(spec.clone, "clone name").map_err(|e| Error::config("clone name", e))?;
+        validate_fork_env(spec.fork_env)?;
+        if !names.insert(spec.clone) {
+            return Err(Error::config(
+                "fork",
+                format!("duplicate clone name '{}'", spec.clone),
+            ));
+        }
+        if spec.clone_forkable {
+            return Err(Error::agent(
+                "fork",
+                "nested fork is not supported: a clone cannot be re-forked, so `forkable` on a fork has no effect (drop it)",
+            ));
+        }
+        if db.get_vm(spec.clone)?.is_some() {
+            return Err(Error::agent(
+                "fork",
+                format!("machine '{}' already exists", spec.clone),
+            ));
+        }
+        for (host, _) in spec.pinned_ports {
+            if !reserved_ports.insert(*host) {
+                return Err(Error::config(
+                    "fork",
+                    format!("host port {host} is assigned to more than one clone"),
+                ));
+            }
+        }
     }
 
     let golden_rec = db
         .get_vm(golden)?
         .ok_or_else(|| Error::vm_not_found(golden))?;
-
-    // The golden must be alive and forkable. We probe the control socket rather
-    // than the vsock agent: after its first fork the golden is frozen (paused)
-    // as the shared base, so an agent ping would fail — but STATUS still answers
-    // (running or paused), and we can fork it again.
     let ctl = control_socket_path(golden);
     if !ctl.exists() {
         return Err(Error::agent(
@@ -127,77 +270,30 @@ pub fn prepare_fork(
             format!("golden '{golden}' is not ready to fork: {status}"),
         ));
     }
-    if db.get_vm(clone)?.is_some() {
-        return Err(Error::agent(
-            "fork",
-            format!("machine '{clone}' already exists"),
-        ));
-    }
 
-    // Clone dir + snapshot dir. A leftover data directory with no DB record is
-    // an orphan from a previously crashed fork; its stale qcow2 overlays would
-    // make `krun_create_disk_overlay` fail (rc=-5, it refuses to overwrite an
-    // existing target). The DB check above guarantees no live clone owns this
-    // name, so clearing the directory is safe.
-    let clone_dir = vm_data_dir(clone);
-    if clone_dir.exists() {
-        std::fs::remove_dir_all(&clone_dir)
-            .map_err(|e| Error::agent("clear orphan clone dir", e.to_string()))?;
-    }
-    std::fs::create_dir_all(&clone_dir)
-        .map_err(|e| Error::agent("create clone dir", e.to_string()))?;
-
-    // A pack-backed golden (created `--from <.smolmachine>`) resolves its layers
-    // either through the shared content-addressed store (privileged installs: a
-    // pointer file beside its data dir) or from its own pre-extracted `pack`
-    // dir (rootless installs). The clone record inherits `source_smolmachine`
-    // but a fork never runs the create-time extraction, so without one of those
-    // the clone's start falls into the sidecar re-extraction fallback — seconds
-    // of host-side work per fork for read-only state the golden already has.
-    // Give the clone the golden's resolution in O(1):
-    //  - shared store: replicate the pointer file (the entry is no-evict while
-    //    referenced and start self-heals a missing one, so the copied pointer
-    //    can never point at anything the golden's own couldn't);
-    //  - per-machine layout: symlink the clone's `pack` dir to the golden's
-    //    extracted layers. The layers are read-only lowerdir content, the
-    //    golden is frozen, and its deletion is refused while clones exist, so
-    //    the target outlives every reader. `force_detach_layers_volume` no-ops
-    //    on symlinks, so a clone's stop/delete can't detach the golden's macOS
-    //    layers volume through the link.
-    let golden_layers = crate::agent::machine_layers_cache_dir(golden);
-    let golden_ptr = crate::agent::shared_pack_pointer_path(&golden_layers);
-    if golden_ptr.exists() {
-        let clone_layers = crate::agent::machine_layers_cache_dir(clone);
-        std::fs::create_dir_all(&clone_layers)
-            .map_err(|e| Error::agent("create clone pack dir", e.to_string()))?;
-        std::fs::copy(
-            &golden_ptr,
-            crate::agent::shared_pack_pointer_path(&clone_layers),
-        )
-        .map_err(|e| Error::agent("copy shared pack pointer", e.to_string()))?;
-    } else if smolvm_pack::extract::is_extracted(&golden_layers) {
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(
-            &golden_layers,
-            crate::agent::machine_layers_cache_dir(clone),
-        )
-        .map_err(|e| Error::agent("link clone pack dir", e.to_string()))?;
-    }
-
-    // The golden writes its frozen snapshot (checkpoint + memfd manifest) here.
-    // It lives under the GOLDEN's data dir, not the clone's: under Landlock the
-    // frozen golden VMM is confined to its own data dir, so it can write here but
-    // could not write into a separate clone's dir. The clone — which already needs
-    // read access to the golden's dir for its copy-on-write disk backing — reads
-    // the snapshot from the same place. See `internal_boot`'s Landlock grants.
     let gdir = vm_data_dir(golden);
-    let snapshot_dir = gdir.join("fork-snapshots").join(clone);
-    std::fs::create_dir_all(&snapshot_dir)
-        .map_err(|e| Error::agent("create snapshot dir", e.to_string()))?;
-    // Under per-VM uid isolation (privileged launcher) the frozen golden VMM runs
-    // as its own unprivileged uid and writes the snapshot here via the FORK
-    // command below, so hand this dir to that uid. No-op unless privileged; if the
-    // drop is active the golden's uid lookup must succeed (fail closed).
+    // Keep this path short and independent of clone names. libkrun and its
+    // control transport encounter platform path ceilings well below PATH_MAX;
+    // a long XDG_CACHE_HOME plus `fork-snapshots/<clone>` otherwise makes a
+    // valid golden fail restore with EINVAL. The 8-hex component keeps the
+    // snapshot path no longer than the already-required `agent.sock` path.
+    // Never remove a colliding random directory because a live clone may still
+    // be using an older snapshot.
+    let snapshot_root = gdir.join("s");
+    std::fs::create_dir_all(&snapshot_root)
+        .map_err(|e| Error::agent("create snapshot root", e.to_string()))?;
+    let snapshot_dir = (0..128)
+        .find_map(|_| {
+            let candidate = snapshot_root.join(host_random_hex(8));
+            match std::fs::create_dir(&candidate) {
+                Ok(()) => Some(Ok(candidate)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .transpose()
+        .map_err(|e| Error::agent("create snapshot dir", e.to_string()))?
+        .ok_or_else(|| Error::agent("create snapshot dir", "could not allocate a unique id"))?;
     if let Some(result) =
         crate::process::vm_drop_ids(&crate::agent::vm_uid_registry_dir(), &gdir, None, None)
     {
@@ -207,103 +303,156 @@ pub fn prepare_fork(
             .map_err(|e| Error::agent("fork: chown snapshot dir", e.to_string()))?;
     }
 
-    // Register the clone in the DB with the golden's config, no running-state,
-    // and its port forwards remapped to fresh host ports. With the default TSI
-    // backend outbound is proxied per-process (each clone gets it for free, no
-    // guest MAC/IP involved); only inbound host ports must be made distinct so
-    // the clone is reachable without colliding with the still-running golden or
-    // sibling clones.
-    let mut clone_rec = golden_rec.clone();
-    clone_rec.name = clone.to_string();
-    clone_rec.pid = None;
-    clone_rec.pid_start_time = None;
-    // Per-fork parameters: merged into the clone's record env (so `machine
-    // exec` sessions and any workload relaunch see them), overriding
-    // same-named keys inherited from the golden. The already-running workload
-    // can't have its env changed — it reads the same pairs from the file
-    // `write_fork_env` drops after boot.
-    if !fork_env.is_empty() {
-        clone_rec
-            .env
-            .retain(|(k, _)| !fork_env.iter().any(|(fk, _)| fk == k));
-        clone_rec.env.extend(fork_env.iter().cloned());
-    }
-    // Per-fork secrets: merge the refs into the clone's persisted `secret_refs`
-    // (overriding same-named refs inherited from the golden), so every `exec`
-    // in the clone resolves them fresh — the fork-safe path where plaintext
-    // never lands in the overlay/artifact or a guest file, and each clone's
-    // secrets are its own, invisible to the golden and sibling clones. Unlike
-    // `fork_env`, these are NOT written to the `fork-env` guest file.
-    for (k, r) in fork_secrets {
-        clone_rec.secret_refs.insert(k.clone(), r.clone());
-    }
-    let mut port_remaps = Vec::new();
-    if !pinned_ports.is_empty() {
-        // User pinned the clone's forwards explicitly — use them as-is.
-        clone_rec.ports = pinned_ports.to_vec();
-        for (h, g) in &clone_rec.ports {
-            port_remaps.push((*h, *g, *h));
-        }
-    } else if !clone_rec.ports.is_empty() {
-        let mut remapped = Vec::with_capacity(clone_rec.ports.len());
-        for (golden_host, guest) in &clone_rec.ports {
-            match alloc_free_host_port() {
-                Some(h) => {
-                    port_remaps.push((*golden_host, *guest, h));
-                    remapped.push((h, *guest));
-                }
-                None => tracing::warn!(
-                    guest,
-                    "could not allocate a host port for fork clone; dropping forward"
-                ),
-            }
-        }
-        clone_rec.ports = remapped;
-    }
-    clone_rec.golden = Some(golden.to_string());
-    db.insert_vm(clone, &clone_rec)?;
-
-    // Freeze the golden and write its snapshot (checkpoint + memfd manifest).
-    let cleanup = || {
-        let _ = db.remove_vm(clone);
-        let _ = std::fs::remove_dir_all(&clone_dir);
-        let _ = std::fs::remove_dir_all(&snapshot_dir);
-    };
-    // Phase timing: fork latency is dominated by one of these two steps; log
-    // each so a slow fork is diagnosable (the golden's RAM checkpoint vs the
-    // clone's disk-overlay creation) instead of a single opaque wall-time.
     let t_snap = std::time::Instant::now();
-    let reply = match control_socket_cmd(&ctl, &format!("FORK {}", snapshot_dir.display())) {
-        Ok(r) => r,
-        Err(e) => {
-            cleanup();
-            return Err(e);
+    let reply = control_socket_cmd(&ctl, &format!("FORK {}", snapshot_dir.display()));
+    let reply = match reply {
+        Ok(reply) if reply.starts_with("OK") => reply,
+        Ok(reply) => {
+            let _ = std::fs::remove_dir_all(&snapshot_dir);
+            return Err(Error::agent("fork", format!("golden FORK failed: {reply}")));
+        }
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&snapshot_dir);
+            return Err(error);
         }
     };
-    if !reply.starts_with("OK") {
-        cleanup();
-        return Err(Error::agent("fork", format!("golden FORK failed: {reply}")));
-    }
     tracing::info!(
         elapsed_ms = t_snap.elapsed().as_millis() as u64,
+        clones = specs.len(),
+        response = %reply,
         "fork: golden RAM checkpoint written"
     );
 
-    let t_disk = std::time::Instant::now();
-    if let Err(e) = clone_fork_disks(&gdir, &clone_dir) {
-        cleanup();
-        return Err(e);
+    let mut prepared = Vec::with_capacity(specs.len());
+    for spec in specs {
+        match prepare_clone_from_snapshot(
+            db,
+            golden,
+            &golden_rec,
+            &gdir,
+            &snapshot_dir,
+            spec,
+            &mut reserved_ports,
+        ) {
+            Ok(clone) => prepared.push(clone),
+            Err(error) => {
+                for clone in &prepared {
+                    let _ = db.remove_vm(&clone.clone_record.name);
+                    let _ = std::fs::remove_dir_all(vm_data_dir(&clone.clone_record.name));
+                }
+                let _ = std::fs::remove_dir_all(&snapshot_dir);
+                return match resume_golden(golden) {
+                    Ok(()) => Err(error),
+                    Err(resume_error) => Err(Error::agent(
+                        "fork",
+                        format!(
+                            "clone preparation failed: {error}; golden rollback also failed: {resume_error}"
+                        ),
+                    )),
+                };
+            }
+        }
     }
-    tracing::info!(
-        elapsed_ms = t_disk.elapsed().as_millis() as u64,
-        "fork: clone disk overlays created"
-    );
+    Ok(prepared)
+}
 
-    Ok(PreparedFork {
-        snapshot_dir,
-        clone_record: clone_rec,
-        port_remaps,
-    })
+fn prepare_clone_from_snapshot(
+    db: &SmolvmDb,
+    golden: &str,
+    golden_rec: &VmRecord,
+    golden_dir: &Path,
+    snapshot_dir: &Path,
+    spec: &ForkSpec<'_>,
+    reserved_ports: &mut HashSet<u16>,
+) -> Result<PreparedFork> {
+    let clone = spec.clone;
+    let clone_dir = vm_data_dir(clone);
+    let result = (|| {
+        if clone_dir.exists() {
+            std::fs::remove_dir_all(&clone_dir)
+                .map_err(|e| Error::agent("clear orphan clone dir", e.to_string()))?;
+        }
+        std::fs::create_dir_all(&clone_dir)
+            .map_err(|e| Error::agent("create clone dir", e.to_string()))?;
+
+        let golden_layers = crate::agent::machine_layers_cache_dir(golden);
+        let golden_ptr = crate::agent::shared_pack_pointer_path(&golden_layers);
+        if golden_ptr.exists() {
+            let clone_layers = crate::agent::machine_layers_cache_dir(clone);
+            std::fs::create_dir_all(&clone_layers)
+                .map_err(|e| Error::agent("create clone pack dir", e.to_string()))?;
+            std::fs::copy(
+                &golden_ptr,
+                crate::agent::shared_pack_pointer_path(&clone_layers),
+            )
+            .map_err(|e| Error::agent("copy shared pack pointer", e.to_string()))?;
+        } else if smolvm_pack::extract::is_extracted(&golden_layers) {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(
+                &golden_layers,
+                crate::agent::machine_layers_cache_dir(clone),
+            )
+            .map_err(|e| Error::agent("link clone pack dir", e.to_string()))?;
+        }
+
+        let mut clone_rec = golden_rec.clone();
+        clone_rec.name = clone.to_string();
+        clone_rec.pid = None;
+        clone_rec.pid_start_time = None;
+        if !spec.fork_env.is_empty() {
+            clone_rec
+                .env
+                .retain(|(k, _)| !spec.fork_env.iter().any(|(fk, _)| fk == k));
+            clone_rec.env.extend(spec.fork_env.iter().cloned());
+        }
+        for (key, secret) in spec.fork_secrets {
+            clone_rec.secret_refs.insert(key.clone(), secret.clone());
+        }
+
+        let mut port_remaps = Vec::new();
+        if !spec.pinned_ports.is_empty() {
+            clone_rec.ports = spec.pinned_ports.to_vec();
+            for (host, guest) in &clone_rec.ports {
+                port_remaps.push((*host, *guest, *host));
+            }
+        } else if !clone_rec.ports.is_empty() {
+            let mut remapped = Vec::with_capacity(clone_rec.ports.len());
+            for (golden_host, guest) in &clone_rec.ports {
+                match alloc_free_host_port_excluding(reserved_ports) {
+                    Some(host) => {
+                        port_remaps.push((*golden_host, *guest, host));
+                        remapped.push((host, *guest));
+                    }
+                    None => tracing::warn!(
+                        guest,
+                        "could not allocate a host port for fork clone; dropping forward"
+                    ),
+                }
+            }
+            clone_rec.ports = remapped;
+        }
+        clone_rec.golden = Some(golden.to_string());
+        db.insert_vm(clone, &clone_rec)?;
+
+        let t_disk = std::time::Instant::now();
+        clone_fork_disks(golden_dir, &clone_dir)?;
+        tracing::info!(
+            clone,
+            elapsed_ms = t_disk.elapsed().as_millis() as u64,
+            "fork: clone disk overlays created"
+        );
+        Ok(PreparedFork {
+            snapshot_dir: snapshot_dir.to_path_buf(),
+            clone_record: clone_rec,
+            port_remaps,
+        })
+    })();
+
+    if result.is_err() {
+        let _ = db.remove_vm(clone);
+        let _ = std::fs::remove_dir_all(&clone_dir);
+    }
+    result
 }
 
 /// Give the clone its own disks. The golden is frozen with its block workers
@@ -639,6 +788,16 @@ fn alloc_free_host_port() -> Option<u16> {
         .ok()
         .and_then(|l| l.local_addr().ok())
         .map(|addr| addr.port())
+}
+
+fn alloc_free_host_port_excluding(reserved: &mut HashSet<u16>) -> Option<u16> {
+    for _ in 0..128 {
+        let port = alloc_free_host_port()?;
+        if reserved.insert(port) {
+            return Some(port);
+        }
+    }
+    None
 }
 
 /// Read `hex_len/2` random bytes from the host RNG, hex-encoded. Used to seed

@@ -1904,6 +1904,64 @@ mod tests {
     }
 
     #[test]
+    fn fork_accepts_single_and_batch_forms() {
+        let single =
+            TestMachineCli::parse_from(["machine", "fork", "--golden", "base", "--name", "worker"]);
+        let MachineCmd::Fork(single) = single.command else {
+            panic!("expected machine fork command");
+        };
+        assert_eq!(single.clone.as_deref(), Some("worker"));
+        assert_eq!(single.count.get(), 1);
+        assert!(!single.wait_ready);
+
+        let batch = TestMachineCli::parse_from([
+            "machine",
+            "fork",
+            "--golden",
+            "base",
+            "--count",
+            "8",
+            "--name-prefix",
+            "worker",
+            "--parallel",
+            "3",
+            "--ready-timeout",
+            "2m",
+        ]);
+        let MachineCmd::Fork(batch) = batch.command else {
+            panic!("expected machine fork command");
+        };
+        assert_eq!(batch.count.get(), 8);
+        assert_eq!(batch.name_prefix.as_deref(), Some("worker"));
+        assert_eq!(batch.parallel.get(), 3);
+        assert!(!batch.wait_ready);
+        assert_eq!(batch.ready_timeout, Duration::from_secs(120));
+        assert_eq!(
+            forkpoint_timeout(batch.count.get(), batch.wait_ready, batch.ready_timeout),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(forkpoint_timeout(1, false, Duration::from_secs(120)), None);
+    }
+
+    #[test]
+    fn indexed_fork_env_renders_each_clone() {
+        let specs = vec![
+            "TRIAL={index}".to_string(),
+            "OUTPUT=/runs/{name}".to_string(),
+            "SMOLVM_FORK_INDEX=wrong".to_string(),
+        ];
+        assert_eq!(
+            render_indexed_fork_env(&specs, 3, "worker-3", true),
+            vec![
+                ("TRIAL".to_string(), "3".to_string()),
+                ("OUTPUT".to_string(), "/runs/worker-3".to_string()),
+                ("SMOLVM_FORK_INDEX".to_string(), "3".to_string()),
+                ("SMOLVM_FORK_NAME".to_string(), "worker-3".to_string()),
+            ]
+        );
+    }
+
+    #[test]
     fn run_accepts_auto_graph_flag() {
         let cli = TestMachineCli::parse_from([
             "machine",
@@ -2945,7 +3003,34 @@ pub struct ForkCmd {
 
     /// Name for the new clone machine.
     #[arg(short = 'n', long = "name", value_name = "NAME")]
-    pub clone: String,
+    pub clone: Option<String>,
+
+    /// Number of clones to create from one snapshot. Batch forks wait for the
+    /// standard `smolvm-fork-ready` boundary automatically.
+    #[arg(long, default_value = "1", value_name = "COUNT")]
+    pub count: std::num::NonZeroU32,
+
+    /// Name batch clones PREFIX-0 through PREFIX-(COUNT-1).
+    #[arg(long, value_name = "PREFIX")]
+    pub name_prefix: Option<String>,
+
+    /// Maximum number of clone boots in flight during a batch fork.
+    #[arg(long, default_value = "4", value_name = "COUNT")]
+    pub parallel: std::num::NonZeroU32,
+
+    /// Wait for `smolvm-fork-ready` in a single-clone fork. Batch forks always
+    /// wait and release clones only after identity and fork env are installed.
+    #[arg(long)]
+    pub wait_ready: bool,
+
+    /// Maximum time to wait for the golden workload's forkpoint.
+    #[arg(
+        long,
+        default_value = "10m",
+        value_parser = parse_duration,
+        value_name = "DURATION",
+    )]
+    pub ready_timeout: Duration,
 
     /// Make the clone itself forkable (memfd RAM + control socket), so it can
     /// in turn be forked.
@@ -2965,7 +3050,7 @@ pub struct ForkCmd {
     pub share_weights: bool,
 
     /// Per-fork parameter (repeatable, KEY=VALUE). Delivered to the clone as
-    /// `/run/smolvm/fork-env` (dotenv format) for the already-running workload
+    /// `/etc/smolvm/fork-env` (dotenv format) for the already-running workload
     /// to read, and merged into the clone's env for later `machine exec`
     /// sessions. This is how sweep/rollout clones learn which variant they
     /// are — no shared-mount claim files needed.
@@ -2998,20 +3083,119 @@ pub struct ForkCmd {
 impl ForkCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let ports: Vec<(u16, u16)> = self.port.iter().map(|p| (p.host, p.guest)).collect();
-        let fork_env = smolvm::util::parse_env_list(&self.env);
         // Parse per-fork secret refs (TrustedLocal — host env/absolute file);
         // they merge into the clone's secret_refs and resolve fresh per exec.
         let fork_secrets = parse_cli_secret_refs(&self.secret_env, &self.secret_file)?;
-        vm_common::fork_vm(
+        let count = self.count.get();
+        let wait_ready = forkpoint_timeout(count, self.wait_ready, self.ready_timeout);
+        if count > 1024 {
+            return Err(smolvm::Error::config(
+                "fork",
+                "--count cannot exceed 1024 clones per batch",
+            ));
+        }
+
+        if count == 1 {
+            let clone = match (self.clone, self.name_prefix) {
+                (Some(clone), None) => clone,
+                (None, Some(prefix)) => format!("{prefix}-0"),
+                (Some(_), Some(_)) => {
+                    return Err(smolvm::Error::config(
+                        "fork",
+                        "use either --name or --name-prefix, not both",
+                    ));
+                }
+                (None, None) => {
+                    return Err(smolvm::Error::config(
+                        "fork",
+                        "--name is required for one clone; use --name-prefix with --count for a batch",
+                    ));
+                }
+            };
+            let fork_env = render_indexed_fork_env(&self.env, 0, &clone, false);
+            return vm_common::fork_vm(
+                &self.golden,
+                &clone,
+                vm_common::ForkVmOptions {
+                    clone_forkable: self.forkable,
+                    pinned_ports: &ports,
+                    share_weights: self.share_weights,
+                    fork_env: &fork_env,
+                    fork_secrets: &fork_secrets,
+                    wait_ready,
+                },
+            );
+        }
+
+        if self.clone.is_some() {
+            return Err(smolvm::Error::config(
+                "fork",
+                "--name cannot be used with --count greater than 1; use --name-prefix",
+            ));
+        }
+        let prefix = self.name_prefix.ok_or_else(|| {
+            smolvm::Error::config(
+                "fork",
+                "--name-prefix is required with --count greater than 1",
+            )
+        })?;
+        if self.forkable {
+            return Err(smolvm::Error::config(
+                "fork",
+                "--forkable is not supported for batch clones",
+            ));
+        }
+        if !ports.is_empty() {
+            return Err(smolvm::Error::config(
+                "fork",
+                "pinned --port mappings are not supported for a batch; inherited ports are remapped automatically",
+            ));
+        }
+
+        let clones: Vec<_> = (0..count)
+            .map(|index| {
+                let name = format!("{prefix}-{index}");
+                let env = render_indexed_fork_env(&self.env, index, &name, true);
+                (name, env)
+            })
+            .collect();
+        vm_common::fork_vm_batch(
             &self.golden,
-            &self.clone,
-            self.forkable,
-            &ports,
+            &clones,
             self.share_weights,
-            &fork_env,
             &fork_secrets,
+            wait_ready,
+            self.parallel.get() as usize,
         )
     }
+}
+
+fn render_indexed_fork_env(
+    specs: &[String],
+    index: u32,
+    name: &str,
+    include_identity: bool,
+) -> Vec<(String, String)> {
+    let mut env = smolvm::util::parse_env_list(specs);
+    for (_, value) in &mut env {
+        *value = value
+            .replace("{index}", &index.to_string())
+            .replace("{name}", name);
+    }
+    if include_identity {
+        env.retain(|(key, _)| key != "SMOLVM_FORK_INDEX" && key != "SMOLVM_FORK_NAME");
+        env.push(("SMOLVM_FORK_INDEX".to_string(), index.to_string()));
+        env.push(("SMOLVM_FORK_NAME".to_string(), name.to_string()));
+    }
+    env
+}
+
+fn forkpoint_timeout(
+    count: u32,
+    explicitly_requested: bool,
+    timeout: Duration,
+) -> Option<Duration> {
+    (count > 1 || explicitly_requested).then_some(timeout)
 }
 
 // ============================================================================

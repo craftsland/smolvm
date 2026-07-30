@@ -589,6 +589,14 @@ pub fn launch_agent_vm_dynamic(
         )));
     }
 
+    if std::env::var(guest_env::FORKABLE).as_deref() == Ok(guest_env::VALUE_ON) {
+        env_strings.push(cstr(&format!(
+            "{}={}",
+            guest_env::FORKABLE,
+            guest_env::VALUE_ON
+        )));
+    }
+
     // Enable Rosetta only when requested AND actually available on this host, so
     // a stray `--rosetta` on a non-Rosetta host degrades to a no-op rather than a
     // dangling virtiofs tag the guest would fail to mount. The guest agent reads

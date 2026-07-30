@@ -1656,6 +1656,14 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             env_strings.push(cstr(&format!("{}={}", guest_env::READY_MARKER, marker)));
         }
 
+        if std::env::var(guest_env::FORKABLE).as_deref() == Ok(guest_env::VALUE_ON) {
+            env_strings.push(cstr(&format!(
+                "{}={}",
+                guest_env::FORKABLE,
+                guest_env::VALUE_ON
+            )));
+        }
+
         if let Ok(pool_size) = std::env::var(guest_env::CUDA_FORK_POOL_SIZE) {
             env_strings.push(cstr(&format!(
                 "{}={pool_size}",
