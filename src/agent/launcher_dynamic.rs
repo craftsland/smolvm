@@ -582,6 +582,13 @@ pub fn launch_agent_vm_dynamic(
         }
     }
 
+    if let Ok(pool_size) = std::env::var(guest_env::CUDA_FORK_POOL_SIZE) {
+        env_strings.push(cstr(&format!(
+            "{}={pool_size}",
+            guest_env::CUDA_FORK_POOL_SIZE
+        )));
+    }
+
     // Enable Rosetta only when requested AND actually available on this host, so
     // a stray `--rosetta` on a non-Rosetta host degrades to a no-op rather than a
     // dangling virtiofs tag the guest would fail to mount. The guest agent reads

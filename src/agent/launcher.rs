@@ -1656,6 +1656,13 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             env_strings.push(cstr(&format!("{}={}", guest_env::READY_MARKER, marker)));
         }
 
+        if let Ok(pool_size) = std::env::var(guest_env::CUDA_FORK_POOL_SIZE) {
+            env_strings.push(cstr(&format!(
+                "{}={pool_size}",
+                guest_env::CUDA_FORK_POOL_SIZE
+            )));
+        }
+
         // DNS allow-host filtering is now enforced inside libkrun (see the
         // egress policy above). The guest-side DNS proxy is intentionally NOT
         // started: the guest keeps its default resolv.conf (1.1.1.1/8.8.8.8) so
