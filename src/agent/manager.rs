@@ -1702,7 +1702,10 @@ impl AgentManager {
                 v.push(("SMOLVM_CUDA_CLONE_SHARE", "1".to_string()));
             }
             if let Some(pool_size) = features.cuda_fork_pool_size {
-                v.push(("SMOLVM_CUDA_FORK_POOL_SIZE", pool_size.to_string()));
+                v.push((
+                    smolvm_protocol::guest_env::CUDA_FORK_POOL_SIZE,
+                    pool_size.to_string(),
+                ));
             }
             if let Some(limit_mib) = features.cuda_vram_limit_mib {
                 v.push(("SMOLVM_CUDA_VRAM_LIMIT_MB", limit_mib.to_string()));

@@ -15,10 +15,106 @@
 
 /// The env var the launcher sets on the agent, and that the guest shim reads.
 const ZEROCOPY_ENV: &str = smolvm_protocol::guest_env::CUDA_ZEROCOPY;
+const FORK_POOL_SIZE_ENV: &str = smolvm_protocol::guest_env::CUDA_FORK_POOL_SIZE;
+const EXPANDABLE_SEGMENTS_ENV: &str = smolvm_protocol::guest_env::CUDA_EXPANDABLE_SEGMENTS;
+const PYTORCH_ALLOC_CONF: &str = "PYTORCH_ALLOC_CONF";
+const PYTORCH_CUDA_ALLOC_CONF: &str = "PYTORCH_CUDA_ALLOC_CONF";
+const EXPANDABLE_SEGMENTS: &str = "expandable_segments:True";
 
 /// Whether CUDA guest-RAM zero-copy was requested for this VM.
 pub fn zerocopy_enabled() -> bool {
     std::env::var(ZEROCOPY_ENV).as_deref() == Ok("1")
+}
+
+fn fork_pool_enabled() -> bool {
+    std::env::var(FORK_POOL_SIZE_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .is_some_and(|size| size > 0)
+}
+
+fn disabled(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "off" | "no"
+    )
+}
+
+fn has_expandable_segments(value: &str) -> bool {
+    value.split(',').any(|option| {
+        option
+            .split_once(':')
+            .is_some_and(|(key, _)| key.trim().eq_ignore_ascii_case("expandable_segments"))
+    })
+}
+
+fn append_expandable_segments(value: &mut String) {
+    if !value.trim().is_empty() {
+        value.push(',');
+    }
+    value.push_str(EXPANDABLE_SEGMENTS);
+}
+
+fn inject_expandable_segments_specs(env: &mut Vec<String>, enabled: bool) {
+    if !enabled
+        || env.iter().any(|entry| {
+            entry
+                .split_once('=')
+                .is_some_and(|(key, value)| key == EXPANDABLE_SEGMENTS_ENV && disabled(value))
+        })
+    {
+        return;
+    }
+    let allocator_indexes: Vec<usize> = env
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            let (key, _) = entry.split_once('=')?;
+            matches!(key, PYTORCH_ALLOC_CONF | PYTORCH_CUDA_ALLOC_CONF).then_some(index)
+        })
+        .collect();
+    if allocator_indexes.iter().any(|&index| {
+        env[index]
+            .split_once('=')
+            .is_some_and(|(_, value)| has_expandable_segments(value))
+    }) {
+        return;
+    }
+    if let Some(&index) = allocator_indexes.first() {
+        let (key, value) = env[index].split_once('=').unwrap();
+        let mut value = value.to_string();
+        append_expandable_segments(&mut value);
+        env[index] = format!("{key}={value}");
+    } else {
+        env.push(format!("{PYTORCH_CUDA_ALLOC_CONF}={EXPANDABLE_SEGMENTS}"));
+    }
+}
+
+fn inject_expandable_segments_pairs(env: &mut Vec<(String, String)>, enabled: bool) {
+    if !enabled
+        || env
+            .iter()
+            .any(|(key, value)| key == EXPANDABLE_SEGMENTS_ENV && disabled(value))
+    {
+        return;
+    }
+    if env.iter().any(|(key, value)| {
+        matches!(key.as_str(), PYTORCH_ALLOC_CONF | PYTORCH_CUDA_ALLOC_CONF)
+            && has_expandable_segments(value)
+    }) {
+        return;
+    }
+    if let Some((_, value)) = env
+        .iter_mut()
+        .find(|(key, _)| matches!(key.as_str(), PYTORCH_ALLOC_CONF | PYTORCH_CUDA_ALLOC_CONF))
+    {
+        append_expandable_segments(value);
+    } else {
+        env.push((
+            PYTORCH_CUDA_ALLOC_CONF.to_string(),
+            EXPANDABLE_SEGMENTS.to_string(),
+        ));
+    }
 }
 
 /// Where the guest CUDA shims ship inside the VM rootfs (from the agent
@@ -60,7 +156,7 @@ const RPATH_PINNED_SONAMES: &[&str] = &[
 /// vars can't reach them). Used on the fresh-container path (`crun run`/
 /// `create`). No-op unless CUDA was requested.
 pub fn inject_into_container(spec: &mut crate::oci::OciSpec, rootfs: &std::path::Path) {
-    inject_into_container_if(spec, rootfs, zerocopy_enabled());
+    inject_into_container_if(spec, rootfs, zerocopy_enabled(), fork_pool_enabled());
 }
 
 /// Testable core of [`inject_into_container`].
@@ -68,11 +164,13 @@ fn inject_into_container_if(
     spec: &mut crate::oci::OciSpec,
     rootfs: &std::path::Path,
     enabled: bool,
+    fork_pool: bool,
 ) {
     if !enabled {
         return;
     }
     spec.add_env(ZEROCOPY_ENV, "1");
+    inject_expandable_segments_specs(&mut spec.process.env, fork_pool);
     stage_shims(spec, rootfs, std::path::Path::new(GUEST_SHIM_DIR));
 }
 
@@ -189,6 +287,7 @@ pub fn augment_exec_env(mut env: Vec<(String, String)>) -> Vec<(String, String)>
             CONTAINER_SHIM_DIR.to_string(),
         )),
     }
+    inject_expandable_segments_pairs(&mut env, fork_pool_enabled());
     env
 }
 
@@ -211,14 +310,14 @@ mod tests {
     #[test]
     fn injects_when_enabled() {
         let mut s = spec();
-        inject_into_container_if(&mut s, std::path::Path::new("/nonexistent"), true);
+        inject_into_container_if(&mut s, std::path::Path::new("/nonexistent"), true, false);
         assert!(s.process.env.iter().any(|e| e == "SMOLVM_CUDA_ZEROCOPY=1"));
     }
 
     #[test]
     fn noop_when_disabled() {
         let mut s = spec();
-        inject_into_container_if(&mut s, std::path::Path::new("/nonexistent"), false);
+        inject_into_container_if(&mut s, std::path::Path::new("/nonexistent"), false, false);
         assert!(!s
             .process
             .env
@@ -252,6 +351,78 @@ mod tests {
         let mut env = vec!["PATH=/usr/bin".to_string()];
         append_ld_library_path(&mut env, CONTAINER_SHIM_DIR);
         assert!(env.contains(&format!("LD_LIBRARY_PATH={CONTAINER_SHIM_DIR}")));
+    }
+
+    #[test]
+    fn fork_pool_injects_expandable_segments() {
+        let mut s = spec();
+        inject_into_container_if(&mut s, std::path::Path::new("/nonexistent"), true, true);
+        assert!(s
+            .process
+            .env
+            .iter()
+            .any(|entry| entry == "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"));
+    }
+
+    #[test]
+    fn fork_pool_appends_to_existing_allocator_config() {
+        let mut s = spec();
+        s.process
+            .env
+            .push("PYTORCH_ALLOC_CONF=max_split_size_mb:128".to_string());
+        inject_into_container_if(&mut s, std::path::Path::new("/nonexistent"), true, true);
+        assert!(s.process.env.iter().any(|entry| {
+            entry == "PYTORCH_ALLOC_CONF=max_split_size_mb:128,expandable_segments:True"
+        }));
+    }
+
+    #[test]
+    fn fork_pool_preserves_explicit_allocator_choice() {
+        let mut s = spec();
+        s.process
+            .env
+            .push("PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False".to_string());
+        inject_into_container_if(&mut s, std::path::Path::new("/nonexistent"), true, true);
+        assert!(s
+            .process
+            .env
+            .iter()
+            .any(|entry| entry == "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False"));
+    }
+
+    #[test]
+    fn workload_can_disable_automatic_expandable_segments() {
+        let mut s = spec();
+        s.process
+            .env
+            .push("SMOLVM_CUDA_EXPANDABLE_SEGMENTS=off".to_string());
+        inject_into_container_if(&mut s, std::path::Path::new("/nonexistent"), true, true);
+        assert!(!s.process.env.iter().any(|entry| {
+            entry.starts_with("PYTORCH_CUDA_ALLOC_CONF=")
+                || entry.starts_with("PYTORCH_ALLOC_CONF=")
+        }));
+    }
+
+    #[test]
+    fn exec_env_injects_expandable_segments() {
+        let mut env = vec![(
+            PYTORCH_CUDA_ALLOC_CONF.to_string(),
+            "max_split_size_mb:128".to_string(),
+        )];
+        inject_expandable_segments_pairs(&mut env, true);
+        assert!(env.iter().any(|(key, value)| {
+            key == PYTORCH_CUDA_ALLOC_CONF
+                && value == "max_split_size_mb:128,expandable_segments:True"
+        }));
+    }
+
+    #[test]
+    fn exec_env_respects_expandable_segments_opt_out() {
+        let mut env = vec![(EXPANDABLE_SEGMENTS_ENV.to_string(), "false".to_string())];
+        inject_expandable_segments_pairs(&mut env, true);
+        assert!(!env.iter().any(|(key, _)| {
+            matches!(key.as_str(), PYTORCH_ALLOC_CONF | PYTORCH_CUDA_ALLOC_CONF)
+        }));
     }
 
     #[test]
