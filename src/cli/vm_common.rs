@@ -721,6 +721,7 @@ pub struct ForkVmOptions<'a> {
     pub fork_env: &'a [(String, String)],
     pub fork_secrets: &'a BTreeMap<String, SecretRef>,
     pub wait_ready: Option<std::time::Duration>,
+    pub hold: bool,
 }
 
 pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm::Result<()> {
@@ -735,15 +736,26 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
     // The launch-agnostic mechanics live in the lib (`agent::fork`) so the CLI
     // and the serve API share one implementation.
     eprintln!("Freezing golden '{golden}' as fork base...");
-    let prep = smolvm::agent::fork::prepare_fork(
-        &db,
-        golden,
-        clone,
-        options.pinned_ports,
-        options.clone_forkable,
-        options.fork_env,
-        options.fork_secrets,
-    )?;
+    let prep = if options.hold {
+        smolvm::agent::fork::prepare_held_fork(
+            &db,
+            golden,
+            clone,
+            options.pinned_ports,
+            options.fork_env,
+            options.fork_secrets,
+        )?
+    } else {
+        smolvm::agent::fork::prepare_fork(
+            &db,
+            golden,
+            clone,
+            options.pinned_ports,
+            options.clone_forkable,
+            options.fork_env,
+            options.fork_secrets,
+        )?
+    };
     for (golden_host, guest, clone_host) in &prep.port_remaps {
         if options.pinned_ports.is_empty() {
             eprintln!(
@@ -755,23 +767,31 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
     }
 
     let snapshot_dir = prep.snapshot_dir.clone();
+    let resume_golden = prep.resume_golden_on_rollback;
     if let Err(error) =
         boot_prepared_fork(&db, clone, prep, options.share_weights, options.fork_env)
     {
-        return rollback_failed_fork(golden, &snapshot_dir, error);
+        return rollback_failed_fork(golden, &snapshot_dir, resume_golden, error);
     }
-    if options.wait_ready.is_some() {
+    if options.wait_ready.is_some() && !options.hold {
         if let Err(error) = smolvm::agent::fork::fail_closed_on_rejuvenation(
             smolvm::agent::fork::release_forkpoint(clone),
             || teardown_fork_clone(&db, clone),
         ) {
-            return rollback_failed_fork(golden, &snapshot_dir, error);
+            return rollback_failed_fork(golden, &snapshot_dir, resume_golden, error);
         }
     }
-    eprintln!(
-        "Forked '{golden}' -> '{clone}'. Golden stays frozen as the fork base \
-         (do not start it again while clones exist)."
-    );
+    if options.hold {
+        eprintln!(
+            "Forked '{golden}' -> held slot '{clone}'. Release it with \
+             `smolvm machine fork-release --name {clone}`."
+        );
+    } else {
+        eprintln!(
+            "Forked '{golden}' -> '{clone}'. Golden stays frozen as the fork base \
+             (do not start it again while clones exist)."
+        );
+    }
     Ok(())
 }
 
@@ -785,6 +805,7 @@ pub fn fork_vm_batch(
     fork_secrets: &BTreeMap<String, SecretRef>,
     wait_ready: Option<std::time::Duration>,
     parallel: usize,
+    hold: bool,
 ) -> smolvm::Result<()> {
     let db = SmolvmDb::open()?;
     if let Some(timeout) = wait_ready {
@@ -800,6 +821,7 @@ pub fn fork_vm_batch(
             clone_forkable: false,
             fork_env: env,
             fork_secrets,
+            hold,
         })
         .collect();
     eprintln!(
@@ -808,6 +830,7 @@ pub fn fork_vm_batch(
     );
     let prepared = smolvm::agent::fork::prepare_forks(&db, golden, &specs)?;
     let snapshot_dir = prepared[0].snapshot_dir.clone();
+    let resume_golden = prepared[0].resume_golden_on_rollback;
     let all_names: Vec<String> = clones.iter().map(|(name, _)| name.clone()).collect();
     let jobs: Vec<_> = prepared
         .into_iter()
@@ -884,7 +907,7 @@ pub fn fork_vm_batch(
         }
     }
 
-    if first_error.is_none() && wait_ready.is_some() {
+    if first_error.is_none() && wait_ready.is_some() && !hold {
         for name in &all_names {
             if let Err(error) = smolvm::agent::fork::release_forkpoint(name) {
                 first_error = Some(smolvm::Error::agent(
@@ -900,12 +923,74 @@ pub fn fork_vm_batch(
         for name in &all_names {
             teardown_fork_clone(&db, name);
         }
-        return rollback_failed_fork(golden, &snapshot_dir, error);
+        return rollback_failed_fork(golden, &snapshot_dir, resume_golden, error);
     }
 
+    if hold {
+        eprintln!(
+            "Provisioned {} held slots from '{golden}' with one snapshot.",
+            all_names.len()
+        );
+    } else {
+        eprintln!(
+            "Forked {} clones from '{golden}' with one snapshot.",
+            all_names.len()
+        );
+    }
+    Ok(())
+}
+
+/// Assign and release one held clone. This is intentionally one-way: after the
+/// workload begins, the clone is dirty and must be replaced from its golden
+/// before it can serve another independent job.
+pub fn release_held_fork(clone: &str, assignment: &[(String, String)]) -> smolvm::Result<()> {
+    let db = SmolvmDb::open()?;
+    let record = db
+        .get_vm(clone)?
+        .ok_or_else(|| smolvm::Error::vm_not_found(clone))?;
+    if record.golden.is_none() {
+        return Err(smolvm::Error::agent(
+            "release held fork",
+            format!("machine '{clone}' is not a fork clone"),
+        ));
+    }
+    if !record.forkpoint_held {
+        return Err(smolvm::Error::agent(
+            "release held fork",
+            format!("clone '{clone}' is not a held pool slot"),
+        ));
+    }
+
+    smolvm::agent::fork::validate_fork_env(assignment)?;
+    let merged = smolvm::agent::fork::merge_fork_env(&record.fork_env, assignment);
+    let claimed = std::cell::Cell::new(false);
+    db.update_vm(clone, |updated| {
+        if updated.forkpoint_held {
+            smolvm::agent::fork::record_fork_activation(updated, assignment, merged.clone());
+            claimed.set(true);
+        }
+    })?
+    .ok_or_else(|| smolvm::Error::vm_not_found(clone))?;
+    if !claimed.get() {
+        return Err(smolvm::Error::agent(
+            "release held fork",
+            format!("clone '{clone}' was already claimed"),
+        ));
+    }
+    let activated = smolvm::agent::fork::activate_held_fork(clone, &record, assignment).map_err(
+        |error| {
+            smolvm::Error::agent(
+                "release held fork",
+                format!(
+                    "slot '{clone}' was claimed and will not be reused after activation failed: {error}"
+                ),
+            )
+        },
+    )?;
+    debug_assert_eq!(activated, merged);
     eprintln!(
-        "Forked {} clones from '{golden}' with one snapshot.",
-        all_names.len()
+        "Released held slot '{clone}'. Replace it from '{}' after the workload completes.",
+        record.golden.as_deref().unwrap_or("its golden")
     );
     Ok(())
 }
@@ -956,10 +1041,15 @@ fn teardown_fork_clone(db: &SmolvmDb, clone: &str) {
 fn rollback_failed_fork(
     golden: &str,
     snapshot_dir: &std::path::Path,
+    resume_golden: bool,
     error: smolvm::Error,
 ) -> smolvm::Result<()> {
     let cleanup_error = std::fs::remove_dir_all(snapshot_dir).err();
-    let resume_error = smolvm::agent::fork::resume_golden(golden).err();
+    let resume_error = if resume_golden {
+        smolvm::agent::fork::resume_golden(golden).err()
+    } else {
+        None
+    };
     match (cleanup_error, resume_error) {
         (None, None) => Err(error),
         (cleanup, resume) => Err(smolvm::Error::agent(
@@ -2054,6 +2144,7 @@ fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
         "ephemeral": record.ephemeral,
         "gpu": record.gpu.unwrap_or(false),
         "gpu_vram_mib": record.gpu_vram_mib,
+        "forkpoint_held": record.forkpoint_held,
         "restart_policy": record.restart.policy.to_string(),
         "restart_max_retries": record.restart.max_retries,
         "restart_count": record.restart.restart_count,
@@ -2166,6 +2257,9 @@ pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
                         Some(vram) => println!("  GPU: enabled ({} MiB VRAM)", vram),
                         None => println!("  GPU: enabled"),
                     }
+                }
+                if record.forkpoint_held {
+                    println!("  Fork slot: held");
                 }
                 for cmd in &record.init {
                     println!("  Init: {}", cmd);

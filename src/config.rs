@@ -554,6 +554,21 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub golden: Option<String>,
 
+    /// Whether a fork clone is still parked at the inherited workload
+    /// forkpoint. Held clones are clean, already-booted pool slots: a caller
+    /// installs the job-specific fork parameters and releases each slot once.
+    /// A released training clone is disposable and must never be marked held
+    /// again because its optimizer, RNG, and dataset state may have changed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub forkpoint_held: bool,
+
+    /// Parameters delivered through `/etc/smolvm/fork-env` for this clone.
+    /// Kept separately from the machine's ordinary environment so a held slot
+    /// can merge assignment-time values without copying unrelated golden env
+    /// entries into the workload-facing parameter file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fork_env: Vec<(String, String)>,
+
     /// Set for machines created by the Kubernetes containerd shim (pod
     /// sandboxes). Scopes node-reboot reconciliation (see
     /// `control::reconcile_runtime_machines`) so it reclaims only shim-managed
@@ -645,6 +660,8 @@ impl VmRecord {
             ephemeral: false,
             source_smolmachine: None,
             golden: None,
+            forkpoint_held: false,
+            fork_env: Vec::new(),
             runtime_managed: false,
         }
     }
@@ -704,6 +721,8 @@ impl VmRecord {
             ephemeral: false,
             source_smolmachine: None,
             golden: None,
+            forkpoint_held: false,
+            fork_env: Vec::new(),
             runtime_managed: false,
         }
     }
@@ -1178,6 +1197,27 @@ mod tests {
         let legacy: VmRecord = serde_json::from_value(legacy_value).unwrap();
         assert_eq!(legacy.cuda_fork_pool_size, None);
         assert_eq!(legacy.cuda_vram_limit_mib, None);
+    }
+
+    #[test]
+    fn held_fork_state_roundtrips_and_legacy_records_default_released() {
+        let mut record = VmRecord::new("slot-0".to_string(), 2, 1024, vec![], vec![], false);
+        record.golden = Some("golden".to_string());
+        record.forkpoint_held = true;
+        record.fork_env = vec![("SMOLVM_FORK_INDEX".to_string(), "0".to_string())];
+
+        let encoded = serde_json::to_value(&record).unwrap();
+        let decoded: VmRecord = serde_json::from_value(encoded.clone()).unwrap();
+        assert!(decoded.forkpoint_held);
+        assert_eq!(decoded.fork_env, record.fork_env);
+
+        let mut legacy_value = encoded;
+        let legacy_object = legacy_value.as_object_mut().unwrap();
+        legacy_object.remove("forkpoint_held");
+        legacy_object.remove("fork_env");
+        let legacy: VmRecord = serde_json::from_value(legacy_value).unwrap();
+        assert!(!legacy.forkpoint_held);
+        assert!(legacy.fork_env.is_empty());
     }
 
     #[test]

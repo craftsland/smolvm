@@ -637,6 +637,9 @@ pub struct MachineInfo {
     /// Explicit logical CUDA memory limit per golden/clone session, in MiB.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cuda_vram_limit_mib: Option<u64>,
+    /// True while this clone is an already-booted clean slot parked at the
+    /// workload forkpoint and available for one assignment.
+    pub forkpoint_held: bool,
     /// Cumulative guest-outbound (egress) bytes since boot, for billing. Present
     /// only for virtio-net machines that have reported a value; omitted for TSI
     /// or machines that haven't flushed yet. Surfaced the same way `storage_gb`
@@ -814,8 +817,21 @@ pub struct ForkRequest {
     /// the base stays frozen (LoRA/QLoRA fine-tuning, inference).
     #[serde(default)]
     pub share_weights: bool,
+    /// Wait for the workload's standard forkpoint before snapshotting, then
+    /// release the clone only after identity and fork parameters are installed.
+    #[serde(default)]
+    pub wait_ready: bool,
+    /// Keep the clone parked at the inherited forkpoint as an already-booted
+    /// pool slot. Implies `waitReady`; release it exactly once through the
+    /// fork-release endpoint after assigning job-specific parameters.
+    #[serde(default)]
+    pub hold: bool,
+    /// Maximum seconds to wait for the golden workload's forkpoint. Defaults
+    /// to 240 when `waitReady` or `hold` is enabled.
+    #[serde(default)]
+    pub ready_timeout_secs: Option<u64>,
     /// Per-fork parameters as KEY=VALUE strings. Delivered to the clone at
-    /// `/run/smolvm/fork-env` (dotenv format) for the already-running workload
+    /// `/etc/smolvm/fork-env` (dotenv format) for the already-running workload
     /// to read, and merged into the clone's env for later exec sessions.
     #[serde(default)]
     pub env: Vec<String>,
@@ -828,6 +844,16 @@ pub struct ForkRequest {
     #[serde(default)]
     #[schema(value_type = Object)]
     pub secrets: RequestSecretRefs,
+}
+
+/// Assignment for one already-booted held fork slot.
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkReleaseRequest {
+    /// Job-specific KEY=VALUE parameters. A value replaces a same-named value
+    /// installed while provisioning the slot.
+    #[serde(default)]
+    pub env: Vec<String>,
 }
 
 #[cfg(test)]
@@ -893,5 +919,16 @@ mod registry_auth_tests {
         .into();
         assert_eq!(a.username, "oauth2accesstoken");
         assert_eq!(a.password, "p:with:colons");
+    }
+
+    #[test]
+    fn legacy_fork_request_preserves_uncoordinated_behavior() {
+        let request: ForkRequest = serde_json::from_value(serde_json::json!({
+            "name": "clone-1"
+        }))
+        .unwrap();
+        assert!(!request.wait_ready);
+        assert!(!request.hold);
+        assert_eq!(request.ready_timeout_secs, None);
     }
 }

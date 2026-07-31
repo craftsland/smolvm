@@ -267,6 +267,9 @@ pub enum MachineCmd {
     /// Fork a running forkable machine into a new clone (CoW memory + disks)
     Fork(ForkCmd),
 
+    /// Assign parameters and release one held fork-pool slot
+    ForkRelease(ForkReleaseCmd),
+
     /// Stop a running machine
     Stop(StopCmd),
 
@@ -337,6 +340,7 @@ impl MachineCmd {
             MachineCmd::Create(cmd) => cmd.run(),
             MachineCmd::Start(cmd) => cmd.run(),
             MachineCmd::Fork(cmd) => cmd.run(),
+            MachineCmd::ForkRelease(cmd) => cmd.run(),
             MachineCmd::Stop(cmd) => cmd.run(),
             MachineCmd::Delete(cmd) => cmd.run(),
             MachineCmd::Status(cmd) => cmd.run(),
@@ -1937,10 +1941,36 @@ mod tests {
         assert!(!batch.wait_ready);
         assert_eq!(batch.ready_timeout, Duration::from_secs(120));
         assert_eq!(
-            forkpoint_timeout(batch.count.get(), batch.wait_ready, batch.ready_timeout),
+            forkpoint_timeout(
+                batch.count.get(),
+                batch.wait_ready,
+                batch.hold,
+                batch.ready_timeout,
+            ),
             Some(Duration::from_secs(120))
         );
-        assert_eq!(forkpoint_timeout(1, false, Duration::from_secs(120)), None);
+        assert_eq!(
+            forkpoint_timeout(1, false, false, Duration::from_secs(120)),
+            None
+        );
+        assert_eq!(
+            forkpoint_timeout(1, false, true, Duration::from_secs(120)),
+            Some(Duration::from_secs(120))
+        );
+
+        let release = TestMachineCli::parse_from([
+            "machine",
+            "fork-release",
+            "--name",
+            "worker-0",
+            "--env",
+            "LR=3e-4",
+        ]);
+        let MachineCmd::ForkRelease(release) = release.command else {
+            panic!("expected fork-release command");
+        };
+        assert_eq!(release.name, "worker-0");
+        assert_eq!(release.env, vec!["LR=3e-4"]);
     }
 
     #[test]
@@ -3019,9 +3049,17 @@ pub struct ForkCmd {
     pub parallel: std::num::NonZeroU32,
 
     /// Wait for `smolvm-fork-ready` in a single-clone fork. Batch forks always
-    /// wait and release clones only after identity and fork env are installed.
+    /// wait; unless held, they release clones only after identity and fork env
+    /// are installed.
     #[arg(long)]
     pub wait_ready: bool,
+
+    /// Keep each clone parked at the inherited forkpoint as an already-booted
+    /// pool slot. Assign and release a slot later with `machine fork-release`.
+    /// A consumed slot is disposable; delete and replenish it from the golden
+    /// rather than reusing mutated training state.
+    #[arg(long)]
+    pub hold: bool,
 
     /// Maximum time to wait for the golden workload's forkpoint.
     #[arg(
@@ -3087,11 +3125,17 @@ impl ForkCmd {
         // they merge into the clone's secret_refs and resolve fresh per exec.
         let fork_secrets = parse_cli_secret_refs(&self.secret_env, &self.secret_file)?;
         let count = self.count.get();
-        let wait_ready = forkpoint_timeout(count, self.wait_ready, self.ready_timeout);
+        let wait_ready = forkpoint_timeout(count, self.wait_ready, self.hold, self.ready_timeout);
         if count > 1024 {
             return Err(smolvm::Error::config(
                 "fork",
                 "--count cannot exceed 1024 clones per batch",
+            ));
+        }
+        if self.hold && self.forkable {
+            return Err(smolvm::Error::config(
+                "fork",
+                "--hold cannot be combined with --forkable; pool slots are disposable leaves",
             ));
         }
 
@@ -3123,6 +3167,7 @@ impl ForkCmd {
                     fork_env: &fork_env,
                     fork_secrets: &fork_secrets,
                     wait_ready,
+                    hold: self.hold,
                 },
             );
         }
@@ -3166,7 +3211,28 @@ impl ForkCmd {
             &fork_secrets,
             wait_ready,
             self.parallel.get() as usize,
+            self.hold,
         )
+    }
+}
+
+/// Assign job-specific parameters and release one held fork-pool slot.
+#[derive(Args, Debug)]
+pub struct ForkReleaseCmd {
+    /// Held clone to assign and release.
+    #[arg(short = 'n', long = "name", value_name = "NAME")]
+    pub name: String,
+
+    /// Assignment parameter (repeatable, KEY=VALUE). Values override matching
+    /// parameters installed when the slot was provisioned.
+    #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
+    pub env: Vec<String>,
+}
+
+impl ForkReleaseCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let env = smolvm::util::parse_env_list(&self.env);
+        vm_common::release_held_fork(&self.name, &env)
     }
 }
 
@@ -3193,9 +3259,10 @@ fn render_indexed_fork_env(
 fn forkpoint_timeout(
     count: u32,
     explicitly_requested: bool,
+    hold: bool,
     timeout: Duration,
 ) -> Option<Duration> {
-    (count > 1 || explicitly_requested).then_some(timeout)
+    (count > 1 || explicitly_requested || hold).then_some(timeout)
 }
 
 // ============================================================================

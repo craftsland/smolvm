@@ -37,8 +37,8 @@ use crate::api::state::{
 };
 use crate::api::types::{
     ApiErrorResponse, CreateMachineRequest, DeleteQuery, DeleteResponse, ExportRequest,
-    ExportResponse, ForkRequest, ListMachinesResponse, MachineInfo, MountInfo, MountSpec, PortSpec,
-    ResizeMachineRequest, ResourceSpec, StartMachineQuery,
+    ExportResponse, ForkReleaseRequest, ForkRequest, ListMachinesResponse, MachineInfo, MountInfo,
+    MountSpec, PortSpec, ResizeMachineRequest, ResourceSpec, StartMachineQuery,
 };
 use crate::config::{RecordState, RestartConfig, VmRecord};
 use crate::data::disk::{Overlay, Storage};
@@ -107,6 +107,7 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         overlay_gb: Some(record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB)),
         cuda_fork_pool_size: record.cuda_fork_pool_size,
         cuda_vram_limit_mib: record.cuda_vram_limit_mib,
+        forkpoint_held: record.forkpoint_held,
         // Cumulative egress, read from the per-VM telemetry file the subprocess
         // flushes. Surfaced here so the control plane reads it from the machine
         // list exactly like disk size — no bespoke endpoint.
@@ -174,6 +175,7 @@ fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> Machin
         source_smolmachine: record.source_smolmachine.clone(),
         cuda_fork_pool_size: record.cuda_fork_pool_size,
         cuda_vram_limit_mib: record.cuda_vram_limit_mib,
+        forkpoint_held: record.forkpoint_held,
     }
 }
 
@@ -1274,12 +1276,17 @@ pub async fn fork_machine(
     let clone = req.name.clone();
     let pinned_ports: Vec<(u16, u16)> = req.ports.iter().map(|p| (p.host, p.guest)).collect();
     let req_share_weights = req.share_weights;
+    let req_hold = req.hold;
+    let wait_ready = req.wait_ready || req_hold;
+    let ready_timeout = std::time::Duration::from_secs(req.ready_timeout_secs.unwrap_or(240));
     let fork_env = crate::util::parse_env_list(&req.env);
     // Per-fork secrets become the clone's persisted secret_refs (resolved fresh
     // on each exec, never at rest) — validate them at TrustedLocal like the
     // Smolfile-declared refs they join.
     crate::api::handlers::validate_fork_secrets(&req.secrets)?;
     let fork_secrets = req.secrets.clone();
+    crate::agent::fork::validate_fork_env(&fork_env)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     // Validate pinned ports as the create path does: fork uses these host ports
     // as-is (no remapping), so port 0 or a duplicated host port would otherwise
@@ -1302,6 +1309,16 @@ pub async fn fork_machine(
         }
     }
 
+    if wait_ready {
+        let golden_b = golden.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::agent::fork::wait_for_forkpoint(&golden_b, ready_timeout)
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("task error: {e}")))?
+        .map_err(classify_fork_error)?;
+    }
+
     // Serialize lifecycle on the CLONE name so a concurrent start/stop/delete of
     // the same clone can't race the fork's register + boot. The golden is only
     // read + frozen via its control socket, which tolerates concurrent forks.
@@ -1320,9 +1337,16 @@ pub async fn fork_machine(
         let env = fork_env.clone();
         let secrets = fork_secrets.clone();
         tokio::task::spawn_blocking(move || {
-            crate::agent::fork::prepare_fork(
-                &db, &golden_b, &clone_b, &ports, /* clone_forkable */ false, &env, &secrets,
-            )
+            if req_hold {
+                crate::agent::fork::prepare_held_fork(
+                    &db, &golden_b, &clone_b, &ports, &env, &secrets,
+                )
+            } else {
+                crate::agent::fork::prepare_fork(
+                    &db, &golden_b, &clone_b, &ports, /* clone_forkable */ false, &env,
+                    &secrets,
+                )
+            }
         })
         .await
         .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
@@ -1386,6 +1410,13 @@ pub async fn fork_machine(
             teardown,
         )
         .map_err(|e| format!("fork env delivery failed: {}", e))?;
+        if wait_ready && !req_hold {
+            crate::agent::fork::fail_closed_on_rejuvenation(
+                crate::agent::fork::release_forkpoint(&clone_b),
+                teardown,
+            )
+            .map_err(|e| format!("forkpoint release failed: {e}"))?;
+        }
 
         let pid = manager.child_pid();
         Ok::<_, String>((manager, pid, record))
@@ -1417,6 +1448,90 @@ pub async fn fork_machine(
     info.state = "running".to_string();
     info.pid = pid;
     Ok(Json(info))
+}
+
+/// Assign job parameters and release one held fork-pool slot.
+#[utoipa::path(
+    post,
+    path = "/api/v1/machines/{name}/fork-release",
+    tag = "Machines",
+    params(("name" = String, Path, description = "Held clone name")),
+    request_body = ForkReleaseRequest,
+    responses(
+        (status = 200, description = "Held clone assigned and released", body = MachineInfo),
+        (status = 404, description = "Clone not found", body = ApiErrorResponse),
+        (status = 409, description = "Machine is not a held fork slot", body = ApiErrorResponse),
+        (status = 500, description = "Activation failed", body = ApiErrorResponse)
+    )
+)]
+pub async fn release_held_fork(
+    State(state): State<Arc<ApiState>>,
+    Path(clone): Path<String>,
+    Json(req): Json<ForkReleaseRequest>,
+) -> Result<Json<MachineInfo>, ApiError> {
+    let lifecycle = state.lifecycle_lock(&clone);
+    let _guard = lifecycle.lock().await;
+    let record = state
+        .lookup_vm(&clone)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("machine '{clone}' not found")))?;
+    if record.golden.is_none() || !record.forkpoint_held {
+        return Err(ApiError::Conflict(format!(
+            "machine '{clone}' is not a held fork-pool slot"
+        )));
+    }
+
+    let assignment = crate::util::parse_env_list(&req.env);
+    crate::agent::fork::validate_fork_env(&assignment)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let merged = crate::agent::fork::merge_fork_env(&record.fork_env, &assignment);
+    // Claim in durable state before publishing the guest release marker. A
+    // crash can strand one slot, but can never leave a running workload marked
+    // assignable and run it twice. Replenishment from the golden is the safe
+    // recovery for any ambiguous activation failure.
+    let assignment_for_record = assignment.clone();
+    let merged_for_record = merged.clone();
+    let claimed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let claimed_in_update = claimed.clone();
+    let updated = state
+        .update_vm(&clone, move |entry| {
+            if entry.forkpoint_held {
+                crate::agent::fork::record_fork_activation(
+                    entry,
+                    &assignment_for_record,
+                    merged_for_record,
+                );
+                claimed_in_update.store(true, std::sync::atomic::Ordering::Release);
+            }
+        })
+        .await?
+        .ok_or_else(|| {
+            ApiError::NotFound(format!("clone '{clone}' disappeared before activation"))
+        })?;
+    if !claimed.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(ApiError::Conflict(format!(
+            "held fork-pool slot '{clone}' was already claimed"
+        )));
+    }
+    if let Ok(entry) = state.get_machine(&clone) {
+        entry.lock().forkpoint_held = false;
+    }
+
+    let clone_b = clone.clone();
+    let record_b = record.clone();
+    let assignment_b = assignment.clone();
+    let activated = tokio::task::spawn_blocking(move || {
+        crate::agent::fork::activate_held_fork(&clone_b, &record_b, &assignment_b)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("task error: {e}")))?
+    .map_err(|error| {
+        ApiError::Internal(format!(
+            "slot '{clone}' was claimed and will not be reused after activation failed: {error}"
+        ))
+    })?;
+    debug_assert_eq!(activated, merged);
+    Ok(Json(record_to_info(&clone, &updated)))
 }
 
 /// Stop a machine.

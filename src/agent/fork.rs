@@ -59,6 +59,21 @@ pub fn control_socket_cmd(sock: &Path, cmd: &str) -> Result<String> {
 /// marker and blocks. Keeping the wait in the VM namespace avoids coupling the
 /// host to container logs, PIDs, or workload-specific files.
 pub fn wait_for_forkpoint(golden: &str, timeout: Duration) -> Result<()> {
+    // A successful first fork leaves the golden paused permanently as the CoW
+    // base. Pool replenishment must not try to run a new agent exec inside that
+    // paused VM: its vCPUs cannot answer, even though the already-proven
+    // forkpoint remains the exact snapshot source. The control plane is still
+    // live in the VMM, so recognize that state before touching the guest.
+    let control = control_socket_path(golden);
+    if control.exists() {
+        if let Ok(status) = control_socket_cmd(&control, "STATUS") {
+            if fork_base_already_paused(&status) {
+                tracing::debug!(golden, %status, "fork base is already paused; reusing its forkpoint");
+                return Ok(());
+            }
+        }
+    }
+
     let socket = vm_data_dir(golden).join("agent.sock");
     let mut client = AgentClient::connect_with_retry(&socket)
         .map_err(|e| Error::agent("wait for forkpoint", format!("agent connect: {e}")))?;
@@ -90,6 +105,10 @@ pub fn wait_for_forkpoint(golden: &str, timeout: Duration) -> Result<()> {
             ),
         )),
     }
+}
+
+fn fork_base_already_paused(status: &str) -> bool {
+    status.trim() == "OK paused"
 }
 
 /// Release the workload restored in `clone` after its identity and per-fork
@@ -155,6 +174,10 @@ pub struct PreparedFork {
     /// caller to log. Empty when the golden has no forwards. When ports were
     /// pinned, `golden_host == clone_host`.
     pub port_remaps: Vec<(u16, u16, u16)>,
+    /// Whether a caller must resume the golden if clone boot/finalization fails.
+    /// False for pool refill from an already-paused golden: resuming that base
+    /// would invalidate every existing clone and retained CUDA snapshot.
+    pub resume_golden_on_rollback: bool,
 }
 
 /// Parameters for one clone in a single-snapshot fork operation.
@@ -169,6 +192,9 @@ pub struct ForkSpec<'a> {
     pub fork_env: &'a [(String, String)],
     /// Per-clone secret references resolved by later execs.
     pub fork_secrets: &'a BTreeMap<String, crate::secrets::SecretRef>,
+    /// Keep the restored workload parked at its inherited forkpoint until a
+    /// later assignment explicitly releases it.
+    pub hold: bool,
 }
 
 /// Freeze a running, forkable `golden`, snapshot it, register `clone` in the DB
@@ -198,6 +224,32 @@ pub fn prepare_fork(
             clone_forkable,
             fork_env,
             fork_secrets,
+            hold: false,
+        }],
+    )?;
+    Ok(prepared.remove(0))
+}
+
+/// Prepare one clean clone that remains parked at the inherited forkpoint.
+/// Held slots are deliberately non-forkable and one-shot.
+pub fn prepare_held_fork(
+    db: &SmolvmDb,
+    golden: &str,
+    clone: &str,
+    pinned_ports: &[(u16, u16)],
+    fork_env: &[(String, String)],
+    fork_secrets: &BTreeMap<String, crate::secrets::SecretRef>,
+) -> Result<PreparedFork> {
+    let mut prepared = prepare_forks(
+        db,
+        golden,
+        &[ForkSpec {
+            clone,
+            pinned_ports,
+            clone_forkable: false,
+            fork_env,
+            fork_secrets,
+            hold: true,
         }],
     )?;
     Ok(prepared.remove(0))
@@ -270,6 +322,7 @@ pub fn prepare_forks(
             format!("golden '{golden}' is not ready to fork: {status}"),
         ));
     }
+    let golden_was_paused = fork_base_already_paused(&status);
 
     let gdir = vm_data_dir(golden);
     // Keep this path short and independent of clone names. libkrun and its
@@ -334,13 +387,19 @@ pub fn prepare_forks(
             spec,
             &mut reserved_ports,
         ) {
-            Ok(clone) => prepared.push(clone),
+            Ok(mut clone) => {
+                clone.resume_golden_on_rollback = !golden_was_paused;
+                prepared.push(clone);
+            }
             Err(error) => {
                 for clone in &prepared {
                     let _ = db.remove_vm(&clone.clone_record.name);
                     let _ = std::fs::remove_dir_all(vm_data_dir(&clone.clone_record.name));
                 }
                 let _ = std::fs::remove_dir_all(&snapshot_dir);
+                if golden_was_paused {
+                    return Err(error);
+                }
                 return match resume_golden(golden) {
                     Ok(()) => Err(error),
                     Err(resume_error) => Err(Error::agent(
@@ -432,6 +491,8 @@ fn prepare_clone_from_snapshot(
             clone_rec.ports = remapped;
         }
         clone_rec.golden = Some(golden.to_string());
+        clone_rec.forkpoint_held = spec.hold;
+        clone_rec.fork_env = spec.fork_env.to_vec();
         db.insert_vm(clone, &clone_rec)?;
 
         let t_disk = std::time::Instant::now();
@@ -445,6 +506,7 @@ fn prepare_clone_from_snapshot(
             snapshot_dir: snapshot_dir.to_path_buf(),
             clone_record: clone_rec,
             port_remaps,
+            resume_golden_on_rollback: true,
         })
     })();
 
@@ -704,6 +766,38 @@ pub fn render_fork_env(env: &[(String, String)]) -> String {
     out
 }
 
+/// Merge assignment-time parameters into a held slot's initial fork
+/// parameters. Later values replace same-named earlier values while preserving
+/// stable ordering for every untouched entry.
+pub fn merge_fork_env(
+    initial: &[(String, String)],
+    assignment: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut merged = initial.to_vec();
+    for (key, value) in assignment {
+        merged.retain(|(existing, _)| existing != key);
+        merged.push((key.clone(), value.clone()));
+    }
+    merged
+}
+
+/// Persist the state transition after a held slot has been released
+/// successfully. Kept in one shared helper so the CLI and HTTP API cannot
+/// disagree about the one-shot flag or assignment environment.
+pub fn record_fork_activation(
+    record: &mut VmRecord,
+    assignment: &[(String, String)],
+    merged: Vec<(String, String)>,
+) {
+    let assignment_keys: HashSet<&str> = assignment.iter().map(|(key, _)| key.as_str()).collect();
+    record.forkpoint_held = false;
+    record.fork_env = merged;
+    record
+        .env
+        .retain(|(key, _)| !assignment_keys.contains(key.as_str()));
+    record.env.extend(assignment.iter().cloned());
+}
+
 /// Deliver per-fork parameters into a freshly-booted clone at
 /// [`FORK_ENV_GUEST_PATH`], via a VM-namespace write THROUGH the workload
 /// container's overlayfs `merged` mount. Deliberately not a container exec:
@@ -758,6 +852,83 @@ pub fn write_fork_env(clone: &str, record: &VmRecord, env: &[(String, String)]) 
             ),
         )),
         Err(e) => Err(Error::agent("fork env", format!("vm exec: {e}"))),
+    }
+}
+
+/// Assign and release one clean, already-booted fork-pool slot.
+///
+/// The guest performs the state check, fork-env replacement, and release-marker
+/// publication in one agent exec. A slot can therefore be released only once;
+/// a completed training worker is never reset or reused with dirty optimizer,
+/// RNG, allocator, or dataset state. Callers replenish the pool by deleting the
+/// consumed clone and forking a fresh held slot from its still-frozen golden.
+///
+/// Returns the complete merged fork parameter set that the caller should
+/// persist after success.
+pub fn activate_held_fork(
+    clone: &str,
+    record: &VmRecord,
+    assignment: &[(String, String)],
+) -> Result<Vec<(String, String)>> {
+    validate_fork_env(assignment)?;
+    let merged = merge_fork_env(&record.fork_env, assignment);
+    let content = render_fork_env(&merged);
+    let owner = crate::workload::persistent_overlay_owner(clone, record.golden.as_deref());
+    let merged_root = format!("/storage/overlays/persistent-{owner}/merged");
+    let env_path = if record.image.is_some() {
+        format!("{merged_root}{FORK_ENV_GUEST_PATH}")
+    } else {
+        FORK_ENV_GUEST_PATH.to_string()
+    };
+    let ensure_env_parent = if record.image.is_some() {
+        format!(
+            "if [ ! -d '{merged_root}' ]; then echo 'missing {merged_root}' >&2; exit 41; fi; \
+             mkdir -p '{merged_root}/etc/smolvm'"
+        )
+    } else {
+        "mkdir -p /etc/smolvm".to_string()
+    };
+    let script = format!(
+        "set -e; \
+         if [ -f '{release}' ]; then exit 42; fi; \
+         if [ ! -f '{ready}' ]; then exit 43; fi; \
+         {ensure_env_parent}; \
+         umask 077; cat > '{env_path}.tmp'; mv '{env_path}.tmp' '{env_path}'; \
+         printf '%s\\n' smolvm-forkpoint-release-v1 > '{release}.tmp'; \
+         mv '{release}.tmp' '{release}'",
+        ready = smolvm_protocol::forkpoint::READY_PATH,
+        release = smolvm_protocol::forkpoint::RELEASE_PATH,
+    );
+    let socket = vm_data_dir(clone).join("agent.sock");
+    let mut client = AgentClient::connect_with_retry(&socket)
+        .map_err(|e| Error::agent("activate held fork", format!("agent connect: {e}")))?;
+    match client.vm_exec(
+        vec!["/bin/sh".into(), "-c".into(), script],
+        vec![],
+        None,
+        Some(Duration::from_secs(10)),
+        Some(content),
+    ) {
+        Ok((0, _, _)) => Ok(merged),
+        Ok((42, _, _)) => Err(Error::agent(
+            "activate held fork",
+            format!("clone '{clone}' was already released"),
+        )),
+        Ok((43, _, _)) => Err(Error::agent(
+            "activate held fork",
+            format!("clone '{clone}' is not parked at a forkpoint"),
+        )),
+        Ok((code, _, stderr)) => Err(Error::agent(
+            "activate held fork",
+            format!(
+                "clone '{clone}' activation exited {code}: {}",
+                String::from_utf8_lossy(&stderr).trim()
+            ),
+        )),
+        Err(e) => Err(Error::agent(
+            "activate held fork",
+            format!("clone '{clone}': {e}"),
+        )),
     }
 }
 
@@ -846,6 +1017,13 @@ mod tests {
     }
 
     #[test]
+    fn paused_golden_reuses_the_proven_forkpoint_for_refill() {
+        assert!(fork_base_already_paused("OK paused\n"));
+        assert!(!fork_base_already_paused("OK running\n"));
+        assert!(!fork_base_already_paused("ERR not forkable\n"));
+    }
+
+    #[test]
     fn fork_env_renders_one_pair_per_line() {
         let env = vec![
             ("LR".to_string(), "3e-4".to_string()),
@@ -853,6 +1031,50 @@ mod tests {
         ];
         assert_eq!(render_fork_env(&env), "LR=3e-4\nNOTE=a=b c\n");
         assert_eq!(render_fork_env(&[]), "");
+    }
+
+    #[test]
+    fn assignment_env_overrides_only_matching_pool_values() {
+        let initial = vec![
+            ("SMOLVM_FORK_INDEX".to_string(), "2".to_string()),
+            ("LR".to_string(), "1e-4".to_string()),
+        ];
+        let assignment = vec![
+            ("LR".to_string(), "3e-4".to_string()),
+            ("DATASET".to_string(), "math".to_string()),
+        ];
+        assert_eq!(
+            merge_fork_env(&initial, &assignment),
+            vec![
+                ("SMOLVM_FORK_INDEX".to_string(), "2".to_string()),
+                ("LR".to_string(), "3e-4".to_string()),
+                ("DATASET".to_string(), "math".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn successful_activation_is_persisted_as_one_shot() {
+        let mut record = VmRecord::new("slot-0".to_string(), 2, 1024, vec![], vec![], false);
+        record.forkpoint_held = true;
+        record.env = vec![
+            ("BASE".to_string(), "keep".to_string()),
+            ("LR".to_string(), "1e-4".to_string()),
+        ];
+        let assignment = vec![("LR".to_string(), "3e-4".to_string())];
+        let merged = vec![("LR".to_string(), "3e-4".to_string())];
+
+        record_fork_activation(&mut record, &assignment, merged.clone());
+
+        assert!(!record.forkpoint_held);
+        assert_eq!(record.fork_env, merged);
+        assert_eq!(
+            record.env,
+            vec![
+                ("BASE".to_string(), "keep".to_string()),
+                ("LR".to_string(), "3e-4".to_string()),
+            ]
+        );
     }
 
     // Fix 1: the re-mint script must regenerate the per-machine on-disk secrets

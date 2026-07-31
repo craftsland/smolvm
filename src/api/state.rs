@@ -97,6 +97,8 @@ pub struct MachineEntry {
     pub cuda_fork_pool_size: Option<u32>,
     /// Explicit logical CUDA memory limit restored on implicit starts.
     pub cuda_vram_limit_mib: Option<u64>,
+    /// Whether a fork clone is still parked as a clean assignable slot.
+    pub forkpoint_held: bool,
 }
 
 /// Parameters for registering a new machine.
@@ -392,6 +394,7 @@ impl ApiState {
                             source_smolmachine: record.source_smolmachine.clone(),
                             cuda_fork_pool_size: record.cuda_fork_pool_size,
                             cuda_vram_limit_mib: record.cuda_vram_limit_mib,
+                            forkpoint_held: record.forkpoint_held,
                         })),
                     );
                     loaded.push(name.clone());
@@ -867,6 +870,7 @@ impl ApiState {
                         source_smolmachine: reg.source_smolmachine,
                         cuda_fork_pool_size: None,
                         cuda_vram_limit_mib: None,
+                        forkpoint_held: false,
                     })),
                 );
                 Ok(())
@@ -1505,6 +1509,7 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
         overlay_gb: entry.resources.overlay_gb,
         cuda_fork_pool_size: entry.cuda_fork_pool_size,
         cuda_vram_limit_mib: entry.cuda_vram_limit_mib,
+        forkpoint_held: entry.forkpoint_held,
         egress_bytes,
         cpu_seconds,
         cpu_millis,
@@ -1628,6 +1633,7 @@ mod tests {
                 source_smolmachine: None,
                 cuda_fork_pool_size: None,
                 cuda_vram_limit_mib: None,
+                forkpoint_held: false,
             },
         );
 
@@ -1693,6 +1699,7 @@ mod tests {
                 source_smolmachine: None,
                 cuda_fork_pool_size: None,
                 cuda_vram_limit_mib: None,
+                forkpoint_held: false,
             },
         );
 
