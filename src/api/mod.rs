@@ -125,6 +125,7 @@ use state::ApiState;
         types::CreateForkPoolRequest,
         types::DeleteForkPoolQuery,
         types::AcquireForkLeaseRequest,
+        types::ForkLeasePayloadFile,
         types::ResizeForkPoolRequest,
         // Response types
         types::HealthResponse,

@@ -4,6 +4,8 @@ use axum::{
     extract::{Path, Query, State},
     Json,
 };
+use base64::Engine as _;
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 use crate::api::error::ApiError;
@@ -13,6 +15,7 @@ use crate::api::types::{
     DeleteResponse, ForkLeaseInfo, ForkPoolInfo, ListForkPoolsResponse, ResizeForkPoolRequest,
 };
 use crate::data::validate_vm_name;
+use crate::db::ForkPoolSlotClaim;
 use crate::pool::{
     ClaimForkPoolSlot, ForkLeaseRecord, ForkLeaseState, ForkPoolRecord, ForkPoolSlotState,
 };
@@ -24,6 +27,95 @@ const MAX_POOL_READY: u32 = 256;
 const MIN_LEASE_TTL_SECS: u64 = 30;
 const MAX_LEASE_TTL_SECS: u64 = 24 * 60 * 60;
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
+const MAX_LEASE_PAYLOAD_FILES: usize = 32;
+const MAX_LEASE_PAYLOAD_BYTES: usize = 1024 * 1024;
+const MAX_LEASE_PAYLOAD_PATH_BYTES: usize = 512;
+const DEFAULT_LEASE_PAYLOAD_MODE: u32 = 0o644;
+
+#[derive(Clone)]
+struct StagedLeaseFile {
+    path: String,
+    data: Vec<u8>,
+    mode: u32,
+}
+
+fn validate_lease_payload(
+    files: &[crate::api::types::ForkLeasePayloadFile],
+) -> Result<(Vec<StagedLeaseFile>, Option<String>), ApiError> {
+    if files.len() > MAX_LEASE_PAYLOAD_FILES {
+        return Err(ApiError::BadRequest(format!(
+            "lease payload may contain at most {MAX_LEASE_PAYLOAD_FILES} files"
+        )));
+    }
+
+    let mut staged = Vec::with_capacity(files.len());
+    let mut paths = std::collections::HashSet::with_capacity(files.len());
+    let mut total = 0usize;
+    for file in files {
+        let path = file.path.as_str();
+        let valid_path = !path.is_empty()
+            && path.len() <= MAX_LEASE_PAYLOAD_PATH_BYTES
+            && !path.starts_with('/')
+            && !path.contains('\\')
+            && !path.chars().any(char::is_control)
+            && path
+                .split('/')
+                .all(|component| !component.is_empty() && component != "." && component != "..");
+        if !valid_path {
+            return Err(ApiError::BadRequest(format!(
+                "lease payload path '{path}' must be a safe relative path under /workspace"
+            )));
+        }
+        if !paths.insert(path.to_string()) {
+            return Err(ApiError::BadRequest(format!(
+                "lease payload path '{path}' is duplicated"
+            )));
+        }
+        let mode = file.mode.unwrap_or(DEFAULT_LEASE_PAYLOAD_MODE);
+        if mode & !0o777 != 0 {
+            return Err(ApiError::BadRequest(format!(
+                "lease payload mode for '{path}' must contain only Unix permission bits"
+            )));
+        }
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(&file.data_base64)
+            .map_err(|_| {
+                ApiError::BadRequest(format!(
+                    "lease payload dataBase64 for '{path}' is not valid standard base64"
+                ))
+            })?;
+        total = total
+            .checked_add(data.len())
+            .ok_or_else(|| ApiError::BadRequest("lease payload decoded size overflowed".into()))?;
+        if total > MAX_LEASE_PAYLOAD_BYTES {
+            return Err(ApiError::BadRequest(format!(
+                "lease payload decoded contents must total at most {MAX_LEASE_PAYLOAD_BYTES} bytes"
+            )));
+        }
+        staged.push(StagedLeaseFile {
+            path: path.to_string(),
+            data,
+            mode,
+        });
+    }
+    if staged.is_empty() {
+        return Ok((staged, None));
+    }
+
+    // File order is not semantically meaningful because the workload remains
+    // parked until every write succeeds. Canonicalize it so idempotent retries
+    // may send the same file set in any order.
+    staged.sort_by(|left, right| left.path.cmp(&right.path));
+    let mut digest = Sha256::new();
+    for file in &staged {
+        digest.update((file.path.len() as u64).to_le_bytes());
+        digest.update(file.path.as_bytes());
+        digest.update(file.mode.to_le_bytes());
+        digest.update((file.data.len() as u64).to_le_bytes());
+        digest.update(&file.data);
+    }
+    Ok((staged, Some(hex::encode(digest.finalize()))))
+}
 
 fn lease_info(lease: ForkLeaseRecord) -> ForkLeaseInfo {
     ForkLeaseInfo {
@@ -41,6 +133,7 @@ async fn activate_claimed_lease(
     state: Arc<ApiState>,
     lease: ForkLeaseRecord,
     assignment: Vec<(String, String)>,
+    files: Vec<StagedLeaseFile>,
 ) -> Result<ForkLeaseRecord, String> {
     let record = match state.lookup_vm(&lease.machine_name).await {
         Ok(Some(record)) => record,
@@ -61,6 +154,19 @@ async fn activate_claimed_lease(
     };
     let machine = lease.machine_name.clone();
     let activation = tokio::task::spawn_blocking(move || {
+        if !files.is_empty() {
+            let socket = crate::agent::vm_data_dir(&machine).join("agent.sock");
+            let mut client = crate::agent::AgentClient::connect_with_retry(&socket)
+                .map_err(|e| crate::Error::agent("stage lease payload", e.to_string()))?;
+            for file in files {
+                let path = format!("/workspace/{}", file.path);
+                client
+                    .write_file(&path, &file.data, Some(file.mode))
+                    .map_err(|e| {
+                        crate::Error::agent("stage lease payload", format!("write '{path}': {e}"))
+                    })?;
+            }
+        }
         crate::agent::fork::activate_held_fork(&machine, &record, &assignment)
     })
     .await
@@ -385,9 +491,9 @@ pub async fn delete_pool(
     request_body = AcquireForkLeaseRequest,
     responses(
         (status = 200, description = "Worker lease", body = ForkLeaseInfo),
-        (status = 400, description = "Invalid assignment", body = ApiErrorResponse),
+        (status = 400, description = "Invalid assignment or payload", body = ApiErrorResponse),
         (status = 404, description = "Pool not found", body = ApiErrorResponse),
-        (status = 409, description = "Pool at active-lease capacity", body = ApiErrorResponse),
+        (status = 409, description = "Lease request conflicts with pool state", body = ApiErrorResponse),
         (status = 503, description = "No clean worker ready yet", body = ApiErrorResponse)
     )
 )]
@@ -407,6 +513,7 @@ pub async fn acquire_lease(
     let assignment = crate::util::parse_env_list(&req.env);
     crate::agent::fork::validate_fork_env(&assignment)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let (files, payload_sha256) = validate_lease_payload(&req.files)?;
     let db = state.db().clone();
     let lookup = pool_name.clone();
     let pool = tokio::task::spawn_blocking(move || db.get_fork_pool(&lookup))
@@ -425,24 +532,32 @@ pub async fn acquire_lease(
     let pool_for_claim = pool_name.clone();
     let key = req.idempotency_key.clone();
     let assignment_for_claim = assignment.clone();
+    let payload_for_claim = payload_sha256.clone();
+    let require_private_workspace = !files.is_empty();
     let claim = tokio::task::spawn_blocking(move || {
-        db.claim_fork_pool_slot(
-            &pool_for_claim,
-            &lease_id,
-            &key,
-            &assignment_for_claim,
-            ttl,
+        db.claim_fork_pool_slot(ForkPoolSlotClaim {
+            pool_name: &pool_for_claim,
+            lease_id: &lease_id,
+            idempotency_key: &key,
+            assignment: &assignment_for_claim,
+            payload_sha256: payload_for_claim.as_deref(),
+            require_private_workspace,
+            ttl_secs: ttl,
             now,
-        )
+        })
     })
     .await
     .map_err(|e| ApiError::internal(format!("pool claim task failed: {e}")))?
     .map_err(ApiError::database)?;
     let lease = match claim {
         ClaimForkPoolSlot::Existing(lease) => {
-            if lease.assignment != assignment || lease.ttl_secs != ttl {
+            if lease.assignment != assignment
+                || lease.payload_sha256 != payload_sha256
+                || lease.ttl_secs != ttl
+            {
                 return Err(ApiError::Conflict(
-                    "idempotencyKey was already used with a different assignment or TTL".into(),
+                    "idempotencyKey was already used with a different assignment, payload, or TTL"
+                        .into(),
                 ));
             }
             return Ok(Json(lease_info(lease)));
@@ -467,6 +582,12 @@ pub async fn acquire_lease(
                 "fork pool '{pool_name}' is deleting"
             )))
         }
+        ClaimForkPoolSlot::WorkspaceExternallyMounted => {
+            return Err(ApiError::Conflict(
+                "lease payload staging requires smolvm's private /workspace; this pool's worker mounts external storage inside /workspace"
+                    .into(),
+            ))
+        }
         ClaimForkPoolSlot::Claimed(lease) => lease,
     };
 
@@ -479,10 +600,15 @@ pub async fn acquire_lease(
     // Run activation in its own task. Dropping an HTTP request future does not
     // cancel this task, so a client disconnect after the durable claim cannot
     // strand a successfully released guest forever in `activating` state.
-    let active = tokio::spawn(activate_claimed_lease(state.clone(), lease, assignment))
-        .await
-        .map_err(|e| ApiError::internal(format!("pool activation task failed: {e}")))?
-        .map_err(ApiError::Internal)?;
+    let active = tokio::spawn(activate_claimed_lease(
+        state.clone(),
+        lease,
+        assignment,
+        files,
+    ))
+    .await
+    .map_err(|e| ApiError::internal(format!("pool activation task failed: {e}")))?
+    .map_err(ApiError::Internal)?;
     Ok(Json(lease_info(active)))
 }
 
@@ -619,4 +745,141 @@ pub async fn complete_lease(
         )));
     }
     Ok(Json(lease_info(lease)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::types::ForkLeasePayloadFile;
+
+    fn payload(path: &str, data: &[u8], mode: Option<u32>) -> ForkLeasePayloadFile {
+        ForkLeasePayloadFile {
+            path: path.into(),
+            data_base64: base64::engine::general_purpose::STANDARD.encode(data),
+            mode,
+        }
+    }
+
+    fn bad_request(error: ApiError) -> String {
+        match error {
+            ApiError::BadRequest(message) => message,
+            other => panic!("expected bad request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lease_payload_is_canonical_and_order_independent() {
+        let first = vec![
+            payload("jobs/z.json", b"z", Some(0o600)),
+            payload("jobs/a.json", b"a", None),
+        ];
+        let second = vec![first[1].clone(), first[0].clone()];
+        let (staged_first, digest_first) = validate_lease_payload(&first).unwrap();
+        let (staged_second, digest_second) = validate_lease_payload(&second).unwrap();
+
+        assert_eq!(digest_first, digest_second);
+        assert_eq!(staged_first[0].path, "jobs/a.json");
+        assert_eq!(staged_first[0].mode, 0o644);
+        assert_eq!(staged_second[1].path, "jobs/z.json");
+    }
+
+    #[test]
+    fn lease_payload_rejects_unsafe_or_ambiguous_paths() {
+        for path in [
+            "",
+            "/absolute",
+            "../escape",
+            "jobs/../escape",
+            "jobs/./file",
+            "jobs//file",
+            "jobs\\file",
+            "jobs/file/",
+        ] {
+            let error = validate_lease_payload(&[payload(path, b"x", None)])
+                .err()
+                .expect("unsafe path should fail");
+            assert!(bad_request(error).contains("safe relative path"), "{path}");
+        }
+
+        let duplicate = vec![
+            payload("job.json", b"a", None),
+            payload("job.json", b"b", None),
+        ];
+        assert!(bad_request(
+            validate_lease_payload(&duplicate)
+                .err()
+                .expect("duplicate path should fail")
+        )
+        .contains("duplicated"));
+    }
+
+    #[test]
+    fn lease_payload_enforces_encoding_mode_and_size_limits() {
+        let invalid_base64 = ForkLeasePayloadFile {
+            path: "job.json".into(),
+            data_base64: "***".into(),
+            mode: None,
+        };
+        assert!(bad_request(
+            validate_lease_payload(&[invalid_base64])
+                .err()
+                .expect("invalid base64 should fail")
+        )
+        .contains("not valid standard base64"));
+
+        let invalid_mode = payload("job.sh", b"x", Some(0o1000));
+        assert!(bad_request(
+            validate_lease_payload(&[invalid_mode])
+                .err()
+                .expect("invalid mode should fail")
+        )
+        .contains("permission bits"));
+
+        let oversized = payload("large.bin", &vec![0u8; MAX_LEASE_PAYLOAD_BYTES + 1], None);
+        assert!(bad_request(
+            validate_lease_payload(&[oversized])
+                .err()
+                .expect("oversized payload should fail")
+        )
+        .contains("must total at most"));
+
+        let too_many: Vec<_> = (0..=MAX_LEASE_PAYLOAD_FILES)
+            .map(|index| payload(&format!("{index}.json"), b"x", None))
+            .collect();
+        assert!(bad_request(
+            validate_lease_payload(&too_many)
+                .err()
+                .expect("too many files should fail")
+        )
+        .contains("at most"));
+
+        let long_path = "a".repeat(MAX_LEASE_PAYLOAD_PATH_BYTES + 1);
+        assert!(bad_request(
+            validate_lease_payload(&[payload(&long_path, b"x", None)])
+                .err()
+                .expect("long path should fail")
+        )
+        .contains("safe relative path"));
+    }
+
+    #[test]
+    fn lease_payload_debug_redacts_contents() {
+        let file = ForkLeasePayloadFile {
+            path: "job.json".into(),
+            data_base64: "customer-secret".into(),
+            mode: None,
+        };
+        let shown = format!("{file:?}");
+        assert!(shown.contains("<redacted>"));
+        assert!(!shown.contains("customer-secret"));
+    }
+
+    #[test]
+    fn legacy_lease_request_defaults_to_no_payload() {
+        let request: AcquireForkLeaseRequest = serde_json::from_str(
+            r#"{"idempotencyKey":"request-a","env":["EPISODE=42"],"ttlSecs":60}"#,
+        )
+        .unwrap();
+        assert!(request.files.is_empty());
+    }
 }

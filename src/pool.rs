@@ -120,6 +120,9 @@ pub struct ForkLeaseRecord {
     pub state: ForkLeaseState,
     /// Canonical assignment environment written before guest release.
     pub assignment: Vec<(String, String)>,
+    /// Digest of the canonical pre-release file payload, for retry validation.
+    #[serde(default)]
+    pub payload_sha256: Option<String>,
     /// Unix timestamp when the claim was created.
     pub created_at: u64,
     /// Unix timestamp of the last state transition or heartbeat.
@@ -147,4 +150,32 @@ pub enum ClaimForkPoolSlot {
     PoolNotFound,
     /// Pool deletion began before the claim committed.
     PoolDeleting,
+    /// Payload staging cannot safely target an externally mounted workspace.
+    WorkspaceExternallyMounted,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_lease_without_payload_digest_still_deserializes() {
+        let lease: ForkLeaseRecord = serde_json::from_str(
+            r#"{
+                "id":"lease-1",
+                "pool_name":"pool",
+                "machine_name":"worker",
+                "idempotency_key":"request",
+                "state":"active",
+                "assignment":[],
+                "created_at":1,
+                "updated_at":1,
+                "expires_at":61,
+                "ttl_secs":60,
+                "last_error":null
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(lease.payload_sha256, None);
+    }
 }

@@ -953,9 +953,39 @@ pub struct AcquireForkLeaseRequest {
     /// Job-specific KEY=VALUE parameters installed before the workload runs.
     #[serde(default)]
     pub env: Vec<String>,
+    /// Small files written atomically under `/workspace` before the workload is
+    /// released. The entire worker is discarded if any file cannot be staged.
+    #[serde(default)]
+    pub files: Vec<ForkLeasePayloadFile>,
     /// Optional lease duration override for this worker.
     #[serde(default)]
     pub ttl_secs: Option<u64>,
+}
+
+/// One file staged into a held worker before lease activation.
+#[derive(Clone, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkLeasePayloadFile {
+    /// Relative path below `/workspace`, such as `jobs/episode.json`.
+    #[schema(example = "jobs/episode.json")]
+    pub path: String,
+    /// Standard base64-encoded file contents.
+    #[schema(example = "eyJlcGlzb2RlIjo0Mn0K")]
+    pub data_base64: String,
+    /// Optional Unix permission bits in decimal; defaults to 420 (`0644`).
+    #[serde(default)]
+    #[schema(example = 420)]
+    pub mode: Option<u32>,
+}
+
+impl std::fmt::Debug for ForkLeasePayloadFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ForkLeasePayloadFile")
+            .field("path", &self.path)
+            .field("data_base64", &"<redacted>")
+            .field("mode", &self.mode)
+            .finish()
+    }
 }
 
 /// Public state of one one-shot fork worker lease.
