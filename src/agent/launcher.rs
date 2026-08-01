@@ -212,6 +212,13 @@ pub struct LaunchFeatures {
     /// golden's loaded weight physicals instead of copying them (one base copy
     /// in VRAM across sibling clones; correct for frozen-base fine-tuning).
     pub cuda_share_weights: bool,
+    /// Number of runnable CUDA fork clones planned for this golden. The host
+    /// uses it before guest CUDA initialization to expose a safe per-session
+    /// VRAM share to cache-sizing frameworks such as vLLM.
+    pub cuda_fork_pool_size: Option<u32>,
+    /// Explicit logical VRAM limit for each fork worker, in MiB. Overrides the
+    /// automatic density policy when a larger model needs a known budget.
+    pub cuda_vram_limit_mib: Option<u64>,
     /// Start as a fork base: back guest RAM with a memfd (copy-on-write
     /// cloneable) and expose `control_socket` so the machine can be forked.
     pub forkable: bool,
@@ -1647,6 +1654,21 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // the host pre-created and polls. See manager::ready_marker_name.
         if let Ok(marker) = std::env::var(guest_env::READY_MARKER) {
             env_strings.push(cstr(&format!("{}={}", guest_env::READY_MARKER, marker)));
+        }
+
+        if std::env::var(guest_env::FORKABLE).as_deref() == Ok(guest_env::VALUE_ON) {
+            env_strings.push(cstr(&format!(
+                "{}={}",
+                guest_env::FORKABLE,
+                guest_env::VALUE_ON
+            )));
+        }
+
+        if let Ok(pool_size) = std::env::var(guest_env::CUDA_FORK_POOL_SIZE) {
+            env_strings.push(cstr(&format!(
+                "{}={pool_size}",
+                guest_env::CUDA_FORK_POOL_SIZE
+            )));
         }
 
         // DNS allow-host filtering is now enforced inside libkrun (see the

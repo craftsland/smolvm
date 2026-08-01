@@ -24,6 +24,8 @@ pub enum ApiError {
     BadRequest(String),
     /// Request timeout (408).
     Timeout,
+    /// Temporarily unavailable (503).
+    Unavailable(String),
     /// Internal server error (500).
     Internal(String),
 }
@@ -59,6 +61,7 @@ impl IntoResponse for ApiError {
                 "TIMEOUT",
                 "request timed out".to_string(),
             ),
+            ApiError::Unavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, "UNAVAILABLE", msg),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", msg),
         };
 
@@ -125,6 +128,10 @@ mod tests {
             (ApiError::Conflict("x".into()), StatusCode::CONFLICT),
             (ApiError::BadRequest("x".into()), StatusCode::BAD_REQUEST),
             (ApiError::Timeout, StatusCode::REQUEST_TIMEOUT),
+            (
+                ApiError::Unavailable("x".into()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
             (
                 ApiError::Internal("x".into()),
                 StatusCode::INTERNAL_SERVER_ERROR,

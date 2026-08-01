@@ -96,6 +96,7 @@ pub fn build_create_params(
             });
         }
     };
+    let auto_graph = sf.auto_graph.unwrap_or(false);
 
     // Image: CLI > Smolfile > None
     let image = cli_image.or(sf.image);
@@ -139,6 +140,9 @@ pub fn build_create_params(
     let mut env: Vec<String> = sf.env.into_iter().map(|e| e.trim().to_string()).collect();
     env.extend(dev.env.into_iter().map(|e| e.trim().to_string()));
     env.extend(cli_env.into_iter().map(|e| e.trim().to_string()));
+    if auto_graph {
+        smolvm::util::enable_cuda_auto_graph_env_specs(&mut env);
+    }
 
     // Init: [dev].init > top-level init, then CLI extends
     let sf_init = if !dev.init.is_empty() {
@@ -281,7 +285,7 @@ pub fn build_create_params(
         health_retries,
         health_startup_grace_secs,
         ssh_agent: sf.auth.as_ref().and_then(|a| a.ssh_agent).unwrap_or(false),
-        cuda: sf.cuda.unwrap_or(false),
+        cuda: sf.cuda.unwrap_or(false) || auto_graph,
         docker_socket: sf.docker_socket.unwrap_or(false),
         gpu,
         gpu_vram_mib: sf.gpu_vram,
@@ -435,4 +439,52 @@ pub fn resolve_pack_config(
         gpu: cli_gpu || sf.gpu.unwrap_or(false),
         secret_refs: sf.secrets,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_graph_smolfile_enables_cuda_and_framework_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Smolfile");
+        std::fs::write(
+            &path,
+            "auto_graph = true\nenv = [\"KEEP=yes\", \"TORCHINDUCTOR_CUDAGRAPHS=0\"]\n",
+        )
+        .unwrap();
+
+        let params = build_create_params(
+            "graph-vm".to_string(),
+            None,
+            None,
+            vec![],
+            DEFAULT_MICROVM_CPU_COUNT,
+            DEFAULT_MICROVM_MEMORY_MIB,
+            vec![],
+            vec![],
+            false,
+            None,
+            None,
+            vec![],
+            vec![],
+            None,
+            Some(path),
+            None,
+            None,
+            vec![],
+        )
+        .unwrap();
+
+        assert!(params.cuda);
+        assert_eq!(
+            params.env,
+            vec![
+                "KEEP=yes".to_string(),
+                "SMOLVM_CUDA_AUTO_GRAPH=1".to_string(),
+                "TORCHINDUCTOR_CUDAGRAPHS=1".to_string(),
+            ]
+        );
+    }
 }

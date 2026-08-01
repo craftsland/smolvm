@@ -362,6 +362,19 @@ pub trait Backend: Send {
 /// a stale/forged id from the guest never aliases a live resource.
 #[derive(Default)]
 struct Session {
+    /// Optional host-assigned logical VRAM limit for this connection. This is
+    /// advertised by the per-VM proxy before any guest RPC reaches a shared
+    /// daemon, so one long-lived daemon can serve machines with different
+    /// capacity policies.
+    vram_limit_bytes: Option<u64>,
+    /// Number of forked workers the golden is expected to produce. Goldens get
+    /// the density-oriented load budget; workers get a fair share for private
+    /// post-fork growth before frameworks size caches during initialization.
+    fork_pool_size: Option<u32>,
+    /// Whether this connection belongs to a fork clone. A golden needs enough
+    /// logical capacity to load the shared base model before it forks; only
+    /// clones should divide private growth across the whole pool.
+    fork_clone: bool,
     next_id: u64,
     modules: HashMap<u64, u64>,
     functions: HashMap<u64, u64>,
@@ -860,22 +873,150 @@ fn vmm_handoff_snapshot(token: u64) -> Option<Vec<(u64, u64)>> {
 static LAYOUT_HANDOFF: std::sync::Mutex<Option<HashMap<u64, std::sync::Weak<LayoutCell>>>> =
     std::sync::Mutex::new(None);
 
+/// Frozen process layouts that carry reconstruction metadata but no device
+/// memory. Keeping these layouts alive lets a late clone process reconstruct
+/// its CUDA modules after the golden VM has exited, without eagerly creating a
+/// CUDA context for that process during clone startup.
+static METADATA_LAYOUT_HANDOFF: std::sync::Mutex<Option<HashMap<u64, std::sync::Arc<LayoutCell>>>> =
+    std::sync::Mutex::new(None);
+
 fn layout_handoff_register(l: &std::sync::Arc<LayoutCell>, my_token: u64) {
+    if let Some(cache) = METADATA_LAYOUT_HANDOFF.lock().unwrap().as_mut() {
+        cache.remove(&my_token);
+    }
     let mut reg = LAYOUT_HANDOFF.lock().unwrap();
     let reg = reg.get_or_insert_with(HashMap::new);
     reg.retain(|_, w| w.strong_count() > 0);
     reg.insert(my_token, std::sync::Arc::downgrade(l));
 }
 
-/// The live layout registered under `token`, for a resuming sibling channel to
-/// SHARE (same guest process → one layout; see the Init handler).
-fn layout_handoff_adopt(token: u64) -> Option<std::sync::Arc<LayoutCell>> {
-    LAYOUT_HANDOFF
+fn layout_handoff_lookup(token: u64) -> Option<std::sync::Arc<LayoutCell>> {
+    if let Some(layout) = LAYOUT_HANDOFF
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|reg| reg.get(&token))
+        .and_then(std::sync::Weak::upgrade)
+    {
+        return Some(layout);
+    }
+    METADATA_LAYOUT_HANDOFF
         .lock()
         .unwrap()
         .as_ref()?
-        .get(&token)?
-        .upgrade()
+        .get(&token)
+        .cloned()
+}
+
+/// Retain a frozen layout only when it has no device-memory dependency.
+///
+/// The daemon calls this while the golden is frozen. A metadata-only helper
+/// process can then start lazily after the golden exits, while memory-bearing
+/// layouts continue to require the live golden for handle export and staging.
+pub fn cache_metadata_only_layout(token: u64) -> bool {
+    if dptr_handoff_snapshot(token).is_some_and(|allocs| !allocs.is_empty())
+        || vmm_handoff_snapshot(token).is_some_and(|ranges| !ranges.is_empty())
+    {
+        return false;
+    }
+
+    let Some(layout) = LAYOUT_HANDOFF
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|reg| reg.get(&token))
+        .and_then(std::sync::Weak::upgrade)
+    else {
+        return false;
+    };
+    {
+        let golden = layout.lock().unwrap();
+        if !golden.reservations.is_empty() || !golden.maps.is_empty() {
+            return false;
+        }
+    }
+
+    // Preserve every channel token registered to this process-scoped layout,
+    // not just the canonical token returned by layout_tokens().
+    let aliases: Vec<u64> = LAYOUT_HANDOFF
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|reg| {
+            reg.iter()
+                .filter_map(|(&alias, weak)| {
+                    weak.upgrade()
+                        .is_some_and(|candidate| std::sync::Arc::ptr_eq(&candidate, &layout))
+                        .then_some(alias)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut cache = METADATA_LAYOUT_HANDOFF.lock().unwrap();
+    let cache = cache.get_or_insert_with(HashMap::new);
+    for alias in aliases {
+        cache.insert(alias, layout.clone());
+    }
+    true
+}
+
+/// Retain a frozen process layout after its live golden CUDA sessions exit.
+///
+/// The daemon separately snapshots every private device-memory range to host
+/// storage before calling this. Keeping the layout alive preserves module,
+/// function, stream, event, graph, and handle metadata for later pool
+/// replenishment without retaining the golden's CUDA context or VRAM.
+pub fn cache_frozen_layout(token: u64) -> bool {
+    let Some(layout) = LAYOUT_HANDOFF
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|reg| reg.get(&token))
+        .and_then(std::sync::Weak::upgrade)
+    else {
+        return false;
+    };
+    let aliases: Vec<u64> = LAYOUT_HANDOFF
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|reg| {
+            reg.iter()
+                .filter_map(|(&alias, weak)| {
+                    weak.upgrade()
+                        .is_some_and(|candidate| std::sync::Arc::ptr_eq(&candidate, &layout))
+                        .then_some(alias)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut cache = METADATA_LAYOUT_HANDOFF.lock().unwrap();
+    let cache = cache.get_or_insert_with(HashMap::new);
+    for alias in aliases {
+        cache.insert(alias, layout.clone());
+    }
+    true
+}
+
+/// Release a retained metadata-only process layout and all of its channel-token
+/// aliases. Live golden sessions remain discoverable through the weak registry;
+/// this only drops the durable reference used after golden exit.
+pub fn release_metadata_only_layout(token: u64) -> bool {
+    let mut cache = METADATA_LAYOUT_HANDOFF.lock().unwrap();
+    let Some(cache) = cache.as_mut() else {
+        return false;
+    };
+    let Some(layout) = cache.get(&token).cloned() else {
+        return false;
+    };
+    cache.retain(|_, candidate| !std::sync::Arc::ptr_eq(candidate, &layout));
+    true
+}
+
+/// The live layout registered under `token`, for a resuming sibling channel to
+/// SHARE (same guest process → one layout; see the Init handler).
+fn layout_handoff_adopt(token: u64) -> Option<std::sync::Arc<LayoutCell>> {
+    layout_handoff_lookup(token)
 }
 
 /// One VMM chunk in the fork handoff (see [`layout_handoff_snapshot`]).
@@ -899,8 +1040,7 @@ pub struct HandoffChunk {
 /// `(reservations: [(va,size)], chunks)` for `token`'s golden.
 #[allow(clippy::type_complexity)]
 pub fn layout_handoff_snapshot(token: u64) -> Option<(Vec<(u64, u64)>, Vec<HandoffChunk>, i32)> {
-    let reg = LAYOUT_HANDOFF.lock().unwrap();
-    let l = reg.as_ref()?.get(&token)?.upgrade()?;
+    let l = layout_handoff_lookup(token)?;
     let g = l.lock().unwrap();
     let resvs = g.reservations.iter().map(|(&v, &s)| (v, s)).collect();
     let maps = g
@@ -952,8 +1092,7 @@ pub fn module_handoff_snapshot(
     Vec<(u64, u64, GraphSer)>,
     Vec<(u8, u16, u64, Vec<u8>)>,
 )> {
-    let reg = LAYOUT_HANDOFF.lock().unwrap();
-    let l = reg.as_ref()?.get(&token)?.upgrade()?;
+    let l = layout_handoff_lookup(token)?;
     let g = l.lock().unwrap();
     let modules = g.modules.iter().map(|(&h, i)| (h, i.clone())).collect();
     let funcs = g
@@ -1016,14 +1155,10 @@ pub fn layout_tokens() -> Vec<u64> {
 /// and the trainer) register distinct layouts and must never share one clone
 /// worker/context.
 pub fn layout_handoff_same_process(a: u64, b: u64) -> bool {
-    let reg = LAYOUT_HANDOFF.lock().unwrap();
-    let Some(reg) = reg.as_ref() else {
+    let Some(a) = layout_handoff_lookup(a) else {
         return false;
     };
-    let Some(a) = reg.get(&a).and_then(|w| w.upgrade()) else {
-        return false;
-    };
-    let Some(b) = reg.get(&b).and_then(|w| w.upgrade()) else {
+    let Some(b) = layout_handoff_lookup(b) else {
         return false;
     };
     std::sync::Arc::ptr_eq(&a, &b)
@@ -1033,12 +1168,7 @@ pub fn layout_handoff_same_process(a: u64, b: u64) -> bool {
 /// `(graph_vh, exec_vh, ordered op payloads)`. Separate from
 /// [`module_handoff_snapshot`] so its 6-tuple stays stable.
 pub fn graph_oplogs_snapshot(token: u64) -> GraphOplogs {
-    let reg = LAYOUT_HANDOFF.lock().unwrap();
-    match reg
-        .as_ref()
-        .and_then(|r| r.get(&token))
-        .and_then(|w| w.upgrade())
-    {
+    match layout_handoff_lookup(token) {
         Some(l) => l.lock().unwrap().graph_oplogs.clone(),
         None => Vec::new(),
     }
@@ -1206,6 +1336,78 @@ pub fn set_vmm_trans(map: HashMap<u64, u64>) {
     VMM_TRANS.with(|m| *m.borrow_mut() = Some(map));
 }
 
+/// Address ranges whose reconstructed physical allocation is shared with the
+/// frozen golden. Clone resume can replay the golden allocator's original
+/// `cuMemSetAccess(...READWRITE)` calls after reconstruction; those replays
+/// must not silently undo the read-only mapping installed by the worker.
+static WORKER_SHARED_VMM_RANGES: std::sync::Mutex<Vec<(u64, u64)>> =
+    std::sync::Mutex::new(Vec::new());
+
+pub fn set_worker_shared_vmm_ranges(ranges: Vec<(u64, u64)>) {
+    *WORKER_SHARED_VMM_RANGES.lock().unwrap() = ranges;
+}
+
+fn vmm_access_partitions(va: u64, size: u64, shared: &[(u64, u64)]) -> Vec<(u64, u64, bool)> {
+    let Some(end) = va.checked_add(size) else {
+        return vec![(va, size, false)];
+    };
+    let mut intersections: Vec<(u64, u64)> = shared
+        .iter()
+        .filter_map(|&(base, len)| {
+            let shared_end = base.checked_add(len)?;
+            let start = va.max(base);
+            let stop = end.min(shared_end);
+            (start < stop).then_some((start, stop))
+        })
+        .collect();
+    intersections.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for (start, stop) in intersections {
+        if let Some(last) = merged.last_mut().filter(|last| start <= last.1) {
+            last.1 = last.1.max(stop);
+        } else {
+            merged.push((start, stop));
+        }
+    }
+    let mut result = Vec::new();
+    let mut cursor = va;
+    for (start, stop) in merged {
+        if cursor < start {
+            result.push((cursor, start - cursor, false));
+        }
+        result.push((start, stop - start, true));
+        cursor = stop;
+    }
+    if cursor < end {
+        result.push((cursor, end - cursor, false));
+    }
+    result
+}
+
+fn forget_worker_shared_vmm_range(va: u64, size: u64) {
+    let Some(end) = va.checked_add(size) else {
+        return;
+    };
+    let mut ranges = WORKER_SHARED_VMM_RANGES.lock().unwrap();
+    let mut retained = Vec::with_capacity(ranges.len() + 1);
+    for &(base, len) in ranges.iter() {
+        let Some(shared_end) = base.checked_add(len) else {
+            continue;
+        };
+        if shared_end <= va || base >= end {
+            retained.push((base, len));
+            continue;
+        }
+        if base < va {
+            retained.push((base, va - base));
+        }
+        if shared_end > end {
+            retained.push((end, shared_end - end));
+        }
+    }
+    *ranges = retained;
+}
+
 /// Worker-mode: private copies of the golden's non-VMM (`cudaMalloc`)
 /// allocations, made during reconstruction — `(golden_dptr, size, copy)`.
 /// Process-global and NON-draining: every serving thread's isolate session
@@ -1228,6 +1430,16 @@ pub fn set_worker_alloc_trans(v: Vec<(u64, u64, u64)>) {
 /// seed late-attached channels and by every isolate session at clone resume.
 pub fn worker_alloc_trans_snapshot() -> Vec<(u64, u64, u64)> {
     WORKER_ALLOC_TRANS.lock().unwrap().clone()
+}
+
+fn alloc_trans_is_identity(trans: &[(u64, u64, u64)], dptr: u64) -> bool {
+    trans
+        .iter()
+        .any(|&(golden, _, worker)| golden == dptr && worker == dptr)
+}
+
+fn worker_identity_alloc(dptr: u64) -> bool {
+    alloc_trans_is_identity(&WORKER_ALLOC_TRANS.lock().unwrap(), dptr)
 }
 
 /// M3b: rebuild the golden's captured graphs in THIS worker's context and map
@@ -1704,6 +1916,89 @@ fn cow_written(sess: &mut Session, b: &mut dyn Backend, req: &Request) {
     }
 }
 
+/// Address-preserving COW for shared VMM chunks in a clone worker. An
+/// expandable-segment chunk can be reused for mutable training data after the
+/// snapshot, so its first explicit write must replace the shared mapping with
+/// private physical memory at the same virtual address.
+fn cow_worker_vmm_range(
+    sess: &Session,
+    b: &mut dyn Backend,
+    dptr: u64,
+    bytes: u64,
+) -> CuResult<()> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    let write_end = dptr.saturating_add(bytes);
+    let mut ranges = WORKER_SHARED_VMM_RANGES.lock().unwrap();
+    let device = if sess.device_pinned {
+        sess.device_base
+    } else {
+        0
+    };
+    while let Some(index) = ranges.iter().position(|&(base, size)| {
+        let end = base.saturating_add(size);
+        dptr < end && base < write_end
+    }) {
+        let (base, size) = ranges[index];
+        let private = b.mem_create(size, device)?;
+        let snapshot = match b.memcpy_dtoh(base, size, 0) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let _ = b.mem_release(private);
+                return Err(error);
+            }
+        };
+        if let Err(error) = b.ctx_synchronize() {
+            let _ = b.mem_release(private);
+            return Err(error);
+        }
+        if let Err(error) = b.mem_unmap(base, size) {
+            let _ = b.mem_release(private);
+            return Err(error);
+        }
+        if let Err(error) = b.mem_map(base, size, 0, private) {
+            let _ = b.mem_release(private);
+            return Err(error);
+        }
+        if let Err(error) = b.mem_set_access(base, size, device) {
+            let _ = b.mem_release(private);
+            return Err(error);
+        }
+        // The mapping retains the allocation. The old imported handle remains
+        // in VMM_TRANS so the guest can release its inherited handle normally.
+        let _ = b.mem_release(private);
+        b.memcpy_htod(base, &snapshot, 0)?;
+        b.ctx_synchronize()?;
+        ranges.swap_remove(index);
+    }
+    Ok(())
+}
+
+fn cow_worker_vmm_written(sess: &Session, b: &mut dyn Backend, req: &Request) -> CuResult<()> {
+    let written = match req {
+        Request::MemcpyHtoD { dptr, data, .. } => Some((*dptr, data.len() as u64)),
+        Request::MemsetD8 { dptr, bytes, .. } | Request::MemsetD8Async { dptr, bytes, .. } => {
+            Some((*dptr, *bytes))
+        }
+        Request::MemcpyShmHtoD { dptr, size, .. } => Some((*dptr, *size)),
+        Request::MemcpyGpaHtoD { dptr, segments, .. } => {
+            let bytes = segments
+                .iter()
+                .fold(0_u64, |total, (_, len)| total.saturating_add(*len));
+            Some((*dptr, bytes))
+        }
+        Request::MemcpyDtoD { dst, bytes, .. } | Request::MemcpyDtoDAsync { dst, bytes, .. } => {
+            Some((*dst, *bytes))
+        }
+        _ => None,
+    };
+    match written {
+        Some((dptr, bytes)) => cow_worker_vmm_range(sess, b, dptr, bytes),
+        None => Ok(()),
+    }
+}
+
 /// Rewrite a guest device pointer through the clone's private-copy ranges. A
 /// pointer inside an inherited allocation `[base, base+size)` maps to the same
 /// offset in the clone's copy; everything else (fresh post-fork allocations,
@@ -1911,10 +2206,62 @@ fn libcall_tag(p: &[u8]) -> String {
     }
 }
 
+/// Host-assigned capacity policy for one CUDA-RPC connection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ServeOptions {
+    /// Exact logical device-memory limit. Takes precedence over pool sizing.
+    pub vram_limit_bytes: Option<u64>,
+    /// Number of runnable fork clones expected from this golden.
+    pub fork_pool_size: Option<u32>,
+    /// Whether this connection belongs to a fork clone.
+    pub fork_clone: bool,
+}
+
+impl ServeOptions {
+    /// Read the process-local policy used by an in-process server or clone
+    /// worker. Shared daemons receive the same values in a proxy preamble.
+    pub fn from_env() -> Self {
+        let vram_limit_bytes = std::env::var("SMOLVM_CUDA_VRAM_LIMIT_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .or_else(|| {
+                std::env::var("SMOLVM_CUDA_VRAM_LIMIT_MB")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map(|mb| mb.saturating_mul(1024 * 1024))
+            })
+            .filter(|&v| v > 0);
+        let fork_pool_size = std::env::var("SMOLVM_CUDA_FORK_POOL_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&v| v > 0);
+        let fork_clone = std::env::var_os("SMOLVM_CUDA_CLONE_LAYOUT").is_some();
+        Self {
+            vram_limit_bytes,
+            fork_pool_size,
+            fork_clone,
+        }
+    }
+}
+
 /// Serve one CUDA-RPC connection to completion (until the peer closes). Each
 /// request is dispatched to `backend`; returns on clean EOF.
 pub fn serve<S: Read + Write>(stream: S, backend: &mut dyn Backend) -> std::io::Result<()> {
-    let mut sess = Session::default();
+    serve_with_options(stream, backend, ServeOptions::from_env())
+}
+
+/// Serve one connection with a policy supplied by the per-VM host proxy.
+pub fn serve_with_options<S: Read + Write>(
+    stream: S,
+    backend: &mut dyn Backend,
+    options: ServeOptions,
+) -> std::io::Result<()> {
+    let mut sess = Session {
+        vram_limit_bytes: options.vram_limit_bytes,
+        fork_pool_size: options.fork_pool_size,
+        fork_clone: options.fork_clone,
+        ..Session::default()
+    };
     let r = serve_inner(stream, backend, &mut sess);
     // The connection is over (guest exit, crash, or transport error): free
     // everything it still owns so a dead client can't hold GPU memory.
@@ -2464,10 +2811,9 @@ fn serve_rings<S: Read + Write>(
     }
 }
 
-/// Per-connection VRAM budget (`SMOLVM_CUDA_VRAM_LIMIT_MB`), read per
-/// allocation: rare calls, and staying uncached keeps it adjustable and
-/// test-deterministic.
-fn vram_limit() -> u64 {
+/// Legacy process-wide VRAM budget used when a connection has no host-assigned
+/// policy. New proxy and in-process paths snapshot this value in `ServeOptions`.
+fn env_vram_limit() -> u64 {
     std::env::var("SMOLVM_CUDA_VRAM_LIMIT_MB")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -2475,12 +2821,60 @@ fn vram_limit() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+const FORK_POOL_HEADROOM_PERCENT: u64 = 10;
+const DEFAULT_FORK_DENSITY_SLOTS: u64 = 8;
+
+fn pool_vram_limit(total: u64, fork_pool_size: u32, fork_clone: bool) -> u64 {
+    let density_limit = total / DEFAULT_FORK_DENSITY_SLOTS;
+    if !fork_clone {
+        // The golden must first load the complete shareable base model. Its
+        // resident allocation is frozen and shared rather than multiplied by
+        // the number of workers, so dividing it by the pool size is incorrect.
+        return density_limit;
+    }
+    let sessions = u64::from(fork_pool_size).saturating_add(1);
+    let fair_share = total
+        .saturating_mul(100 - FORK_POOL_HEADROOM_PERCENT)
+        .checked_div(100)
+        .unwrap_or(0)
+        .checked_div(sessions)
+        .unwrap_or(0);
+    // A small initial pool must not let vLLM build a near-single-worker cache
+    // and graph set that later becomes expensive or unreliable to reconstruct.
+    // Preserve the validated density-oriented default while still shrinking
+    // further when the requested pool itself needs a smaller fair share.
+    fair_share.min(density_limit)
+}
+
+fn session_vram_limit(sess: &Session, physical_total: u64) -> u64 {
+    sess.vram_limit_bytes
+        .or_else(|| {
+            sess.fork_pool_size
+                .filter(|&n| n > 0)
+                .map(|n| pool_vram_limit(physical_total, n, sess.fork_clone))
+        })
+        .unwrap_or_else(env_vram_limit)
+}
+
+fn allocation_vram_limit(sess: &Session, b: &mut dyn Backend) -> CuResult<u64> {
+    if sess.vram_limit_bytes.is_some() || sess.fork_pool_size.is_none() {
+        return Ok(session_vram_limit(sess, u64::MAX));
+    }
+    let device = if sess.device_pinned {
+        sess.device_base
+    } else {
+        0
+    };
+    b.device_total_mem(device)
+        .map(|total| session_vram_limit(sess, total))
+}
+
 fn session_vram_used(sess: &Session) -> u64 {
     sess.owned_dptrs.values().sum::<u64>() + sess.owned_vmm_handles.values().sum::<u64>()
 }
 
 fn virtual_memory_info(sess: &Session, free: u64, total: u64) -> (u64, u64) {
-    let total = total.min(vram_limit());
+    let total = total.min(session_vram_limit(sess, total));
     let free = free.min(total.saturating_sub(session_vram_used(sess)));
     (free, total)
 }
@@ -2986,6 +3380,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
     // Copy-on-write any shared weight buffer this request writes, then rewrite
     // inherited device pointers to this clone's private copies (both no-ops
     // unless this is an isolating clone).
+    if let Err(code) = cow_worker_vmm_written(sess, b, &req) {
+        return (code, Response::Ok);
+    }
     cow_written(sess, b, &req);
     let req = translate_dptrs(&sess.dptr_trans, req);
     let trace = optrace_summary(&req);
@@ -3035,7 +3432,25 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 if resume_token != 0 && fork_isolate_enabled() {
                     sess.pending_isolate = resume_token;
                 }
-                b.init().map(|_| Response::Handle(token))
+                b.init()?;
+                // Resolve an automatic pool share once, after CUDA is
+                // initialized, and reuse that exact byte limit for every
+                // later allocation on this connection. This keeps one
+                // session's advertised and enforced capacity stable while
+                // removing a driver query from the allocation hot path.
+                if sess.vram_limit_bytes.is_none() {
+                    if let Some(pool_size) = sess.fork_pool_size.filter(|&n| n > 0) {
+                        let device = if sess.device_pinned {
+                            sess.device_base
+                        } else {
+                            0
+                        };
+                        let total = b.device_total_mem(device)?;
+                        sess.vram_limit_bytes =
+                            Some(pool_vram_limit(total, pool_size, sess.fork_clone));
+                    }
+                }
+                Ok(Response::Handle(token))
             }
         }
         Request::DeviceGetCount => {
@@ -3050,7 +3465,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         }
         Request::DeviceTotalMem { device } => b
             .device_total_mem(dev(sess, device))
-            .map(|total| Response::Bytes(total.min(vram_limit()))),
+            .map(|total| Response::Bytes(total.min(session_vram_limit(sess, total)))),
         Request::DriverGetVersion => b.driver_get_version().map(Response::Count),
         Request::DeviceGetAttribute { attrib, device } => b
             .device_get_attribute(attrib, dev(sess, device))
@@ -3352,10 +3767,10 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             b.func_get_attribute(raw_fn, attrib).map(Response::Count)
         }
         Request::MemAlloc { bytes } => {
-            // Per-connection VRAM quota (SMOLVM_CUDA_VRAM_LIMIT_MB on the
-            // host): a guest may not allocate past its budget — the CUDA-
-            // native failure (out of memory) surfaces to the app.
-            let limit = vram_limit();
+            // Per-connection VRAM quota, assigned by the host proxy or the
+            // legacy process environment: a guest may not allocate past its
+            // budget, and CUDA's native out-of-memory status reaches the app.
+            let limit = allocation_vram_limit(sess, b)?;
             let used: u64 = sess.owned_dptrs.values().sum::<u64>()
                 + sess.owned_vmm_handles.values().sum::<u64>();
             if used.saturating_add(bytes) > limit {
@@ -3372,7 +3787,15 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             sess.owned_dptrs.remove(&dptr);
             sess.alloc_table.lock().unwrap().remove(&dptr);
             // (removal returns the freed size to the quota ledger)
-            b.mem_free(dptr).map(|_| Response::Ok)
+            if sess.fork_clone && worker_identity_alloc(dptr) {
+                // Address-preserved ordinary allocations are subranges of
+                // larger VMM-backed regions. They cannot be individually
+                // cuMemFree'd; keep the region until worker teardown and make
+                // the inherited cudaFree report success to the guest.
+                Ok(Response::Ok)
+            } else {
+                b.mem_free(dptr).map(|_| Response::Ok)
+            }
         }
         Request::MemcpyHtoD { dptr, stream, data } => {
             mark_loaded(&sess.alloc_table, dptr); // H2D write → weight/read-only
@@ -4009,7 +4432,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             })
         }
         Request::MemCreate { size, device } => {
-            let limit = vram_limit();
+            let limit = allocation_vram_limit(sess, b)?;
             let used: u64 = sess.owned_dptrs.values().sum::<u64>()
                 + sess.owned_vmm_handles.values().sum::<u64>();
             if used.saturating_add(size) > limit {
@@ -4033,7 +4456,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             device,
             handle_vh,
         } => {
-            let limit = vram_limit();
+            let limit = allocation_vram_limit(sess, b)?;
             let used: u64 = sess.owned_dptrs.values().sum::<u64>()
                 + sess.owned_vmm_handles.values().sum::<u64>();
             if used.saturating_add(size) > limit {
@@ -4095,14 +4518,26 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 Response::Ok
             })
         }
-        Request::MemSetAccess { va, size, device } => b
-            .mem_set_access(va, size, dev(sess, device))
-            .map(|_| Response::Ok),
+        Request::MemSetAccess { va, size, device } => {
+            let partitions =
+                vmm_access_partitions(va, size, &WORKER_SHARED_VMM_RANGES.lock().unwrap());
+            for (part_va, part_size, read_only) in partitions {
+                if read_only {
+                    b.mem_set_access_ro(part_va, part_size, dev(sess, device))?;
+                } else {
+                    b.mem_set_access(part_va, part_size, dev(sess, device))?;
+                }
+            }
+            Ok(Response::Ok)
+        }
         Request::MemUnmap { va, size } => {
             sess.owned_vmm_maps.remove(&va);
             sess.vmm_ranges.lock().unwrap().remove(&va);
             sess.golden_layout.lock().unwrap().maps.remove(&va);
-            b.mem_unmap(va, size).map(|_| Response::Ok)
+            b.mem_unmap(va, size).map(|_| {
+                forget_worker_shared_vmm_range(va, size);
+                Response::Ok
+            })
         }
         Request::MemRelease { handle } => {
             // Burst create: resolve (and retire) the session's virtual handle.
@@ -4512,6 +4947,124 @@ mod tests {
     use super::*;
     use crate::client::Client;
     use std::io::{Read, Write};
+
+    #[test]
+    fn replayed_vmm_access_preserves_only_shared_intersections() {
+        assert_eq!(
+            vmm_access_partitions(0x1000, 0x5000, &[(0x2000, 0x1000), (0x4000, 0x1000)]),
+            vec![
+                (0x1000, 0x1000, false),
+                (0x2000, 0x1000, true),
+                (0x3000, 0x1000, false),
+                (0x4000, 0x1000, true),
+                (0x5000, 0x1000, false),
+            ]
+        );
+        assert_eq!(
+            vmm_access_partitions(0x2000, 0x2000, &[(0x1000, 0x4000)]),
+            vec![(0x2000, 0x2000, true)]
+        );
+    }
+
+    #[test]
+    fn golden_capacity_can_load_the_shared_model_at_high_fanout() {
+        let gib = 1024_u64 * 1024 * 1024;
+        assert_eq!(pool_vram_limit(80 * gib, 2, false), 10 * gib);
+        assert_eq!(pool_vram_limit(80 * gib, 24, false), 10 * gib);
+    }
+
+    #[test]
+    fn clone_capacity_reserves_pool_headroom() {
+        let gib = 1024_u64 * 1024 * 1024;
+        assert_eq!(pool_vram_limit(80 * gib, 2, true), 10 * gib);
+        assert_eq!(pool_vram_limit(80 * gib, 7, true), 9 * gib);
+        assert_eq!(pool_vram_limit(80 * gib, 24, true), 72 * gib / 25);
+    }
+
+    #[test]
+    fn explicit_vram_limit_precedes_pool_budget() {
+        let gib = 1024_u64 * 1024 * 1024;
+        let sess = Session {
+            vram_limit_bytes: Some(10 * gib),
+            fork_pool_size: Some(24),
+            fork_clone: true,
+            ..Session::default()
+        };
+        assert_eq!(session_vram_limit(&sess, 80 * gib), 10 * gib);
+    }
+
+    #[test]
+    fn identity_allocations_are_distinct_from_translated_copies() {
+        let trans = [(0x1000, 0x400, 0x1000), (0x2000, 0x400, 0x9000)];
+        assert!(alloc_trans_is_identity(&trans, 0x1000));
+        assert!(!alloc_trans_is_identity(&trans, 0x2000));
+        assert!(!alloc_trans_is_identity(&trans, 0x3000));
+    }
+
+    #[test]
+    fn fork_pool_budget_resolves_once_at_session_init() {
+        let mut sess = Session {
+            fork_pool_size: Some(2),
+            ..Session::default()
+        };
+        let mut backend = CpuBackend::default();
+        let physical_total = backend.device_total_mem(0).unwrap();
+        let expected = pool_vram_limit(physical_total, 2, false);
+
+        let (status, _) = dispatch(
+            &mut sess,
+            &mut backend,
+            Request::Init {
+                proto_hash: crate::PROTO_HASH,
+                resume_token: 0,
+            },
+        );
+        assert_eq!(status, 0);
+        assert_eq!(sess.vram_limit_bytes, Some(expected));
+        assert_eq!(
+            session_vram_limit(&sess, physical_total.saturating_mul(2)),
+            expected,
+            "the automatic limit must not change across later driver queries"
+        );
+    }
+
+    #[test]
+    fn fork_pool_budget_is_advertised_and_enforced() {
+        let mut sess = Session {
+            fork_pool_size: Some(2),
+            fork_clone: true,
+            ..Session::default()
+        };
+        let mut backend = CpuBackend::default();
+        let physical_total = backend.device_total_mem(0).unwrap();
+        let expected = pool_vram_limit(physical_total, 2, true);
+
+        let (status, response) = dispatch(
+            &mut sess,
+            &mut backend,
+            Request::DeviceTotalMem { device: 0 },
+        );
+        assert_eq!(status, 0);
+        assert!(matches!(response, Response::Bytes(total) if total == expected));
+
+        let (status, response) = dispatch(&mut sess, &mut backend, Request::MemGetInfo);
+        assert_eq!(status, 0);
+        assert!(
+            matches!(response, Response::Pair(free, total) if free == expected && total == expected)
+        );
+
+        let (status, _) = dispatch(
+            &mut sess,
+            &mut backend,
+            Request::MemAlloc {
+                bytes: expected.saturating_add(1),
+            },
+        );
+        assert_eq!(
+            status, 2,
+            "an allocation above the advertised budget must fail"
+        );
+    }
 
     fn layout_with_chunk(va: u64, size: u64) -> LayoutCell {
         let mut g = GoldenLayout::default();
@@ -5136,6 +5689,76 @@ mod tests {
         assert!(layout_handoff_same_process(trainer_a, trainer_b));
         assert!(!layout_handoff_same_process(trainer_a, child));
         assert!(!layout_handoff_same_process(trainer_a, u64::MAX));
+    }
+
+    #[test]
+    fn metadata_only_layout_survives_golden_session_exit() {
+        use std::sync::{Arc, Mutex};
+
+        let layout: Arc<LayoutCell> = Arc::new(Mutex::new(GoldenLayout::default()));
+        layout
+            .lock()
+            .unwrap()
+            .modules
+            .insert(0xCAFE, vec![1, 2, 3, 4]);
+        let primary = 0xA3A3_0000_0000_0001;
+        let alias = 0xA3A3_0000_0000_0002;
+        layout_handoff_register(&layout, primary);
+        layout_handoff_register(&layout, alias);
+
+        assert!(cache_metadata_only_layout(primary));
+        drop(layout);
+
+        for token in [primary, alias] {
+            let (modules, ..) = module_handoff_snapshot(token).unwrap();
+            assert_eq!(modules, vec![(0xCAFE, vec![1, 2, 3, 4])]);
+            assert!(layout_handoff_snapshot(token).unwrap().1.is_empty());
+        }
+        assert!(layout_handoff_same_process(primary, alias));
+        assert!(release_metadata_only_layout(alias));
+        assert!(layout_handoff_snapshot(primary).is_none());
+        assert!(layout_handoff_snapshot(alias).is_none());
+    }
+
+    #[test]
+    fn memory_bearing_layout_is_not_retained_as_metadata() {
+        use std::sync::{Arc, Mutex};
+
+        let layout: Arc<LayoutCell> = Arc::new(Mutex::new(GoldenLayout::default()));
+        layout.lock().unwrap().reservations.insert(0x1000, 0x2000);
+        let token = 0xA4A4_0000_0000_0001;
+        layout_handoff_register(&layout, token);
+
+        assert!(!cache_metadata_only_layout(token));
+        drop(layout);
+        assert!(layout_handoff_snapshot(token).is_none());
+    }
+
+    #[test]
+    fn frozen_memory_layout_survives_after_host_snapshot() {
+        use std::sync::{Arc, Mutex};
+
+        let layout: Arc<LayoutCell> = Arc::new(Mutex::new(GoldenLayout::default()));
+        layout.lock().unwrap().reservations.insert(0x4000, 0x2000);
+        layout
+            .lock()
+            .unwrap()
+            .modules
+            .insert(0xBEEF, vec![4, 3, 2, 1]);
+        let token = 0xA5A5_0000_0000_0001;
+        layout_handoff_register(&layout, token);
+
+        assert!(cache_frozen_layout(token));
+        drop(layout);
+
+        assert_eq!(
+            layout_handoff_snapshot(token).unwrap().0,
+            vec![(0x4000, 0x2000)]
+        );
+        let (modules, ..) = module_handoff_snapshot(token).unwrap();
+        assert_eq!(modules, vec![(0xBEEF, vec![4, 3, 2, 1])]);
+        assert!(release_metadata_only_layout(token));
+        assert!(layout_handoff_snapshot(token).is_none());
     }
 
     // The connect handshake rejects a client whose wire fingerprint differs

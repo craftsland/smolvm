@@ -82,6 +82,7 @@ fn boot_log(level: &str, msg: &str) {
 mod cuda;
 mod dns_proxy;
 mod docker_bridge;
+mod forkpoint;
 mod network;
 mod oci;
 mod paths;
@@ -198,6 +199,10 @@ fn maybe_set_clock_from_host() {
 }
 
 fn main() {
+    if forkpoint::helper_requested() {
+        std::process::exit(forkpoint::run_helper());
+    }
+
     // Quick --version check (used by init script to detect rootfs updates)
     if std::env::args().any(|a| a == "--version") {
         println!("{}", env!("CARGO_PKG_VERSION"));
@@ -247,6 +252,7 @@ fn main() {
     // Set up persistent rootfs overlay (if /dev/vdb exists).
     // This does overlayfs + pivot_root before anything else touches the filesystem.
     setup_persistent_rootfs();
+    forkpoint::setup();
     boot_log(
         "INFO",
         &format!("boot rootfs_done uptime_ms={}", uptime_ms()),
@@ -3215,6 +3221,7 @@ fn write_oci_bundle(
 
     ssh_agent::inject_into_container(&mut spec);
     rosetta::inject_into_container(&mut spec);
+    forkpoint::inject_into_container(&mut spec);
     cuda::inject_into_container(&mut spec, rootfs_path);
     spec.write_to(bundle_path)
         .map_err(|e| format!("failed to write OCI spec: {}", e))?;
@@ -4058,6 +4065,7 @@ fn spawn_interactive_command(
     // Forward SSH agent into the container if enabled at boot.
     ssh_agent::inject_into_container(&mut spec);
     rosetta::inject_into_container(&mut spec);
+    forkpoint::inject_into_container(&mut spec);
     cuda::inject_into_container(&mut spec, rootfs_path);
 
     spec.write_to(&bundle_path)

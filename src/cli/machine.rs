@@ -267,6 +267,9 @@ pub enum MachineCmd {
     /// Fork a running forkable machine into a new clone (CoW memory + disks)
     Fork(ForkCmd),
 
+    /// Assign parameters and release one held fork-pool slot
+    ForkRelease(ForkReleaseCmd),
+
     /// Stop a running machine
     Stop(StopCmd),
 
@@ -337,6 +340,7 @@ impl MachineCmd {
             MachineCmd::Create(cmd) => cmd.run(),
             MachineCmd::Start(cmd) => cmd.run(),
             MachineCmd::Fork(cmd) => cmd.run(),
+            MachineCmd::ForkRelease(cmd) => cmd.run(),
             MachineCmd::Stop(cmd) => cmd.run(),
             MachineCmd::Delete(cmd) => cmd.run(),
             MachineCmd::Status(cmd) => cmd.run(),
@@ -530,6 +534,11 @@ pub struct RunCmd {
     /// Remote guest CUDA Driver-API calls to the host NVIDIA GPU over vsock
     #[arg(long, help_heading = "Hardware")]
     pub cuda: bool,
+
+    /// Ask compatible CUDA frameworks to graph safe compiled regions.
+    /// Implies --cuda; arbitrary eager CUDA calls are not captured.
+    #[arg(long, help_heading = "Hardware")]
+    pub auto_graph: bool,
 
     /// Expose the guest's Docker daemon socket to the host as a Unix socket
     /// (DOCKER_HOST=unix://…). Requires dockerd running in the VM.
@@ -869,6 +878,10 @@ impl RunCmd {
         // flags pass through. Flags the sidecar runner can't honor are rejected
         // at parse time via `conflicts_with_all` on `from`.
         if let Some(from) = self.from {
+            let mut env = self.env;
+            if self.auto_graph {
+                smolvm::util::enable_cuda_auto_graph_env_specs(&mut env);
+            }
             return crate::cli::pack_run::PackRunCmd {
                 sidecar: Some(from),
                 command: self.command,
@@ -876,7 +889,7 @@ impl RunCmd {
                 tty: self.tty,
                 timeout: self.timeout,
                 workdir: self.workdir,
-                env: self.env,
+                env,
                 volume: self.volume,
                 port: self.port,
                 net: self.net,
@@ -888,7 +901,8 @@ impl RunCmd {
                 force_extract: false,
                 info: false,
                 debug: false,
-                cuda: false,
+                cuda: self.cuda,
+                auto_graph: self.auto_graph,
             }
             .run();
         }
@@ -942,6 +956,10 @@ impl RunCmd {
         )?;
 
         let mut params = params;
+        if self.auto_graph {
+            smolvm::util::enable_cuda_auto_graph_env_specs(&mut params.env);
+            params.cuda = true;
+        }
         params.dns_filter_hosts = match (params.dns_filter_hosts.take(), cli_dns_filter_hosts) {
             (Some(mut from_smolfile), Some(mut from_cli)) => {
                 from_smolfile.append(&mut from_cli);
@@ -1003,7 +1021,8 @@ impl RunCmd {
                     force_extract: false,
                     info: false,
                     debug: false,
-                    cuda: false,
+                    cuda: self.cuda || params.cuda,
+                    auto_graph: self.auto_graph,
                 }
                 .run();
             }
@@ -1056,7 +1075,8 @@ impl RunCmd {
                 force_extract: false,
                 info: false,
                 debug: false,
-                cuda: false,
+                cuda: self.cuda || params.cuda,
+                auto_graph: self.auto_graph,
             }
             .run();
         }
@@ -1858,6 +1878,149 @@ mod tests {
         assert!(cmd.detach);
     }
 
+    #[test]
+    fn start_cuda_pool_flags_parse_and_limit_requires_pool() {
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "start",
+            "--name",
+            "golden",
+            "--fork-pool-size",
+            "4",
+            "--cuda-vram-limit-mib",
+            "10240",
+        ]);
+        let MachineCmd::Start(cmd) = cli.command else {
+            panic!("expected machine start command");
+        };
+        assert_eq!(cmd.fork_pool_size.map(|v| v.get()), Some(4));
+        assert_eq!(cmd.cuda_vram_limit_mib.map(|v| v.get()), Some(10240));
+
+        assert!(TestMachineCli::try_parse_from([
+            "machine",
+            "start",
+            "--name",
+            "golden",
+            "--cuda-vram-limit-mib",
+            "10240",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn fork_accepts_single_and_batch_forms() {
+        let single =
+            TestMachineCli::parse_from(["machine", "fork", "--golden", "base", "--name", "worker"]);
+        let MachineCmd::Fork(single) = single.command else {
+            panic!("expected machine fork command");
+        };
+        assert_eq!(single.clone.as_deref(), Some("worker"));
+        assert_eq!(single.count.get(), 1);
+        assert!(!single.wait_ready);
+
+        let batch = TestMachineCli::parse_from([
+            "machine",
+            "fork",
+            "--golden",
+            "base",
+            "--count",
+            "8",
+            "--name-prefix",
+            "worker",
+            "--parallel",
+            "3",
+            "--ready-timeout",
+            "2m",
+        ]);
+        let MachineCmd::Fork(batch) = batch.command else {
+            panic!("expected machine fork command");
+        };
+        assert_eq!(batch.count.get(), 8);
+        assert_eq!(batch.name_prefix.as_deref(), Some("worker"));
+        assert_eq!(batch.parallel.get(), 3);
+        assert!(!batch.wait_ready);
+        assert_eq!(batch.ready_timeout, Duration::from_secs(120));
+        assert_eq!(
+            forkpoint_timeout(
+                batch.count.get(),
+                batch.wait_ready,
+                batch.hold,
+                batch.ready_timeout,
+            ),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(
+            forkpoint_timeout(1, false, false, Duration::from_secs(120)),
+            None
+        );
+        assert_eq!(
+            forkpoint_timeout(1, false, true, Duration::from_secs(120)),
+            Some(Duration::from_secs(120))
+        );
+
+        let release = TestMachineCli::parse_from([
+            "machine",
+            "fork-release",
+            "--name",
+            "worker-0",
+            "--env",
+            "LR=3e-4",
+        ]);
+        let MachineCmd::ForkRelease(release) = release.command else {
+            panic!("expected fork-release command");
+        };
+        assert_eq!(release.name, "worker-0");
+        assert_eq!(release.env, vec!["LR=3e-4"]);
+    }
+
+    #[test]
+    fn indexed_fork_env_renders_each_clone() {
+        let specs = vec![
+            "TRIAL={index}".to_string(),
+            "OUTPUT=/runs/{name}".to_string(),
+            "SMOLVM_FORK_INDEX=wrong".to_string(),
+        ];
+        assert_eq!(
+            render_indexed_fork_env(&specs, 3, "worker-3", true),
+            vec![
+                ("TRIAL".to_string(), "3".to_string()),
+                ("OUTPUT".to_string(), "/runs/worker-3".to_string()),
+                ("SMOLVM_FORK_INDEX".to_string(), "3".to_string()),
+                ("SMOLVM_FORK_NAME".to_string(), "worker-3".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn run_accepts_auto_graph_flag() {
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "run",
+            "--auto-graph",
+            "--image",
+            "alpine",
+            "--",
+            "true",
+        ]);
+
+        let MachineCmd::Run(cmd) = cli.command else {
+            panic!("expected machine run command");
+        };
+        assert!(cmd.auto_graph);
+        assert!(!cmd.cuda, "auto-graph implies CUDA during parameter merge");
+    }
+
+    #[test]
+    fn create_accepts_auto_graph_flag() {
+        let cli =
+            TestMachineCli::parse_from(["machine", "create", "--name", "golden", "--auto-graph"]);
+
+        let MachineCmd::Create(cmd) = cli.command else {
+            panic!("expected machine create command");
+        };
+        assert!(cmd.auto_graph);
+    }
+
     // Documents the clap parsing behaviour: positionals before "--" land in
     // `command`, not `image`.  is_likely_image_ref() catches the unambiguous
     // cases before a VM is booted.
@@ -2356,6 +2519,11 @@ pub struct CreateCmd {
     #[arg(long)]
     pub cuda: bool,
 
+    /// Ask compatible CUDA frameworks to graph safe compiled regions.
+    /// Implies --cuda; arbitrary eager CUDA calls are not captured.
+    #[arg(long)]
+    pub auto_graph: bool,
+
     /// Expose the guest's Docker daemon socket to the host as a Unix socket
     /// (DOCKER_HOST=unix://…). Requires dockerd running in the VM.
     #[arg(long)]
@@ -2464,6 +2632,10 @@ impl CreateCmd {
             cli_allow_cidrs,
         )?;
         let mut params = params;
+        if self.auto_graph {
+            smolvm::util::enable_cuda_auto_graph_env_specs(&mut params.env);
+            params.cuda = true;
+        }
         params.dns_filter_hosts = match (params.dns_filter_hosts.take(), cli_dns_filter_hosts) {
             (Some(mut from_smolfile), Some(mut from_cli)) => {
                 from_smolfile.append(&mut from_cli);
@@ -2655,6 +2827,9 @@ impl CreateCmd {
             env: {
                 let mut env = manifest.env;
                 env.extend(self.env.iter().cloned());
+                if self.auto_graph {
+                    smolvm::util::enable_cuda_auto_graph_env_specs(&mut env);
+                }
                 env
             },
             workdir: manifest.workdir,
@@ -2670,7 +2845,7 @@ impl CreateCmd {
             health_retries: None,
             health_startup_grace_secs: None,
             ssh_agent: self.ssh_agent,
-            cuda: self.cuda,
+            cuda: self.cuda || self.auto_graph,
             docker_socket: self.docker_socket,
             dns_filter_hosts: None,
             published_sockets: parse_published_sockets(&self.expose_socket, &self.mount_socket)?,
@@ -2792,6 +2967,18 @@ pub struct StartCmd {
     #[arg(long)]
     pub forkable: bool,
 
+    /// Plan a CUDA fork pool with this many runnable clones. Smolvm reports a
+    /// safe per-session VRAM share before the golden initializes, so vLLM and
+    /// similar runtimes size private caches without workload changes. Implies
+    /// --forkable.
+    #[arg(long, value_name = "CLONES")]
+    pub fork_pool_size: Option<std::num::NonZeroU32>,
+
+    /// Override the automatic logical VRAM budget for each golden/clone CUDA
+    /// session. The workload still needs no changes. Requires --fork-pool-size.
+    #[arg(long, value_name = "MIB", requires = "fork_pool_size")]
+    pub cuda_vram_limit_mib: Option<std::num::NonZeroU64>,
+
     #[command(flatten, next_help_heading = "Network")]
     pub proxy_opts: crate::cli::proxy_opts::ProxyOpts,
 }
@@ -2804,8 +2991,11 @@ impl StartCmd {
         let no_proxy = self.proxy_opts.no_proxy();
         // Forkable start: memfd-back guest RAM and register a control socket at a
         // known path so `machine fork` can later freeze this machine as a CoW base.
-        let fork = if self.forkable {
-            vm_common::forkable_launch()
+        let fork = if self.forkable || self.fork_pool_size.is_some() {
+            let mut launch = vm_common::forkable_launch();
+            launch.pool_size = self.fork_pool_size.map(std::num::NonZeroU32::get);
+            launch.vram_limit_mib = self.cuda_vram_limit_mib.map(std::num::NonZeroU64::get);
+            launch
         } else {
             vm_common::ForkLaunch::default()
         };
@@ -2843,7 +3033,42 @@ pub struct ForkCmd {
 
     /// Name for the new clone machine.
     #[arg(short = 'n', long = "name", value_name = "NAME")]
-    pub clone: String,
+    pub clone: Option<String>,
+
+    /// Number of clones to create from one snapshot. Batch forks wait for the
+    /// standard `smolvm-fork-ready` boundary automatically.
+    #[arg(long, default_value = "1", value_name = "COUNT")]
+    pub count: std::num::NonZeroU32,
+
+    /// Name batch clones PREFIX-0 through PREFIX-(COUNT-1).
+    #[arg(long, value_name = "PREFIX")]
+    pub name_prefix: Option<String>,
+
+    /// Maximum number of clone boots in flight during a batch fork.
+    #[arg(long, default_value = "4", value_name = "COUNT")]
+    pub parallel: std::num::NonZeroU32,
+
+    /// Wait for `smolvm-fork-ready` in a single-clone fork. Batch forks always
+    /// wait; unless held, they release clones only after identity and fork env
+    /// are installed.
+    #[arg(long)]
+    pub wait_ready: bool,
+
+    /// Keep each clone parked at the inherited forkpoint as an already-booted
+    /// pool slot. Assign and release a slot later with `machine fork-release`.
+    /// A consumed slot is disposable; delete and replenish it from the golden
+    /// rather than reusing mutated training state.
+    #[arg(long)]
+    pub hold: bool,
+
+    /// Maximum time to wait for the golden workload's forkpoint.
+    #[arg(
+        long,
+        default_value = "10m",
+        value_parser = parse_duration,
+        value_name = "DURATION",
+    )]
+    pub ready_timeout: Duration,
 
     /// Make the clone itself forkable (memfd RAM + control socket), so it can
     /// in turn be forked.
@@ -2863,7 +3088,7 @@ pub struct ForkCmd {
     pub share_weights: bool,
 
     /// Per-fork parameter (repeatable, KEY=VALUE). Delivered to the clone as
-    /// `/run/smolvm/fork-env` (dotenv format) for the already-running workload
+    /// `/etc/smolvm/fork-env` (dotenv format) for the already-running workload
     /// to read, and merged into the clone's env for later `machine exec`
     /// sessions. This is how sweep/rollout clones learn which variant they
     /// are — no shared-mount claim files needed.
@@ -2896,20 +3121,148 @@ pub struct ForkCmd {
 impl ForkCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let ports: Vec<(u16, u16)> = self.port.iter().map(|p| (p.host, p.guest)).collect();
-        let fork_env = smolvm::util::parse_env_list(&self.env);
         // Parse per-fork secret refs (TrustedLocal — host env/absolute file);
         // they merge into the clone's secret_refs and resolve fresh per exec.
         let fork_secrets = parse_cli_secret_refs(&self.secret_env, &self.secret_file)?;
-        vm_common::fork_vm(
+        let count = self.count.get();
+        let wait_ready = forkpoint_timeout(count, self.wait_ready, self.hold, self.ready_timeout);
+        if count > 1024 {
+            return Err(smolvm::Error::config(
+                "fork",
+                "--count cannot exceed 1024 clones per batch",
+            ));
+        }
+        if self.hold && self.forkable {
+            return Err(smolvm::Error::config(
+                "fork",
+                "--hold cannot be combined with --forkable; pool slots are disposable leaves",
+            ));
+        }
+
+        if count == 1 {
+            let clone = match (self.clone, self.name_prefix) {
+                (Some(clone), None) => clone,
+                (None, Some(prefix)) => format!("{prefix}-0"),
+                (Some(_), Some(_)) => {
+                    return Err(smolvm::Error::config(
+                        "fork",
+                        "use either --name or --name-prefix, not both",
+                    ));
+                }
+                (None, None) => {
+                    return Err(smolvm::Error::config(
+                        "fork",
+                        "--name is required for one clone; use --name-prefix with --count for a batch",
+                    ));
+                }
+            };
+            let fork_env = render_indexed_fork_env(&self.env, 0, &clone, false);
+            return vm_common::fork_vm(
+                &self.golden,
+                &clone,
+                vm_common::ForkVmOptions {
+                    clone_forkable: self.forkable,
+                    pinned_ports: &ports,
+                    share_weights: self.share_weights,
+                    fork_env: &fork_env,
+                    fork_secrets: &fork_secrets,
+                    wait_ready,
+                    hold: self.hold,
+                },
+            );
+        }
+
+        if self.clone.is_some() {
+            return Err(smolvm::Error::config(
+                "fork",
+                "--name cannot be used with --count greater than 1; use --name-prefix",
+            ));
+        }
+        let prefix = self.name_prefix.ok_or_else(|| {
+            smolvm::Error::config(
+                "fork",
+                "--name-prefix is required with --count greater than 1",
+            )
+        })?;
+        if self.forkable {
+            return Err(smolvm::Error::config(
+                "fork",
+                "--forkable is not supported for batch clones",
+            ));
+        }
+        if !ports.is_empty() {
+            return Err(smolvm::Error::config(
+                "fork",
+                "pinned --port mappings are not supported for a batch; inherited ports are remapped automatically",
+            ));
+        }
+
+        let clones: Vec<_> = (0..count)
+            .map(|index| {
+                let name = format!("{prefix}-{index}");
+                let env = render_indexed_fork_env(&self.env, index, &name, true);
+                (name, env)
+            })
+            .collect();
+        vm_common::fork_vm_batch(
             &self.golden,
-            &self.clone,
-            self.forkable,
-            &ports,
+            &clones,
             self.share_weights,
-            &fork_env,
             &fork_secrets,
+            wait_ready,
+            self.parallel.get() as usize,
+            self.hold,
         )
     }
+}
+
+/// Assign job-specific parameters and release one held fork-pool slot.
+#[derive(Args, Debug)]
+pub struct ForkReleaseCmd {
+    /// Held clone to assign and release.
+    #[arg(short = 'n', long = "name", value_name = "NAME")]
+    pub name: String,
+
+    /// Assignment parameter (repeatable, KEY=VALUE). Values override matching
+    /// parameters installed when the slot was provisioned.
+    #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
+    pub env: Vec<String>,
+}
+
+impl ForkReleaseCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let env = smolvm::util::parse_env_list(&self.env);
+        vm_common::release_held_fork(&self.name, &env)
+    }
+}
+
+fn render_indexed_fork_env(
+    specs: &[String],
+    index: u32,
+    name: &str,
+    include_identity: bool,
+) -> Vec<(String, String)> {
+    let mut env = smolvm::util::parse_env_list(specs);
+    for (_, value) in &mut env {
+        *value = value
+            .replace("{index}", &index.to_string())
+            .replace("{name}", name);
+    }
+    if include_identity {
+        env.retain(|(key, _)| key != "SMOLVM_FORK_INDEX" && key != "SMOLVM_FORK_NAME");
+        env.push(("SMOLVM_FORK_INDEX".to_string(), index.to_string()));
+        env.push(("SMOLVM_FORK_NAME".to_string(), name.to_string()));
+    }
+    env
+}
+
+fn forkpoint_timeout(
+    count: u32,
+    explicitly_requested: bool,
+    hold: bool,
+    timeout: Duration,
+) -> Option<Duration> {
+    (count > 1 || explicitly_requested || hold).then_some(timeout)
 }
 
 // ============================================================================

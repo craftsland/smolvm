@@ -422,6 +422,23 @@ impl Reference {
             }
         }
 
+        // Reject any repository component that could break out of the `/v2/<repo>/`
+        // prefix when interpolated into a registry URL: a `.`/`..` traversal segment
+        // or anything outside the OCI repository charset (notably `%`, which can
+        // smuggle an encoded slash). Without this, `..` in a component turns
+        // `/v2/<repo>/manifests/...` into a request to an unrelated path on the host.
+        for component in namespace
+            .iter()
+            .flat_map(|ns| ns.split('/'))
+            .chain(std::iter::once(name.as_str()))
+        {
+            if !is_valid_repo_component(component) {
+                return Err(err(
+                    "invalid repository component (path traversal or disallowed characters)",
+                ));
+            }
+        }
+
         Ok(Reference {
             registry,
             namespace,
@@ -438,6 +455,18 @@ impl Reference {
             None => self.name.clone(),
         }
     }
+}
+
+/// A single `/`-delimited repository path component is safe to interpolate into a
+/// `/v2/<repo>/...` registry URL: non-empty, not a `.`/`..` traversal segment, and
+/// limited to the OCI repository charset `[A-Za-z0-9._-]` (so no `%`, `/`, or other
+/// URL metacharacters that could smuggle an encoded slash or escape the prefix).
+fn is_valid_repo_component(c: &str) -> bool {
+    !c.is_empty()
+        && c != "."
+        && c != ".."
+        && c.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
 }
 
 impl std::fmt::Display for Reference {
@@ -950,6 +979,40 @@ mirror = "ghcr-mirror.example.com"
             "unexpected reason: {}",
             err.reason
         );
+    }
+
+    #[test]
+    fn test_reference_rejects_repository_path_traversal() {
+        // A `..` component would turn `/v2/<repo>/...` into a request to an
+        // unrelated path on the registry host — reject it (and `.`, and any
+        // component carrying URL metacharacters like `%`).
+        for bad in [
+            "127.0.0.1:8081/../api/v1/machines:latest",
+            "registry.example.com/org/../secret:latest",
+            "registry.example.com/org/%2e%2e:latest",
+            "registry.example.com/org/a%2fb:latest",
+            "registry.example.com/./machine:latest",
+        ] {
+            let err = Reference::parse(bad).unwrap_err();
+            assert!(
+                err.reason.contains("invalid repository component"),
+                "expected rejection for {bad}, got: {}",
+                err.reason
+            );
+        }
+    }
+
+    #[test]
+    fn test_reference_accepts_normal_repositories() {
+        // The guard must not reject legitimate OCI repository paths.
+        for ok in [
+            "python-dev:latest",
+            "binsquare/custom:v1",
+            "ghcr.io/org/team/machine:latest",
+            "registry.example.com/a.b_c-d/img:latest",
+        ] {
+            assert!(Reference::parse(ok).is_ok(), "should accept {ok}");
+        }
     }
 
     // ── set_credentials / set_token / save ──────────────────────────────────

@@ -18,6 +18,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod forkpoint;
 pub mod guest_env;
 pub mod image_ref;
 pub mod publish_socket;

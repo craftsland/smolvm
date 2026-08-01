@@ -571,6 +571,32 @@ pub fn launch_agent_vm_dynamic(
         }
     }
 
+    // The packed launcher wires CUDA directly instead of going through the
+    // shared vsock-service builder, so it must carry the same guest feature
+    // sentinel explicitly. Without it the agent never stages the bundled
+    // shims and `pack run --cuda` boots a CUDA bridge that workloads cannot use.
+    if config.cuda_socket.is_some() {
+        let cuda_env = format!("{}={}", guest_env::CUDA_ZEROCOPY, guest_env::VALUE_ON);
+        if let Ok(cstr) = CString::new(cuda_env) {
+            env_strings.push(cstr);
+        }
+    }
+
+    if let Ok(pool_size) = std::env::var(guest_env::CUDA_FORK_POOL_SIZE) {
+        env_strings.push(cstr(&format!(
+            "{}={pool_size}",
+            guest_env::CUDA_FORK_POOL_SIZE
+        )));
+    }
+
+    if std::env::var(guest_env::FORKABLE).as_deref() == Ok(guest_env::VALUE_ON) {
+        env_strings.push(cstr(&format!(
+            "{}={}",
+            guest_env::FORKABLE,
+            guest_env::VALUE_ON
+        )));
+    }
+
     // Enable Rosetta only when requested AND actually available on this host, so
     // a stray `--rosetta` on a non-Rosetta host degrades to a no-op rather than a
     // dangling virtiofs tag the guest would fail to mount. The guest agent reads

@@ -37,8 +37,8 @@ use crate::api::state::{
 };
 use crate::api::types::{
     ApiErrorResponse, CreateMachineRequest, DeleteQuery, DeleteResponse, ExportRequest,
-    ExportResponse, ForkRequest, ListMachinesResponse, MachineInfo, MountInfo, MountSpec, PortSpec,
-    ResizeMachineRequest, ResourceSpec, StartMachineQuery,
+    ExportResponse, ForkReleaseRequest, ForkRequest, ListMachinesResponse, MachineInfo, MountInfo,
+    MountSpec, PortSpec, ResizeMachineRequest, ResourceSpec, StartMachineQuery,
 };
 use crate::config::{RecordState, RestartConfig, VmRecord};
 use crate::data::disk::{Overlay, Storage};
@@ -105,6 +105,9 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         // when unset.
         storage_gb: Some(record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GIB)),
         overlay_gb: Some(record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB)),
+        cuda_fork_pool_size: record.cuda_fork_pool_size,
+        cuda_vram_limit_mib: record.cuda_vram_limit_mib,
+        forkpoint_held: record.forkpoint_held,
         // Cumulative egress, read from the per-VM telemetry file the subprocess
         // flushes. Surfaced here so the control plane reads it from the machine
         // list exactly like disk size — no bespoke endpoint.
@@ -170,6 +173,9 @@ fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> Machin
         network: record.network,
         secret_refs: record.secret_refs.clone(),
         source_smolmachine: record.source_smolmachine.clone(),
+        cuda_fork_pool_size: record.cuda_fork_pool_size,
+        cuda_vram_limit_mib: record.cuda_vram_limit_mib,
+        forkpoint_held: record.forkpoint_held,
     }
 }
 
@@ -723,7 +729,7 @@ pub async fn create_machine(
         memory_mb: Some(mem),
         network: Some(network),
         gpu: Some(req.gpu),
-        cuda: Some(req.cuda),
+        cuda: Some(req.cuda || req.auto_graph),
         storage_gb: req.storage_gb,
         overlay_gb: req.overlay_gb,
         allowed_cidrs: normalized_cidrs,
@@ -737,6 +743,10 @@ pub async fn create_machine(
     // must be configured locally via the CLI.
     crate::api::handlers::validate_request_secrets(&req.secrets)?;
     crate::api::handlers::validate_request_env(&req.env)?;
+    let mut workload_env = merge_request_env(env, &req.env);
+    if req.auto_graph {
+        crate::util::enable_cuda_auto_graph_env(&mut workload_env);
+    }
 
     // Complete registration: persists to DB + registers in ApiState
     let complete_result = guard.complete(MachineRegistration {
@@ -766,7 +776,7 @@ pub async fn create_machine(
         source_smolmachine,
         entrypoint,
         cmd,
-        env: merge_request_env(env, &req.env),
+        env: workload_env,
         workdir: req.workdir.clone().or(workdir),
         // Record secrets = packed refs from --from (validated Untrusted above)
         // merged with request refs (validated Untrusted at ~line 333); request
@@ -902,7 +912,9 @@ fn validate_workload_image_source(
     tag = "Machines",
     params(
         ("name" = String, Path, description = "Machine name"),
-        ("forkable" = Option<bool>, Query, description = "Start as a fork base (memfd RAM + control socket)")
+        ("forkable" = Option<bool>, Query, description = "Start as a fork base (memfd RAM + control socket)"),
+        ("forkPoolSize" = Option<u32>, Query, description = "Planned runnable CUDA clones; implies forkable and enables automatic VRAM budgeting"),
+        ("cudaVramLimitMib" = Option<u64>, Query, description = "Optional logical VRAM limit per golden/clone session; requires forkPoolSize")
     ),
     responses(
         (status = 200, description = "Machine started", body = MachineInfo),
@@ -932,7 +944,7 @@ pub async fn start_machine(
     let _guard = lifecycle.lock().await;
 
     // Get VM record from database (off the reactor)
-    let record = state
+    let mut record = state
         .lookup_vm(&name)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
@@ -980,13 +992,55 @@ pub async fn start_machine(
         // Zombie: verified-kill the VMM and clear the DB record
         // before falling through to a clean fresh start. Any stale
         // in-memory registry entry gets overwritten by the
-        // `insert_machine` call later in this handler.
+        // `insert_machine` call later in this handler. If the zombie
+        // cannot be confirmed dead, refuse the start instead of
+        // booting on top of it.
         let name_recover = name.clone();
         tokio::task::spawn_blocking(move || {
-            crate::agent::state_probe::recover_if_unreachable(&name_recover);
+            crate::agent::state_probe::recover_if_unreachable(&name_recover)
         })
         .await
-        .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
+        .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+        .map_err(|e| {
+            ApiError::internal(format!(
+                "machine '{name}' is unreachable and zombie cleanup failed: {e}"
+            ))
+        })?;
+    }
+
+    if let Some(pool_size) = query.fork_pool_size {
+        if pool_size == 0 {
+            return Err(ApiError::BadRequest(
+                "forkPoolSize must be greater than zero".to_string(),
+            ));
+        }
+        if !record.cuda {
+            return Err(ApiError::BadRequest(
+                "forkPoolSize requires a CUDA-enabled machine".to_string(),
+            ));
+        }
+        record.cuda_fork_pool_size = Some(pool_size);
+        state
+            .update_vm(&name, move |r| r.cuda_fork_pool_size = Some(pool_size))
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+    }
+    if let Some(limit_mib) = query.cuda_vram_limit_mib {
+        if limit_mib == 0 {
+            return Err(ApiError::BadRequest(
+                "cudaVramLimitMib must be greater than zero".to_string(),
+            ));
+        }
+        if query.fork_pool_size.is_none() {
+            return Err(ApiError::BadRequest(
+                "cudaVramLimitMib requires forkPoolSize".to_string(),
+            ));
+        }
+        record.cuda_vram_limit_mib = Some(limit_mib);
+        state
+            .update_vm(&name, move |r| r.cuda_vram_limit_mib = Some(limit_mib))
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
     }
 
     let mounts = record.host_mounts();
@@ -1001,7 +1055,9 @@ pub async fn start_machine(
     let source_smolmachine = record.source_smolmachine.clone();
     let dns_filter_hosts = record.dns_filter_hosts.clone();
     let record_golden = record.golden.clone();
-    let forkable = query.forkable;
+    let cuda_fork_pool_size = record.cuda_fork_pool_size;
+    let cuda_vram_limit_mib = record.cuda_vram_limit_mib;
+    let forkable = query.forkable || query.fork_pool_size.is_some();
     let (manager, pid) = tokio::task::spawn_blocking(move || {
         let manager = AgentManager::for_vm_with_sizes(&name_clone, storage_gb, overlay_gb)
             .map_err(|e| format!("failed to create agent manager: {}", e))?;
@@ -1026,6 +1082,8 @@ pub async fn start_machine(
         if forkable {
             features.forkable = true;
         }
+        features.cuda_fork_pool_size = cuda_fork_pool_size;
+        features.cuda_vram_limit_mib = cuda_vram_limit_mib;
         let _ = manager
             .ensure_running_via_subprocess(mounts, ports, resources, features)
             .map_err(|e| format!("failed to start machine: {}", e))?;
@@ -1222,15 +1280,29 @@ pub async fn fork_machine(
     Path(golden): Path<String>,
     Json(req): Json<ForkRequest>,
 ) -> Result<Json<MachineInfo>, ApiError> {
+    fork_machine_inner(state, golden, req).await.map(Json)
+}
+
+/// Internal fork entry point shared by the HTTP handler and pool reconciler.
+pub(crate) async fn fork_machine_inner(
+    state: Arc<ApiState>,
+    golden: String,
+    req: ForkRequest,
+) -> Result<MachineInfo, ApiError> {
     let clone = req.name.clone();
     let pinned_ports: Vec<(u16, u16)> = req.ports.iter().map(|p| (p.host, p.guest)).collect();
     let req_share_weights = req.share_weights;
+    let req_hold = req.hold;
+    let wait_ready = req.wait_ready || req_hold;
+    let ready_timeout = std::time::Duration::from_secs(req.ready_timeout_secs.unwrap_or(240));
     let fork_env = crate::util::parse_env_list(&req.env);
     // Per-fork secrets become the clone's persisted secret_refs (resolved fresh
     // on each exec, never at rest) — validate them at TrustedLocal like the
     // Smolfile-declared refs they join.
     crate::api::handlers::validate_fork_secrets(&req.secrets)?;
     let fork_secrets = req.secrets.clone();
+    crate::agent::fork::validate_fork_env(&fork_env)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     // Validate pinned ports as the create path does: fork uses these host ports
     // as-is (no remapping), so port 0 or a duplicated host port would otherwise
@@ -1253,6 +1325,16 @@ pub async fn fork_machine(
         }
     }
 
+    if wait_ready {
+        let golden_b = golden.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::agent::fork::wait_for_forkpoint(&golden_b, ready_timeout)
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("task error: {e}")))?
+        .map_err(classify_fork_error)?;
+    }
+
     // Serialize lifecycle on the CLONE name so a concurrent start/stop/delete of
     // the same clone can't race the fork's register + boot. The golden is only
     // read + frozen via its control socket, which tolerates concurrent forks.
@@ -1271,15 +1353,138 @@ pub async fn fork_machine(
         let env = fork_env.clone();
         let secrets = fork_secrets.clone();
         tokio::task::spawn_blocking(move || {
-            crate::agent::fork::prepare_fork(
-                &db, &golden_b, &clone_b, &ports, /* clone_forkable */ false, &env, &secrets,
-            )
+            if req_hold {
+                crate::agent::fork::prepare_held_fork(
+                    &db, &golden_b, &clone_b, &ports, &env, &secrets,
+                )
+            } else {
+                crate::agent::fork::prepare_fork(
+                    &db, &golden_b, &clone_b, &ports, /* clone_forkable */ false, &env,
+                    &secrets,
+                )
+            }
         })
         .await
         .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
         .map_err(classify_fork_error)?
     };
 
+    boot_prepared_fork_inner(
+        state,
+        clone,
+        prep,
+        req_share_weights,
+        fork_env,
+        wait_ready,
+        req_hold,
+    )
+    .await
+}
+
+/// Prepare several clean held workers from one golden checkpoint and boot them
+/// concurrently. Preparation is all-or-nothing; once booting begins, successful
+/// workers remain usable and each failed worker is reported independently.
+pub(crate) async fn fork_held_machines_inner(
+    state: Arc<ApiState>,
+    golden: String,
+    clones: Vec<String>,
+    share_weights: bool,
+    ready_timeout: std::time::Duration,
+) -> Result<Vec<(String, Result<MachineInfo, ApiError>)>, ApiError> {
+    if clones.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let golden_for_wait = golden.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::agent::fork::wait_for_forkpoint(&golden_for_wait, ready_timeout)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("task error: {e}")))?
+    .map_err(classify_fork_error)?;
+
+    // Keep every clone lifecycle locked through registration and boot. Names are
+    // sorted so this remains deadlock-free if another internal batch ever
+    // overlaps it; pool-generated names are unique in normal operation.
+    let mut lock_names = clones.clone();
+    lock_names.sort();
+    lock_names.dedup();
+    let mut guards = Vec::with_capacity(lock_names.len());
+    for clone in &lock_names {
+        guards.push(state.lifecycle_lock(clone).lock_owned().await);
+    }
+
+    let prepared = {
+        let db = state.db().clone();
+        let golden_for_prep = golden.clone();
+        let clones_for_prep = clones.clone();
+        tokio::task::spawn_blocking(move || {
+            let empty_secrets = std::collections::BTreeMap::new();
+            let specs: Vec<_> = clones_for_prep
+                .iter()
+                .map(|clone| crate::agent::fork::ForkSpec {
+                    clone,
+                    pinned_ports: &[],
+                    clone_forkable: false,
+                    fork_env: &[],
+                    fork_secrets: &empty_secrets,
+                    hold: true,
+                })
+                .collect();
+            crate::agent::fork::prepare_forks(&db, &golden_for_prep, &specs)
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("task error: {e}")))?
+        .map_err(classify_fork_error)?
+    };
+
+    let snapshot_dir = prepared[0].snapshot_dir.clone();
+    let resume_golden_on_rollback = prepared[0].resume_golden_on_rollback;
+    let boots = prepared.into_iter().zip(clones).map(|(prep, clone)| {
+        let state = state.clone();
+        async move {
+            let result = boot_prepared_fork_inner(
+                state,
+                clone.clone(),
+                prep,
+                share_weights,
+                Vec::new(),
+                true,
+                true,
+            )
+            .await;
+            (clone, result)
+        }
+    });
+    let results = futures_util::future::join_all(boots).await;
+
+    // If every restore failed, no clone depends on this checkpoint and an
+    // initially-running golden can safely resume for a later retry. A partial
+    // success must retain the paused golden and shared snapshot.
+    if results.iter().all(|(_, result)| result.is_err()) {
+        if let Err(error) = std::fs::remove_dir_all(&snapshot_dir) {
+            tracing::warn!(path = %snapshot_dir.display(), %error, "failed to remove unused batch fork snapshot");
+        }
+        if resume_golden_on_rollback {
+            if let Err(error) = crate::agent::fork::resume_golden(&golden) {
+                tracing::warn!(%golden, %error, "failed to resume golden after batch restore failure");
+            }
+        }
+    }
+
+    drop(guards);
+    Ok(results)
+}
+
+async fn boot_prepared_fork_inner(
+    state: Arc<ApiState>,
+    clone: String,
+    prep: crate::agent::fork::PreparedFork,
+    share_weights: bool,
+    fork_env: Vec<(String, String)>,
+    wait_ready: bool,
+    hold: bool,
+) -> Result<MachineInfo, ApiError> {
     // Phase 2: boot the clone from the golden's in-memory snapshot (warm — its
     // processes are already running in the restored RAM, so unlike a cold start
     // there is no image workload to launch), then rejuvenate its identity.
@@ -1303,7 +1508,9 @@ pub async fn fork_machine(
         .map_err(|e| format!("failed to prepare packed layers: {}", e))?;
         // Boot from the golden's snapshot instead of cold-booting.
         features.snapshot_dir = Some(prep.snapshot_dir);
-        features.cuda_share_weights = req_share_weights;
+        features.cuda_share_weights = share_weights;
+        features.cuda_fork_pool_size = record.cuda_fork_pool_size;
+        features.cuda_vram_limit_mib = record.cuda_vram_limit_mib;
 
         if let Err(e) = manager.ensure_running_via_subprocess(mounts, ports, resources, features) {
             // Boot failed: roll back the clone registration so a failed fork
@@ -1335,6 +1542,13 @@ pub async fn fork_machine(
             teardown,
         )
         .map_err(|e| format!("fork env delivery failed: {}", e))?;
+        if wait_ready && !hold {
+            crate::agent::fork::fail_closed_on_rejuvenation(
+                crate::agent::fork::release_forkpoint(&clone_b),
+                teardown,
+            )
+            .map_err(|e| format!("forkpoint release failed: {e}"))?;
+        }
 
         let pid = manager.child_pid();
         Ok::<_, String>((manager, pid, record))
@@ -1365,7 +1579,103 @@ pub async fn fork_machine(
     let mut info = record_to_info(&clone, &record);
     info.state = "running".to_string();
     info.pid = pid;
-    Ok(Json(info))
+    Ok(info)
+}
+
+/// Assign job parameters and release one held fork-pool slot.
+#[utoipa::path(
+    post,
+    path = "/api/v1/machines/{name}/fork-release",
+    tag = "Machines",
+    params(("name" = String, Path, description = "Held clone name")),
+    request_body = ForkReleaseRequest,
+    responses(
+        (status = 200, description = "Held clone assigned and released", body = MachineInfo),
+        (status = 404, description = "Clone not found", body = ApiErrorResponse),
+        (status = 409, description = "Machine is not a held fork slot", body = ApiErrorResponse),
+        (status = 500, description = "Activation failed", body = ApiErrorResponse)
+    )
+)]
+pub async fn release_held_fork(
+    State(state): State<Arc<ApiState>>,
+    Path(clone): Path<String>,
+    Json(req): Json<ForkReleaseRequest>,
+) -> Result<Json<MachineInfo>, ApiError> {
+    let lifecycle = state.lifecycle_lock(&clone);
+    let _guard = lifecycle.lock().await;
+    let db = state.db().clone();
+    let clone_for_pool = clone.clone();
+    let pool_slot = tokio::task::spawn_blocking(move || db.get_fork_pool_slot(&clone_for_pool))
+        .await
+        .map_err(|e| ApiError::internal(format!("pool ownership task failed: {e}")))?
+        .map_err(ApiError::database)?;
+    if let Some(slot) = pool_slot {
+        return Err(ApiError::Conflict(format!(
+            "machine '{clone}' is managed by fork pool '{}'; acquire it through the pool lease API",
+            slot.pool_name
+        )));
+    }
+    let record = state
+        .lookup_vm(&clone)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("machine '{clone}' not found")))?;
+    if record.golden.is_none() || !record.forkpoint_held {
+        return Err(ApiError::Conflict(format!(
+            "machine '{clone}' is not a held fork-pool slot"
+        )));
+    }
+
+    let assignment = crate::util::parse_env_list(&req.env);
+    crate::agent::fork::validate_fork_env(&assignment)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let merged = crate::agent::fork::merge_fork_env(&record.fork_env, &assignment);
+    // Claim in durable state before publishing the guest release marker. A
+    // crash can strand one slot, but can never leave a running workload marked
+    // assignable and run it twice. Replenishment from the golden is the safe
+    // recovery for any ambiguous activation failure.
+    let assignment_for_record = assignment.clone();
+    let merged_for_record = merged.clone();
+    let claimed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let claimed_in_update = claimed.clone();
+    let updated = state
+        .update_vm(&clone, move |entry| {
+            if entry.forkpoint_held {
+                crate::agent::fork::record_fork_activation(
+                    entry,
+                    &assignment_for_record,
+                    merged_for_record,
+                );
+                claimed_in_update.store(true, std::sync::atomic::Ordering::Release);
+            }
+        })
+        .await?
+        .ok_or_else(|| {
+            ApiError::NotFound(format!("clone '{clone}' disappeared before activation"))
+        })?;
+    if !claimed.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(ApiError::Conflict(format!(
+            "held fork-pool slot '{clone}' was already claimed"
+        )));
+    }
+    if let Ok(entry) = state.get_machine(&clone) {
+        entry.lock().forkpoint_held = false;
+    }
+
+    let clone_b = clone.clone();
+    let record_b = record.clone();
+    let assignment_b = assignment.clone();
+    let activated = tokio::task::spawn_blocking(move || {
+        crate::agent::fork::activate_held_fork(&clone_b, &record_b, &assignment_b)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("task error: {e}")))?
+    .map_err(|error| {
+        ApiError::Internal(format!(
+            "slot '{clone}' was claimed and will not be reused after activation failed: {error}"
+        ))
+    })?;
+    debug_assert_eq!(activated, merged);
+    Ok(Json(record_to_info(&clone, &updated)))
 }
 
 /// Stop a machine.
@@ -1653,7 +1963,10 @@ pub async fn delete_machine(
 /// and database, and delete its data directory. Refuses if it is a fork base
 /// with live clones. Shared by [`delete_machine`] (once per golden, and once per
 /// clone during a cascade).
-async fn delete_one(state: Arc<ApiState>, name: String) -> Result<DeleteResponse, ApiError> {
+pub(crate) async fn delete_one(
+    state: Arc<ApiState>,
+    name: String,
+) -> Result<DeleteResponse, ApiError> {
     // Hold the per-machine lifecycle lock across the whole delete so the layers
     // volume detach (before the data-dir removal) cannot race a concurrent
     // start's acquire+mount+launch (review finding #3). Acquired before the DB
@@ -1922,6 +2235,13 @@ pub async fn resize_machine(
     Ok(Json(record_to_info(&name, &record)))
 }
 
+/// Where the export subprocess writes its executable stub. `pack create -o X` derives the
+/// real artifact as `X.smolmachine`, so this must NOT already end in that extension or the
+/// CLI rejects it outright.
+fn export_stub_path(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("export")
+}
+
 /// Export a stopped machine to a `.smolmachine` and push it directly to a
 /// registry.
 ///
@@ -1982,11 +2302,12 @@ pub async fn export_machine(
     // Build the .smolmachine by subprocessing this binary's tested export path.
     // The serve handlers and the pack CLI share the same on-disk SmolvmDb, so
     // `pack create --from-vm <name>` sees the serve-managed machine.
-    let tmp = tempfile::Builder::new()
-        .suffix(".smolmachine")
-        .tempfile()
-        .map_err(|e| ApiError::internal(format!("create temp file: {}", e)))?;
-    let tmp_path = tmp.path().to_path_buf();
+    // `pack create -o X` names the executable STUB and derives the sidecar as
+    // X.smolmachine, rejecting an `-o` that already carries that extension. Stage both
+    // inside a temp dir so the sidecar is cleaned up with the stub rather than left behind.
+    let tmp_dir =
+        tempfile::tempdir().map_err(|e| ApiError::internal(format!("create temp dir: {}", e)))?;
+    let tmp_path = export_stub_path(tmp_dir.path());
     let exe =
         std::env::current_exe().map_err(|e| ApiError::internal(format!("current_exe: {}", e)))?;
 
@@ -2055,6 +2376,40 @@ pub async fn export_machine(
     }))
 }
 
+/// True if `host` is a loopback, link-local, or private-range address — an
+/// SSRF-prone pull destination on a fleet node (its own `127.0.0.1` services, the
+/// cloud metadata endpoint at `169.254.169.254`, or a neighbour on the private
+/// network). Hostnames that are not IP literals return false (a DNS-rebind to a
+/// private address is a residual not covered here).
+fn is_ssrf_prone_registry_host(host: &str) -> bool {
+    // localhost / 127.0.0.0/8 / ::1 / 0.0.0.0 — reuse the registry classifier.
+    if smolvm_registry::is_local_registry(host) {
+        return true;
+    }
+    // Extract the bare host (strip IPv6 brackets and any :port), then classify it
+    // only if it parses as an IP literal.
+    let bare = if let Some(rest) = host.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else if host.matches(':').count() == 1 {
+        host.split(':').next().unwrap_or(host)
+    } else {
+        host
+    };
+    match bare.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => {
+            v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()
+        }
+        Ok(std::net::IpAddr::V6(v6)) => {
+            let first = v6.segments()[0];
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (first & 0xffc0) == 0xfe80 // link-local fe80::/10
+                || (first & 0xfe00) == 0xfc00 // unique-local fc00::/7
+        }
+        Err(_) => false,
+    }
+}
+
 async fn pull_from_registry(
     registry_ref: &str,
     identity_token: Option<&str>,
@@ -2093,6 +2448,18 @@ pub(crate) async fn pull_smolmachine(
         "docker.io" => "registry-1.docker.io",
         h => h,
     };
+
+    // A control-plane tenant pull (identity_token present) must never target a
+    // loopback/link-local/private-range host: on a fleet node that is an SSRF
+    // pivot into node-local services, not a real registry. Local dev (no token)
+    // is unaffected, and legitimate tenant pulls resolve public registries.
+    if identity_token.is_some() && is_ssrf_prone_registry_host(api_host) {
+        return Err(ApiError::BadRequest(format!(
+            "registry host '{}' is a private/loopback address and is not permitted for tenant image pulls",
+            api_host
+        )));
+    }
+
     let base_url = if smolvm_registry::is_local_registry(api_host) {
         format!("http://{}", api_host)
     } else {
@@ -2176,9 +2543,64 @@ fn merge_request_env(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::db::SmolvmDb;
     use tempfile::TempDir;
+
+    #[test]
+    fn ssrf_prone_registry_host_flags_loopback_linklocal_and_private() {
+        for host in [
+            "127.0.0.1:8081",
+            "localhost:5000",
+            "0.0.0.0",
+            "169.254.169.254", // cloud metadata
+            "10.0.0.5",
+            "172.16.4.4",
+            "192.168.1.10",
+            "[::1]:5000",
+            "[fe80::1]",
+            "[fc00::1]:443",
+        ] {
+            assert!(
+                is_ssrf_prone_registry_host(host),
+                "{host} should be flagged"
+            );
+        }
+        for host in [
+            "registry-1.docker.io",
+            "registry.smolmachines.com",
+            "ghcr.io",
+            "8.8.8.8",
+            "203.0.113.7:5000",
+        ] {
+            assert!(
+                !is_ssrf_prone_registry_host(host),
+                "{host} should NOT be flagged"
+            );
+        }
+    }
+
+    #[test]
+    fn export_stub_path_is_not_the_sidecar_name() {
+        // Regression: the handler used to hand `pack create` a temp file that already
+        // ended in `.smolmachine`, which the CLI rejects because `-o` names the stub.
+        let dir = std::path::Path::new("/tmp/export-test");
+        let stub = export_stub_path(dir);
+        assert!(
+            stub.extension()
+                .is_none_or(|e| !e.eq_ignore_ascii_case("smolmachine")),
+            "-o must name the stub, not the sidecar: {}",
+            stub.display()
+        );
+        let sidecar = smolvm_pack::sidecar_path_for(&stub);
+        assert_eq!(
+            sidecar.extension().and_then(|e| e.to_str()),
+            Some("smolmachine"),
+            "the derived sidecar must be the .smolmachine artifact"
+        );
+        assert_ne!(stub, sidecar);
+    }
 
     #[test]
     fn classify_fork_error_maps_precondition_failures_to_conflict() {
@@ -2362,6 +2784,7 @@ mod tests {
             network: false,
             gpu: false,
             cuda: false,
+            auto_graph: false,
             entrypoint: vec![],
             cmd: vec![],
             docker_socket: false,
@@ -2424,6 +2847,52 @@ mod tests {
         assert_eq!(req.env[0].name, "FOO");
         assert_eq!(req.env[0].value, "bar");
         assert_eq!(req.workdir.as_deref(), Some("/app"));
+    }
+
+    #[test]
+    fn create_request_auto_graph_is_opt_in() {
+        let enabled: CreateMachineRequest = serde_json::from_value(serde_json::json!({
+            "name": "api-vm",
+            "autoGraph": true
+        }))
+        .unwrap();
+        assert!(enabled.auto_graph);
+
+        let defaulted: CreateMachineRequest = serde_json::from_value(serde_json::json!({
+            "name": "api-vm"
+        }))
+        .unwrap();
+        assert!(!defaulted.auto_graph);
+    }
+
+    #[test]
+    fn auto_graph_policy_overrides_conflicting_request_env() {
+        let mut env = merge_request_env(
+            vec![(
+                crate::util::CUDA_AUTO_GRAPH_ENV.to_string(),
+                "0".to_string(),
+            )],
+            &[crate::api::types::EnvVar {
+                name: crate::util::TORCHINDUCTOR_CUDAGRAPHS_ENV.to_string(),
+                value: "0".to_string(),
+            }],
+        );
+
+        crate::util::enable_cuda_auto_graph_env(&mut env);
+
+        assert_eq!(
+            env,
+            vec![
+                (
+                    crate::util::CUDA_AUTO_GRAPH_ENV.to_string(),
+                    "1".to_string()
+                ),
+                (
+                    crate::util::TORCHINDUCTOR_CUDAGRAPHS_ENV.to_string(),
+                    "1".to_string(),
+                ),
+            ]
+        );
     }
 
     #[test]

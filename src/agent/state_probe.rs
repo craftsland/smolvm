@@ -103,47 +103,46 @@ fn has_live_clones(name: &str) -> bool {
 /// the record's PID/state so the caller can proceed to a clean
 /// fresh start — or simply leave the VM Stopped.
 ///
-/// Kills via verified SIGTERM (PID + start-time match, so a recycled
-/// PID is never harmed), waits up to 2 s for the process to exit,
-/// then escalates to verified SIGKILL.
-///
-/// Infallible by design: if the kill or DB write fails, downstream
-/// code will surface a clear error (libkrun "address already in
-/// use" on restart, or the next `list` will re-probe and converge
-/// on Stopped since the PID ends up dead either way). The caller
-/// doesn't need to branch on success.
+/// Refuses to signal a live PID unless its start time matches the record,
+/// then uses the shared VM shutdown path to wait for confirmed process death.
+/// The record is cleared only after that confirmation.
 ///
 /// This is the shared teardown used by both the CLI (`machine start
 /// | stop | delete --stop`) and the HTTP API (`POST /machines/X/start`)
 /// so all surfaces recover from the Unreachable state the same way.
-pub fn recover_unreachable_machine(record: &VmRecord) {
-    use std::time::{Duration, Instant};
+pub fn recover_unreachable_machine(record: &VmRecord) -> crate::Result<()> {
+    let db = SmolvmDb::open()?;
+    recover_unreachable_machine_in_db(record, &db)
+}
 
+fn recover_unreachable_machine_in_db(record: &VmRecord, db: &SmolvmDb) -> crate::Result<()> {
     if let Some(pid) = record.pid {
-        if crate::process::terminate_verified(pid, record.pid_start_time) {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while Instant::now() < deadline {
-                if !crate::process::is_alive(pid) {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(100));
+        if crate::process::is_alive(pid) {
+            if !crate::process::is_our_process_strict(pid, record.pid_start_time) {
+                return Err(crate::Error::agent(
+                    "recover unreachable machine",
+                    format!(
+                        "refusing to stop unverified process {pid}; if {pid} is \
+                         this VM's process, run: kill -9 {pid}, then retry"
+                    ),
+                ));
             }
-            if crate::process::is_alive(pid) {
-                crate::process::kill_verified(pid, record.pid_start_time);
-            }
+            crate::process::stop_vm_process(
+                pid,
+                crate::process::VM_SIGTERM_TIMEOUT,
+                crate::process::VM_SIGKILL_TIMEOUT,
+            )?;
         }
     }
 
-    // Best-effort DB clear. We write via SmolvmDb (not SmolvmConfig)
-    // to avoid pulling the full in-memory config load; the db update
-    // is targeted to the one record.
-    if let Ok(db) = SmolvmDb::open() {
-        let _ = db.update_vm(&record.name, |r| {
-            r.state = RecordState::Stopped;
-            r.pid = None;
-            r.pid_start_time = None;
-        });
-    }
+    // Write via SmolvmDb (not SmolvmConfig) to avoid pulling the full
+    // in-memory config load; the update is targeted to the one record.
+    db.update_vm(&record.name, |r| {
+        r.state = RecordState::Stopped;
+        r.pid = None;
+        r.pid_start_time = None;
+    })?;
+    Ok(())
 }
 
 /// If the named VM resolves to `Unreachable`, recover it (kill the
@@ -153,16 +152,18 @@ pub fn recover_unreachable_machine(record: &VmRecord) {
 /// CLI/API boundary can share the helper without coupling to
 /// `SmolvmConfig`.
 ///
-/// Returns `true` when recovery actually ran, so callers can print
+/// Returns `Ok(true)` when recovery actually ran, so callers can print
 /// a user-facing notice (start/stop/delete all want to mention the
 /// teardown happened — the alternative is a silent kill, which is
 /// surprising when the operator didn't know a zombie existed).
-pub fn recover_if_unreachable(name: &str) -> bool {
-    let Ok(db) = SmolvmDb::open() else {
-        return false;
-    };
+/// Returns `Ok(false)` when the machine is not Unreachable and nothing
+/// happened. Returns `Err` when the zombie could not be confirmed dead
+/// (unverified PID, or still alive after SIGTERM+SIGKILL); callers must
+/// not proceed as if the machine were stopped in that case.
+pub fn recover_if_unreachable(name: &str) -> crate::Result<bool> {
+    let db = SmolvmDb::open()?;
     let Ok(Some(record)) = db.get_vm(name) else {
-        return false;
+        return Ok(false);
     };
     // Only a genuine zombie resolves to `Unreachable`. A frozen fork base
     // resolves to `Frozen` (see `resolve_state`) and is left alone here —
@@ -170,10 +171,10 @@ pub fn recover_if_unreachable(name: &str) -> bool {
     // A force-delete that genuinely wants to break the chain calls
     // `recover_unreachable_machine` directly, bypassing this path.
     if resolve_state(name, &record) != RecordState::Unreachable {
-        return false;
+        return Ok(false);
     }
-    recover_unreachable_machine(&record);
-    true
+    recover_unreachable_machine_in_db(&record, &db)?;
+    Ok(true)
 }
 
 /// Return true if a short-timeout vsock ping to the agent for this
@@ -295,5 +296,23 @@ mod tests {
         // "does-not-exist" so this also covers has_live_clones == false.)
         let r = record(RecordState::Stopped, Some(99999));
         assert!(!is_frozen_fork_base("does-not-exist", &r));
+    }
+
+    #[test]
+    fn failed_recovery_preserves_process_state() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = SmolvmDb::open_at(&dir.path().join("test.db")).unwrap();
+        let mut r = record(RecordState::Unreachable, Some(std::process::id() as i32));
+        r.pid_start_time = None;
+        db.insert_vm(&r.name, &r).unwrap();
+
+        let error = recover_unreachable_machine_in_db(&r, &db).unwrap_err();
+
+        assert!(error.to_string().contains("unverified process"));
+        assert!(error.to_string().contains("kill -9"));
+        let persisted = db.get_vm(&r.name).unwrap().unwrap();
+        assert_eq!(persisted.state, RecordState::Unreachable);
+        assert_eq!(persisted.pid, r.pid);
+        assert_eq!(persisted.pid_start_time, r.pid_start_time);
     }
 }

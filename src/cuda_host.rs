@@ -12,7 +12,7 @@
 //! with no NVIDIA GPU.
 
 use crate::platform::uds::UdsListener;
-use smolvm_cuda::host::{serve, Backend, CpuBackend, GpuBackend};
+use smolvm_cuda::host::{serve_with_options, Backend, CpuBackend, GpuBackend, ServeOptions};
 use std::path::Path;
 use std::sync::OnceLock;
 use std::thread;
@@ -101,7 +101,8 @@ pub fn start(socket_path: &Path) -> std::io::Result<()> {
             if let Some(ref addr) = daemon {
                 tracing::info!(daemon = %addr, "cuda-host: shared-daemon proxy mode");
             }
-            // P3b: a FORK-CLONE VM warms its daemon-side worker EAGERLY. The
+            let serve_options = ServeOptions::from_env();
+            // A fork clone warms its daemon-side worker eagerly. The
             // warm-flagged preamble makes the daemon spawn the worker (CUDA
             // init + memory reconstruction + module/graph pre-warm) NOW,
             // concurrent with guest resume, instead of on the guest's first
@@ -118,10 +119,24 @@ pub fn start(socket_path: &Path) -> std::io::Result<()> {
                         // worker inherits the dir at spawn and every later
                         // attached channel resolves RingSetupFile against it.
                         let rd = ring_dir_advert();
+                        let policy = cuda_policy_advert();
                         if addr.starts_with('/') {
                             #[cfg(unix)]
                             if let Ok(mut s) = std::os::unix::net::UnixStream::connect(&addr) {
-                                if rd.as_ref().is_none_or(|r| s.write_all(r).is_ok())
+                                #[cfg(target_os = "linux")]
+                                let lifetime = clone_lifetime_advert();
+                                if policy.as_ref().is_none_or(|p| s.write_all(p).is_ok())
+                                    && rd.as_ref().is_none_or(|r| s.write_all(r).is_ok())
+                                    && {
+                                        #[cfg(target_os = "linux")]
+                                        {
+                                            s.write_all(&lifetime).is_ok()
+                                        }
+                                        #[cfg(not(target_os = "linux"))]
+                                        {
+                                            true
+                                        }
+                                    }
                                     && s.write_all(&p).is_ok()
                                 {
                                     tracing::info!("cuda-host: clone warm dial sent");
@@ -130,7 +145,8 @@ pub fn start(socket_path: &Path) -> std::io::Result<()> {
                                 }
                             }
                         } else if let Ok(mut s) = std::net::TcpStream::connect(&addr) {
-                            if rd.as_ref().is_none_or(|r| s.write_all(r).is_ok())
+                            if policy.as_ref().is_none_or(|p| s.write_all(p).is_ok())
+                                && rd.as_ref().is_none_or(|r| s.write_all(r).is_ok())
                                 && s.write_all(&p).is_ok()
                             {
                                 tracing::info!("cuda-host: clone warm dial sent");
@@ -146,6 +162,7 @@ pub fn start(socket_path: &Path) -> std::io::Result<()> {
                 match stream {
                     Ok(stream) => {
                         let daemon = daemon.clone();
+                        let options = serve_options;
                         thread::Builder::new()
                             .name("cuda-host-conn".into())
                             .spawn(move || {
@@ -156,7 +173,9 @@ pub fn start(socket_path: &Path) -> std::io::Result<()> {
                                     return;
                                 }
                                 let mut backend = make_backend();
-                                if let Err(e) = serve(stream, backend.as_mut()) {
+                                if let Err(e) =
+                                    serve_with_options(stream, backend.as_mut(), options)
+                                {
                                     tracing::debug!(error = %e, "CUDA host connection ended");
                                 }
                             })
@@ -234,6 +253,34 @@ fn ring_dir_advert() -> Option<Vec<u8>> {
     v.extend_from_slice(&(dir.len() as u16).to_le_bytes());
     v.extend_from_slice(dir.as_bytes());
     Some(v)
+}
+
+/// Capacity policy advert (`SMVCPOL1` + exact-limit bytes + fork count +
+/// reserved). It precedes every other host-only preamble so a persistent
+/// shared daemon applies this VM's policy rather than its own process env.
+fn cuda_policy_advert() -> Option<[u8; 24]> {
+    let options = ServeOptions::from_env();
+    if options.vram_limit_bytes.is_none() && options.fork_pool_size.is_none() {
+        return None;
+    }
+    let mut p = [0u8; 24];
+    p[..8].copy_from_slice(b"SMVCPOL1");
+    p[8..16].copy_from_slice(&options.vram_limit_bytes.unwrap_or(0).to_le_bytes());
+    p[16..20].copy_from_slice(&options.fork_pool_size.unwrap_or(0).to_le_bytes());
+    Some(p)
+}
+
+/// Local clone-lifetime advertisement. The eager warm dial can happen before
+/// libkrun publishes the clone's guest-RAM regions, but its worker still needs
+/// the VMM pid so a failed clone boot cannot pin a reconstructed CUDA context
+/// until the remote-transport fallback timeout. This is the zero-region form
+/// of `SMVGPVM1`; real channels later attach the full live-RAM map.
+#[cfg(target_os = "linux")]
+fn clone_lifetime_advert() -> [u8; 20] {
+    let mut p = [0u8; 20];
+    p[..8].copy_from_slice(b"SMVGPVM1");
+    p[8..12].copy_from_slice(&std::process::id().to_le_bytes());
+    p
 }
 
 /// A FORK-CLONE VM's proxy prepends the clone preamble (magic + clone id) so
@@ -372,6 +419,9 @@ fn proxy_to_daemon(guest: crate::platform::uds::UdsStream, addr: &str) -> std::i
         {
             use std::io::Write as _;
             let mut daemon = std::os::unix::net::UnixStream::connect(addr)?;
+            if let Some(p) = cuda_policy_advert() {
+                daemon.write_all(&p)?;
+            }
             if let Some(a) = guest_ram_advert() {
                 daemon.write_all(&a)?;
             }
@@ -408,6 +458,10 @@ fn proxy_to_daemon(guest: crate::platform::uds::UdsStream, addr: &str) -> std::i
     }
     let mut daemon = std::net::TcpStream::connect(addr)?;
     let _ = daemon.set_nodelay(true);
+    if let Some(policy) = cuda_policy_advert() {
+        use std::io::Write as _;
+        daemon.write_all(&policy)?;
+    }
     if let Some(p) = preamble() {
         use std::io::Write as _;
         daemon.write_all(&p)?;

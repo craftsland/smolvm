@@ -289,17 +289,21 @@ impl Supervisor {
         let resources = record.vm_resources();
         let source_smolmachine = record.source_smolmachine.clone();
         let dns_filter_hosts = record.dns_filter_hosts.clone();
+        let cuda_fork_pool_size = record.cuda_fork_pool_size;
+        let cuda_vram_limit_mib = record.cuda_vram_limit_mib;
         let name_for_features = name.to_string();
 
         let entry_clone = entry.clone();
         let start_result = tokio::task::spawn_blocking(move || {
             let entry = entry_clone.lock();
             // Wire pre-extracted layers if this machine was created from a .smolmachine.
-            let features = crate::api::state::build_launch_features(
+            let mut features = crate::api::state::build_launch_features(
                 Some(&name_for_features),
                 source_smolmachine.as_deref(),
                 dns_filter_hosts,
             )?;
+            features.cuda_fork_pool_size = cuda_fork_pool_size;
+            features.cuda_vram_limit_mib = cuda_vram_limit_mib;
             entry
                 .manager
                 .ensure_running_via_subprocess(mounts, ports, resources, features)

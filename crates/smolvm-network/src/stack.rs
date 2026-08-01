@@ -211,7 +211,7 @@ fn run_network_stack(
         IpAddr::V6(link_local_from_mac(config.gateway_mac)),
     ];
     let relay_wake = Arc::new(queues.relay_wake.clone());
-    let mut relays = TcpRelayTable::new(None, egress.clone());
+    let mut relays = TcpRelayTable::new(None, egress.clone(), gateway_addrs.to_vec());
     let mut udp_sockets = udp_relay::UdpSocketTable::new();
     let udp_channels = {
         let shutdown_queues = queues.clone();

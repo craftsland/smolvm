@@ -268,6 +268,11 @@ pub struct PackRunCmd {
     /// was created with CUDA, or via `SMOLVM_CUDA=1`.
     #[arg(long)]
     pub cuda: bool,
+
+    /// Ask compatible CUDA frameworks to graph safe compiled regions.
+    /// Implies --cuda; arbitrary eager CUDA calls are not captured.
+    #[arg(long)]
+    pub auto_graph: bool,
 }
 
 impl PackRunCmd {
@@ -401,7 +406,7 @@ impl PackRunCmd {
         // `--cuda` override, or `SMOLVM_CUDA=1`. When on, the parent runs a host
         // CUDA server on `cuda_sock` and the launcher bridges the guest's vsock
         // CUDA port to it (the guest's LD_PRELOADed shims connect out).
-        let cuda_enabled = manifest.cuda || self.cuda || env_flag("SMOLVM_CUDA");
+        let cuda_enabled = manifest.cuda || self.cuda || self.auto_graph || env_flag("SMOLVM_CUDA");
         let cuda_sock = runtime_dir.path().join("cuda.sock");
 
         // Compute auto-sized storage before creating the disk so both the
@@ -435,7 +440,7 @@ impl PackRunCmd {
             network_backend: self.net_backend,
             dns: None,
             gpu: manifest.gpu,
-            cuda: manifest.cuda,
+            cuda: cuda_enabled,
             storage_gib,
             overlay_gib: self.overlay,
             gpu_vram_mib: None,
@@ -962,7 +967,10 @@ fn execute_command(
     mounts: &[smolvm::data::storage::HostMount],
 ) -> smolvm::Result<i32> {
     let command = build_command(manifest, &args.command);
-    let env = build_env(manifest, &args.env)?;
+    let mut env = build_env(manifest, &args.env)?;
+    if args.auto_graph {
+        smolvm::util::enable_cuda_auto_graph_env(&mut env);
+    }
     let workdir = args.workdir.clone().or_else(|| manifest.workdir.clone());
 
     let params = ExecParams {
@@ -1352,6 +1360,7 @@ fn run_ephemeral(
                 info: false,
                 debug,
                 cuda: args.cuda,
+                auto_graph: false,
             };
             cmd.run()
         }
