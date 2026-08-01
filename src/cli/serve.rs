@@ -289,6 +289,11 @@ impl ServeStartCmd {
 
         // Create router
         let drain_state = state.clone();
+        // The loopback plain-HTTP door (fleet mode) serves a RESTRICTED router —
+        // liveness/capacity/metrics only — so the unauthenticated local surface
+        // cannot reach the machine/file/exec API. The full API stays on the mTLS
+        // network port (`app`). See `create_local_router`.
+        let local_app = smolvm::api::create_local_router(state.clone(), self.cors_origins.clone());
         let app = smolvm::api::create_router(state, self.cors_origins.clone());
 
         // Resolve the serve API's TLS posture before binding. In fleet mode this
@@ -301,7 +306,7 @@ impl ServeStartCmd {
 
         // Listen server on TCP or Unix socket
         match listen_target {
-            ListenTarget::Tcp(addr) => self.serve_tcp(addr, app, tls).await?,
+            ListenTarget::Tcp(addr) => self.serve_tcp(addr, app, local_app, tls).await?,
             #[cfg(unix)]
             ListenTarget::Unix(path) => self.serve_unix(path, app).await?,
         }
@@ -341,10 +346,11 @@ impl ServeStartCmd {
         &self,
         addr: SocketAddr,
         app: Router,
+        local_app: Router,
         tls: Option<std::sync::Arc<rustls::ServerConfig>>,
     ) -> Result<()> {
         if let Some(tls_config) = tls {
-            return Self::serve_tcp_tls(addr, app, tls_config).await;
+            return Self::serve_tcp_tls(addr, app, local_app, tls_config).await;
         }
 
         let listener = tokio::net::TcpListener::bind(addr)
@@ -372,6 +378,7 @@ impl ServeStartCmd {
     async fn serve_tcp_tls(
         addr: SocketAddr,
         app: Router,
+        local_app: Router,
         tls_config: std::sync::Arc<rustls::ServerConfig>,
     ) -> Result<()> {
         // Loopback plain-HTTP door for the local node-agent.
@@ -396,7 +403,8 @@ impl ServeStartCmd {
             std_listener
                 .set_nonblocking(true)
                 .map_err(smolvm::error::Error::Io)?;
-            let local_app = app.clone();
+            // `local_app` (restricted: liveness/capacity/metrics) is moved in here;
+            // it deliberately does NOT carry the /api/v1 machine/file/exec routes.
             tracing::info!(address = %local_addr, "starting loopback HTTP door (local node-agent, isolated runtime)");
             println!(
                 "smolvm local API (loopback, plain) on http://{}",

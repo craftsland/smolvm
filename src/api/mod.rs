@@ -244,7 +244,30 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .nest("/machines", machine_routes)
         .nest("/volumes", volume_routes);
 
-    // CORS: Use configured origins, or default to localhost for security.
+    let cors = build_cors(cors_origins);
+
+    // Prometheus metrics
+    let metrics_route = Router::new().route("/metrics", get(serve_metrics));
+
+    // Combine all routes
+    Router::new()
+        .merge(health_route)
+        .merge(capacity_route)
+        .merge(drain_route)
+        .merge(p2p_route)
+        .merge(warm_route)
+        .merge(metrics_route)
+        .nest("/api/v1", api_v1)
+        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
+        .layer(middleware::from_fn(trace_id_middleware))
+        .layer(TraceLayer::new_for_http())
+        .layer(cors)
+        .with_state(state)
+}
+
+/// Build the shared CORS layer from the configured origins (falling back to the
+/// localhost defaults). Shared by [`create_router`] and [`create_local_router`].
+fn build_cors(cors_origins: Vec<String>) -> CorsLayer {
     let default_origins = || {
         vec![
             "http://localhost:8080"
@@ -280,33 +303,107 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
             valid
         }
     };
-
-    let cors = CorsLayer::new()
+    CorsLayer::new()
         .allow_origin(AllowOrigin::list(origins))
         .allow_methods([
             axum::http::Method::GET,
             axum::http::Method::POST,
             axum::http::Method::DELETE,
         ])
-        .allow_headers([axum::http::header::CONTENT_TYPE]);
+        .allow_headers([axum::http::header::CONTENT_TYPE])
+}
 
-    // Prometheus metrics
-    let metrics_route = Router::new().route("/metrics", get(serve_metrics));
-
-    // Combine all routes
+/// The router served on the plain-HTTP LOOPBACK door (fleet mode), as distinct
+/// from the full [`create_router`] served on the mTLS network port.
+///
+/// The loopback door is unauthenticated by construction — anything that can
+/// reach `127.0.0.1` on the node gets in. Serving the full router there exposed
+/// the machine/file/exec API (`/api/v1/*`) to any local caller, and a crafted
+/// registry reference (`127.0.0.1:<port>/...`) makes the node's OWN in-process
+/// registry-pull client such a caller: it turns an attacker-supplied image ref
+/// into unauthenticated reads/writes against `download_file` / `upload_file`.
+///
+/// The door's only legitimate job is liveness — a fleet node-agent polling
+/// `/capacity` (plus `/health`/`/readyz`, and read-only `/metrics`). Restricting
+/// it to exactly those routes closes the SSRF pivot without touching the mTLS
+/// control path, which keeps the full API. Everything else 404s on loopback.
+pub fn create_local_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router {
+    let cors = build_cors(cors_origins);
     Router::new()
-        .merge(health_route)
-        .merge(capacity_route)
-        .merge(drain_route)
-        .merge(p2p_route)
-        .merge(warm_route)
-        .merge(metrics_route)
-        .nest("/api/v1", api_v1)
-        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
+        .route("/health", get(handlers::health::health))
+        .route("/readyz", get(handlers::health::readyz))
+        .route("/capacity", get(handlers::node::capacity))
+        .route("/metrics", get(serve_metrics))
         .layer(middleware::from_fn(trace_id_middleware))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state)
+}
+
+#[cfg(test)]
+mod loopback_router_test {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    async fn status(router: axum::Router, method: &str, path: &str) -> StatusCode {
+        router
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    // The loopback door must NOT expose the machine/file/exec API — that is the
+    // SSRF pivot this router closes. Liveness routes must still answer.
+    #[tokio::test]
+    async fn loopback_router_excludes_machine_file_exec_api() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = crate::db::SmolvmDb::open_at(&dir.path().join("t.db")).unwrap();
+        let state = std::sync::Arc::new(crate::api::state::ApiState::with_db(db));
+        let local = create_local_router(state.clone(), vec![]);
+
+        // The attack surface — every one must be 404 (route absent) on loopback:
+        for (m, p) in [
+            ("GET", "/api/v1/machines"),
+            ("GET", "/api/v1/machines/x/files/etc/passwd"),
+            ("PUT", "/api/v1/machines/x/files/etc/cron.d/x"),
+            ("POST", "/api/v1/machines/x/exec"),
+            ("POST", "/api/v1/machines"),
+        ] {
+            assert_eq!(
+                status(local.clone(), m, p).await,
+                StatusCode::NOT_FOUND,
+                "loopback door must NOT expose {m} {p}"
+            );
+        }
+        // Liveness must still work (not 404) so the node-agent poll survives:
+        assert_ne!(
+            status(local.clone(), "GET", "/capacity").await,
+            StatusCode::NOT_FOUND,
+            "loopback /capacity must remain served"
+        );
+        assert_ne!(
+            status(local.clone(), "GET", "/health").await,
+            StatusCode::NOT_FOUND,
+            "loopback /health must remain served"
+        );
+
+        // Sanity: the FULL router (mTLS port) still DOES expose the API.
+        let full = create_router(state, vec![]);
+        assert_ne!(
+            status(full, "GET", "/api/v1/machines").await,
+            StatusCode::NOT_FOUND,
+            "full router must still expose the machine API on the mTLS port"
+        );
+    }
 }
 
 /// Install the global Prometheus metrics recorder.

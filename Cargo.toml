@@ -126,6 +126,7 @@ windows-sys = { version = "0.60", features = [
 tempfile = "3"
 smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.7.1" }
 regex = "1"
+tower = { version = "0.5", features = ["util"] }
 
 [build-dependencies]
 pkg-config = "0.3"
