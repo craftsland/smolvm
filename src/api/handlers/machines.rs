@@ -1280,6 +1280,15 @@ pub async fn fork_machine(
     Path(golden): Path<String>,
     Json(req): Json<ForkRequest>,
 ) -> Result<Json<MachineInfo>, ApiError> {
+    fork_machine_inner(state, golden, req).await.map(Json)
+}
+
+/// Internal fork entry point shared by the HTTP handler and pool reconciler.
+pub(crate) async fn fork_machine_inner(
+    state: Arc<ApiState>,
+    golden: String,
+    req: ForkRequest,
+) -> Result<MachineInfo, ApiError> {
     let clone = req.name.clone();
     let pinned_ports: Vec<(u16, u16)> = req.ports.iter().map(|p| (p.host, p.guest)).collect();
     let req_share_weights = req.share_weights;
@@ -1454,7 +1463,7 @@ pub async fn fork_machine(
     let mut info = record_to_info(&clone, &record);
     info.state = "running".to_string();
     info.pid = pid;
-    Ok(Json(info))
+    Ok(info)
 }
 
 /// Assign job parameters and release one held fork-pool slot.
@@ -1478,6 +1487,18 @@ pub async fn release_held_fork(
 ) -> Result<Json<MachineInfo>, ApiError> {
     let lifecycle = state.lifecycle_lock(&clone);
     let _guard = lifecycle.lock().await;
+    let db = state.db().clone();
+    let clone_for_pool = clone.clone();
+    let pool_slot = tokio::task::spawn_blocking(move || db.get_fork_pool_slot(&clone_for_pool))
+        .await
+        .map_err(|e| ApiError::internal(format!("pool ownership task failed: {e}")))?
+        .map_err(ApiError::database)?;
+    if let Some(slot) = pool_slot {
+        return Err(ApiError::Conflict(format!(
+            "machine '{clone}' is managed by fork pool '{}'; acquire it through the pool lease API",
+            slot.pool_name
+        )));
+    }
     let record = state
         .lookup_vm(&clone)
         .await?
@@ -1826,7 +1847,10 @@ pub async fn delete_machine(
 /// and database, and delete its data directory. Refuses if it is a fork base
 /// with live clones. Shared by [`delete_machine`] (once per golden, and once per
 /// clone during a cascade).
-async fn delete_one(state: Arc<ApiState>, name: String) -> Result<DeleteResponse, ApiError> {
+pub(crate) async fn delete_one(
+    state: Arc<ApiState>,
+    name: String,
+) -> Result<DeleteResponse, ApiError> {
     // Hold the per-machine lifecycle lock across the whole delete so the layers
     // volume detach (before the data-dir removal) cannot race a concurrent
     // start's acquire+mount+launch (review finding #3). Acquired before the DB

@@ -21,6 +21,7 @@
 #[path = "errors.rs"]
 pub mod error;
 pub mod handlers;
+pub mod pool_controller;
 pub mod state;
 pub mod supervisor;
 pub mod types;
@@ -59,6 +60,7 @@ use state::ApiState;
         (name = "Health", description = "Health check endpoints"),
         (name = "Node", description = "Node capacity introspection"),
         (name = "Machines", description = "Machine lifecycle management"),
+        (name = "Pools", description = "Automatic held-fork worker pools"),
         (name = "Execution", description = "Command execution in machines"),
         (name = "Logs", description = "Log streaming"),
         (name = "Images", description = "OCI image management"),
@@ -91,6 +93,16 @@ use state::ApiState;
         handlers::machines::delete_machine,
         handlers::machines::resize_machine,
         handlers::machines::export_machine,
+        // Pools
+        handlers::pools::create_pool,
+        handlers::pools::list_pools,
+        handlers::pools::get_pool,
+        handlers::pools::resize_pool,
+        handlers::pools::delete_pool,
+        handlers::pools::acquire_lease,
+        handlers::pools::get_lease,
+        handlers::pools::heartbeat_lease,
+        handlers::pools::complete_lease,
     ),
     components(schemas(
         // Request types
@@ -110,6 +122,10 @@ use state::ApiState;
         types::ForkReleaseRequest,
         types::ExportRequest,
         types::StartMachineQuery,
+        types::CreateForkPoolRequest,
+        types::DeleteForkPoolQuery,
+        types::AcquireForkLeaseRequest,
+        types::ResizeForkPoolRequest,
         // Response types
         types::HealthResponse,
         types::CapacityResponse,
@@ -125,6 +141,9 @@ use state::ApiState;
         types::StopResponse,
         types::DeleteResponse,
         types::ApiErrorResponse,
+        types::ForkPoolInfo,
+        types::ListForkPoolsResponse,
+        types::ForkLeaseInfo,
     ))
 )]
 pub struct ApiDoc;
@@ -238,6 +257,30 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .merge(logs_route)
         .merge(machine_routes_with_timeout);
 
+    // Automatic pool operations are bounded by the same request timeout as
+    // machine lifecycle calls. Pool fill and worker replacement happen in the
+    // background controller, so create/delete themselves stay quick.
+    let pool_routes = Router::new()
+        .route("/", post(handlers::pools::create_pool))
+        .route("/", get(handlers::pools::list_pools))
+        .route("/{name}", get(handlers::pools::get_pool))
+        .route("/{name}", delete(handlers::pools::delete_pool))
+        .route("/{name}/size", put(handlers::pools::resize_pool))
+        .route("/{name}/leases", post(handlers::pools::acquire_lease))
+        .route("/{name}/leases/{lease}", get(handlers::pools::get_lease))
+        .route(
+            "/{name}/leases/{lease}/heartbeat",
+            post(handlers::pools::heartbeat_lease),
+        )
+        .route(
+            "/{name}/leases/{lease}/complete",
+            post(handlers::pools::complete_lease),
+        )
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(API_REQUEST_TIMEOUT_SECS),
+        ));
+
     // Volume provisioning (node-side storage for the control plane): create the
     // backing storage on THIS worker and return its host path. See
     // handlers::volumes.
@@ -248,6 +291,7 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
     // API v1 routes
     let api_v1 = Router::new()
         .nest("/machines", machine_routes)
+        .nest("/pools", pool_routes)
         .nest("/volumes", volume_routes);
 
     let cors = build_cors(cors_origins);
@@ -314,6 +358,7 @@ fn build_cors(cors_origins: Vec<String>) -> CorsLayer {
         .allow_methods([
             axum::http::Method::GET,
             axum::http::Method::POST,
+            axum::http::Method::PUT,
             axum::http::Method::DELETE,
         ])
         .allow_headers([axum::http::header::CONTENT_TYPE])

@@ -856,6 +856,129 @@ pub struct ForkReleaseRequest {
     pub env: Vec<String>,
 }
 
+// ============================================================================
+// Automatic fork-pool types
+// ============================================================================
+
+/// Request to create an automatically replenished pool of held fork workers.
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateForkPoolRequest {
+    /// Stable pool name.
+    #[schema(example = "grpo-rollouts")]
+    pub name: String,
+    /// Existing running forkable machine whose workload is at the forkpoint.
+    #[schema(example = "policy-golden")]
+    pub golden: String,
+    /// Number of clean workers kept booted and ready.
+    #[schema(example = 8)]
+    pub desired_ready: u32,
+    /// Optional maximum number of simultaneously active leases.
+    #[serde(default)]
+    pub max_active: Option<u32>,
+    /// Share immutable CUDA allocations with the golden and sibling workers.
+    #[serde(default)]
+    pub share_weights: bool,
+    /// Maximum seconds to wait for the golden workload forkpoint.
+    #[serde(default)]
+    pub ready_timeout_secs: Option<u64>,
+    /// Default seconds an acquired worker may run without a heartbeat.
+    #[serde(default)]
+    pub lease_ttl_secs: Option<u64>,
+}
+
+/// Query parameters for deleting a fork pool.
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
+pub struct DeleteForkPoolQuery {
+    /// Cancel active leases and delete their workers as well.
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// Request to change a pool's clean-worker target.
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ResizeForkPoolRequest {
+    /// New number of clean workers to keep booted and ready.
+    pub desired_ready: u32,
+}
+
+/// Current size and lifecycle state of an automatic fork pool.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkPoolInfo {
+    /// Stable pool name.
+    pub name: String,
+    /// Forkable source machine.
+    pub golden: String,
+    /// Configured clean-worker target.
+    pub desired_ready: u32,
+    /// Optional simultaneous active-lease limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_active: Option<u32>,
+    /// Whether immutable CUDA allocations are shared.
+    pub share_weights: bool,
+    /// Default lease heartbeat duration.
+    pub lease_ttl_secs: u64,
+    /// Workers still being forked and booted.
+    pub provisioning: u32,
+    /// Clean held workers immediately available for acquisition.
+    pub ready: u32,
+    /// Workers durably claimed while guest release is in progress.
+    pub activating: u32,
+    /// Workers currently owned by active leases.
+    pub active: u32,
+    /// Workers being destroyed before replacement or pool deletion.
+    pub retiring: u32,
+    /// True after asynchronous deletion has begun.
+    pub deleting: bool,
+    /// Unix timestamp when the pool was created.
+    pub created_at: u64,
+}
+
+/// List response for automatic fork pools.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ListForkPoolsResponse {
+    /// All pools on this node.
+    pub pools: Vec<ForkPoolInfo>,
+}
+
+/// Request to acquire one clean worker from a fork pool.
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AcquireForkLeaseRequest {
+    /// Retry key unique within the pool. Repeating it returns the same lease.
+    #[schema(example = "rollout-batch-42-worker-3")]
+    pub idempotency_key: String,
+    /// Job-specific KEY=VALUE parameters installed before the workload runs.
+    #[serde(default)]
+    pub env: Vec<String>,
+    /// Optional lease duration override for this worker.
+    #[serde(default)]
+    pub ttl_secs: Option<u64>,
+}
+
+/// Public state of one one-shot fork worker lease.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkLeaseInfo {
+    /// Opaque lease identifier used for heartbeat and completion.
+    pub id: String,
+    /// Pool that supplied the worker.
+    pub pool: String,
+    /// Machine name usable with existing exec, file, and log APIs.
+    pub machine: String,
+    /// Lease state: activating, active, completed, expired, failed, or cancelled.
+    pub state: String,
+    /// Unix timestamp when the lease was acquired.
+    pub created_at: u64,
+    /// Unix timestamp after which a missing heartbeat retires the worker.
+    pub expires_at: u64,
+    /// Activation failure, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[cfg(test)]
 mod registry_auth_tests {
     use super::*;

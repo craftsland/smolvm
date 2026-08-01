@@ -287,6 +287,16 @@ impl ServeStartCmd {
             supervisor.run().await;
         });
 
+        // Automatic fork-pool reconciliation has its own task so slow worker
+        // creation or deletion never delays the machine health supervisor.
+        let pool_state = state.clone();
+        let pool_shutdown = shutdown_rx.clone();
+        let pool_controller_handle = tokio::spawn(async move {
+            let controller =
+                smolvm::api::pool_controller::ForkPoolController::new(pool_state, pool_shutdown);
+            controller.run().await;
+        });
+
         // Create router
         let drain_state = state.clone();
         // The loopback plain-HTTP door (fleet mode) serves a RESTRICTED router —
@@ -312,6 +322,33 @@ impl ServeStartCmd {
         }
 
         // The HTTP server has stopped accepting (graceful shutdown on SIGTERM).
+        // Stop reconcilers before detaching or draining machine managers. In
+        // particular, a pool fill must not register a newly booted worker after
+        // `detach_all` has already walked the registry.
+        let _ = shutdown_tx.send(true);
+        let mut pool_controller_handle = pool_controller_handle;
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            &mut pool_controller_handle,
+        )
+        .await
+        {
+            Ok(_) => tracing::debug!("fork pool controller shut down cleanly"),
+            Err(_) => {
+                tracing::warn!("fork pool controller did not shut down within 5 seconds");
+                pool_controller_handle.abort();
+            }
+        }
+        let mut supervisor_handle = supervisor_handle;
+        match tokio::time::timeout(std::time::Duration::from_secs(5), &mut supervisor_handle).await
+        {
+            Ok(_) => tracing::debug!("supervisor shut down cleanly"),
+            Err(_) => {
+                tracing::warn!("supervisor did not shut down within 5 seconds");
+                supervisor_handle.abort();
+            }
+        }
+
         // VMs survive a normal `serve` restart (reconnect on next start), so this
         // is opt-in: on a host teardown (autoscaler scale-in) set
         // SMOLVM_DRAIN_ON_SHUTDOWN to stop running VMs cleanly — flushing disk
@@ -328,15 +365,6 @@ impl ServeStartCmd {
             // `ApiState` would kill every running VM. Disarm each manager's Drop
             // first, mirroring the CLI's detach-before-exit.
             drain_state.detach_all();
-        }
-
-        // Signal all background tasks to stop
-        let _ = shutdown_tx.send(true);
-
-        // Wait for supervisor to finish (with timeout)
-        match tokio::time::timeout(std::time::Duration::from_secs(5), supervisor_handle).await {
-            Ok(_) => tracing::debug!("supervisor shut down cleanly"),
-            Err(_) => tracing::warn!("supervisor did not shut down within 5 seconds"),
         }
 
         Ok(())

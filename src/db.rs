@@ -11,6 +11,10 @@
 
 use crate::config::VmRecord;
 use crate::error::{Error, Result};
+use crate::pool::{
+    ClaimForkPoolSlot, ForkLeaseRecord, ForkLeaseState, ForkPoolRecord, ForkPoolSlotRecord,
+    ForkPoolSlotState,
+};
 use parking_lot::{Condvar, Mutex};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
@@ -225,7 +229,29 @@ impl SmolvmDb {
              CREATE TABLE IF NOT EXISTS config (
                  key TEXT PRIMARY KEY NOT NULL,
                  value TEXT NOT NULL
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS fork_pools (
+                 name TEXT PRIMARY KEY NOT NULL,
+                 data BLOB NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS fork_pool_slots (
+                 machine_name TEXT PRIMARY KEY NOT NULL,
+                 pool_name TEXT NOT NULL,
+                 state TEXT NOT NULL,
+                 data BLOB NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS fork_pool_slots_pool_state
+                 ON fork_pool_slots(pool_name, state);
+             CREATE TABLE IF NOT EXISTS fork_leases (
+                 id TEXT PRIMARY KEY NOT NULL,
+                 pool_name TEXT NOT NULL,
+                 idempotency_key TEXT NOT NULL,
+                 state TEXT NOT NULL,
+                 data BLOB NOT NULL,
+                 UNIQUE(pool_name, idempotency_key)
+             );
+             CREATE INDEX IF NOT EXISTS fork_leases_pool_state
+                 ON fork_leases(pool_name, state);",
         )
         .db_err("create tables")?;
 
@@ -581,6 +607,995 @@ impl SmolvmDb {
 
             tx.commit().db_err("commit vm update")?;
             Ok(updated)
+        })
+    }
+
+    // ========================================================================
+    // Automatic fork-pool operations
+    // ========================================================================
+
+    /// Create a fork pool if its name is unused.
+    pub fn insert_fork_pool_if_not_exists(&self, pool: &ForkPoolRecord) -> Result<bool> {
+        let data = serde_json::to_vec(pool).db_err("serialize fork pool")?;
+        self.with_conn(|conn| {
+            let changed = conn
+                .execute(
+                    "INSERT OR IGNORE INTO fork_pools (name, data) VALUES (?1, ?2)",
+                    params![pool.name, data],
+                )
+                .db_err(format!("insert fork pool '{}'", pool.name))?;
+            Ok(changed == 1)
+        })
+    }
+
+    /// Read one fork pool.
+    pub fn get_fork_pool(&self, name: &str) -> Result<Option<ForkPoolRecord>> {
+        self.with_read_conn(|conn| {
+            let data: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT data FROM fork_pools WHERE name = ?1",
+                    params![name],
+                    |row| row.get(0),
+                )
+                .optional()
+                .db_err(format!("get fork pool '{name}'"))?;
+            data.map(|bytes| serde_json::from_slice(&bytes).db_err("deserialize fork pool"))
+                .transpose()
+        })
+    }
+
+    /// List all fork pools.
+    pub fn list_fork_pools(&self) -> Result<Vec<ForkPoolRecord>> {
+        self.with_read_conn(|conn| {
+            let mut stmt = conn
+                .prepare_cached("SELECT data FROM fork_pools ORDER BY name")
+                .db_err("prepare list fork pools")?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, Vec<u8>>(0))
+                .db_err("query fork pools")?;
+            let mut pools = Vec::new();
+            for row in rows {
+                let bytes = row.db_err("read fork pool row")?;
+                pools.push(serde_json::from_slice(&bytes).db_err("deserialize fork pool")?);
+            }
+            Ok(pools)
+        })
+    }
+
+    /// Change a pool's ready target and retire surplus unclaimed workers.
+    pub fn resize_fork_pool(
+        &self,
+        name: &str,
+        desired_ready: u32,
+        now: u64,
+    ) -> Result<Option<ForkPoolRecord>> {
+        self.with_conn(|conn| {
+            let tx = conn.transaction().db_err("begin fork pool resize")?;
+            let data: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT data FROM fork_pools WHERE name = ?1",
+                    params![name],
+                    |row| row.get(0),
+                )
+                .optional()
+                .db_err(format!("get fork pool '{name}'"))?;
+            let Some(data) = data else {
+                tx.commit().db_err("commit missing fork pool resize")?;
+                return Ok(None);
+            };
+            let mut pool: ForkPoolRecord =
+                serde_json::from_slice(&data).db_err("deserialize fork pool")?;
+            if pool.deleting {
+                tx.commit().db_err("commit deleting fork pool resize")?;
+                return Ok(Some(pool));
+            }
+            pool.desired_ready = desired_ready;
+            let updated = serde_json::to_vec(&pool).db_err("serialize fork pool")?;
+            tx.execute(
+                "UPDATE fork_pools SET data = ?2 WHERE name = ?1",
+                params![name, updated],
+            )
+            .db_err("update fork pool size")?;
+
+            let available_rows: Vec<Vec<u8>> = {
+                let mut stmt = tx
+                    .prepare_cached(
+                        "SELECT data FROM fork_pool_slots
+                         WHERE pool_name = ?1 AND state IN ('provisioning', 'ready')
+                         ORDER BY CASE state WHEN 'provisioning' THEN 0 ELSE 1 END, machine_name",
+                    )
+                    .db_err("prepare surplus fork slots")?;
+                let rows = stmt
+                    .query_map(params![name], |row| row.get(0))
+                    .db_err("query surplus fork slots")?;
+                let mut collected = Vec::new();
+                for row in rows {
+                    collected.push(row.db_err("read surplus fork slot")?);
+                }
+                collected
+            };
+            let surplus = available_rows.len().saturating_sub(desired_ready as usize);
+            for slot_data in available_rows.into_iter().take(surplus) {
+                let mut slot: ForkPoolSlotRecord =
+                    serde_json::from_slice(&slot_data).db_err("deserialize surplus fork slot")?;
+                slot.state = ForkPoolSlotState::Retiring;
+                slot.updated_at = now;
+                let slot_updated =
+                    serde_json::to_vec(&slot).db_err("serialize surplus fork slot")?;
+                tx.execute(
+                    "UPDATE fork_pool_slots SET state = 'retiring', data = ?2
+                     WHERE machine_name = ?1",
+                    params![slot.machine_name, slot_updated],
+                )
+                .db_err("retire surplus fork slot")?;
+            }
+            tx.commit().db_err("commit fork pool resize")?;
+            Ok(Some(pool))
+        })
+    }
+
+    /// List every slot owned by a pool.
+    pub fn list_fork_pool_slots(&self, pool_name: &str) -> Result<Vec<ForkPoolSlotRecord>> {
+        self.with_read_conn(|conn| {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT data FROM fork_pool_slots WHERE pool_name = ?1 ORDER BY machine_name",
+                )
+                .db_err("prepare list fork pool slots")?;
+            let rows = stmt
+                .query_map(params![pool_name], |row| row.get::<_, Vec<u8>>(0))
+                .db_err(format!("query slots for fork pool '{pool_name}'"))?;
+            let mut slots = Vec::new();
+            for row in rows {
+                let bytes = row.db_err("read fork pool slot row")?;
+                slots.push(serde_json::from_slice(&bytes).db_err("deserialize fork pool slot")?);
+            }
+            Ok(slots)
+        })
+    }
+
+    /// Read pool ownership for one machine, if it is controller-managed.
+    pub fn get_fork_pool_slot(&self, machine_name: &str) -> Result<Option<ForkPoolSlotRecord>> {
+        self.with_read_conn(|conn| {
+            let data: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT data FROM fork_pool_slots WHERE machine_name = ?1",
+                    params![machine_name],
+                    |row| row.get(0),
+                )
+                .optional()
+                .db_err(format!("get fork pool slot '{machine_name}'"))?;
+            data.map(|bytes| serde_json::from_slice(&bytes).db_err("deserialize fork pool slot"))
+                .transpose()
+        })
+    }
+
+    /// Number of additional provisioning/ready slots needed for a pool target.
+    pub fn fork_pool_ready_deficit(&self, pool_name: &str) -> Result<u32> {
+        self.with_read_conn(|conn| {
+            let data: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT data FROM fork_pools WHERE name = ?1",
+                    params![pool_name],
+                    |row| row.get(0),
+                )
+                .optional()
+                .db_err(format!("get fork pool '{pool_name}'"))?;
+            let Some(data) = data else {
+                return Ok(0);
+            };
+            let pool: ForkPoolRecord =
+                serde_json::from_slice(&data).db_err("deserialize fork pool")?;
+            if pool.deleting {
+                return Ok(0);
+            }
+            let available: u32 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM fork_pool_slots
+                     WHERE pool_name = ?1 AND state IN ('provisioning', 'ready')",
+                    params![pool_name],
+                    |row| row.get(0),
+                )
+                .db_err("count available fork pool slots")?;
+            Ok(pool.desired_ready.saturating_sub(available))
+        })
+    }
+
+    /// Reserve a provisioning slot only while the pool still has a ready deficit.
+    ///
+    /// The deficit check and insert share a transaction, so repeated controller
+    /// ticks or a future second controller cannot overfill a pool.
+    pub fn reserve_fork_pool_slot(
+        &self,
+        pool_name: &str,
+        machine_name: &str,
+        now: u64,
+    ) -> Result<bool> {
+        self.with_conn(|conn| {
+            let tx = conn.transaction().db_err("begin fork slot reservation")?;
+            let pool_data: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT data FROM fork_pools WHERE name = ?1",
+                    params![pool_name],
+                    |row| row.get(0),
+                )
+                .optional()
+                .db_err(format!("get fork pool '{pool_name}'"))?;
+            let Some(pool_data) = pool_data else {
+                tx.commit().db_err("commit missing fork pool reservation")?;
+                return Ok(false);
+            };
+            let pool: ForkPoolRecord =
+                serde_json::from_slice(&pool_data).db_err("deserialize fork pool")?;
+            if pool.deleting {
+                tx.commit()
+                    .db_err("commit deleting fork pool reservation")?;
+                return Ok(false);
+            }
+            let available: u32 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM fork_pool_slots
+                     WHERE pool_name = ?1 AND state IN ('provisioning', 'ready')",
+                    params![pool_name],
+                    |row| row.get(0),
+                )
+                .db_err("count available fork pool slots")?;
+            if available >= pool.desired_ready {
+                tx.commit().db_err("commit full fork pool reservation")?;
+                return Ok(false);
+            }
+            let slot = ForkPoolSlotRecord {
+                pool_name: pool_name.to_string(),
+                machine_name: machine_name.to_string(),
+                state: ForkPoolSlotState::Provisioning,
+                lease_id: None,
+                created_at: now,
+                updated_at: now,
+                last_error: None,
+            };
+            let data = serde_json::to_vec(&slot).db_err("serialize fork pool slot")?;
+            let changed = tx
+                .execute(
+                    "INSERT OR IGNORE INTO fork_pool_slots
+                     (machine_name, pool_name, state, data) VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        machine_name,
+                        pool_name,
+                        ForkPoolSlotState::Provisioning.as_str(),
+                        data
+                    ],
+                )
+                .db_err(format!("reserve fork pool slot '{machine_name}'"))?;
+            tx.commit().db_err("commit fork slot reservation")?;
+            Ok(changed == 1)
+        })
+    }
+
+    /// Mark a successfully booted held worker ready for acquisition.
+    pub fn mark_fork_pool_slot_ready(&self, machine_name: &str, now: u64) -> Result<bool> {
+        self.update_fork_pool_slot_state(
+            machine_name,
+            ForkPoolSlotState::Provisioning,
+            ForkPoolSlotState::Ready,
+            now,
+            None,
+        )
+    }
+
+    /// Retire a worker after provisioning, activation, expiry, or cancellation.
+    pub fn mark_fork_pool_slot_retiring(
+        &self,
+        machine_name: &str,
+        now: u64,
+        error: Option<String>,
+    ) -> Result<bool> {
+        self.with_conn(|conn| {
+            let tx = conn.transaction().db_err("begin retire fork pool slot")?;
+            let data: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT data FROM fork_pool_slots WHERE machine_name = ?1",
+                    params![machine_name],
+                    |row| row.get(0),
+                )
+                .optional()
+                .db_err(format!("get fork pool slot '{machine_name}'"))?;
+            let Some(data) = data else {
+                tx.commit().db_err("commit missing fork slot retirement")?;
+                return Ok(false);
+            };
+            let mut slot: ForkPoolSlotRecord =
+                serde_json::from_slice(&data).db_err("deserialize fork pool slot")?;
+            slot.state = ForkPoolSlotState::Retiring;
+            slot.updated_at = now;
+            slot.last_error = error;
+            let updated = serde_json::to_vec(&slot).db_err("serialize fork pool slot")?;
+            tx.execute(
+                "UPDATE fork_pool_slots SET state = ?2, data = ?3 WHERE machine_name = ?1",
+                params![machine_name, ForkPoolSlotState::Retiring.as_str(), updated],
+            )
+            .db_err(format!("retire fork pool slot '{machine_name}'"))?;
+            tx.commit().db_err("commit fork slot retirement")?;
+            Ok(true)
+        })
+    }
+
+    fn update_fork_pool_slot_state(
+        &self,
+        machine_name: &str,
+        expected: ForkPoolSlotState,
+        next: ForkPoolSlotState,
+        now: u64,
+        error: Option<String>,
+    ) -> Result<bool> {
+        self.with_conn(|conn| {
+            let tx = conn.transaction().db_err("begin fork pool slot update")?;
+            let data: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT data FROM fork_pool_slots WHERE machine_name = ?1 AND state = ?2",
+                    params![machine_name, expected.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .db_err(format!("get fork pool slot '{machine_name}'"))?;
+            let Some(data) = data else {
+                tx.commit().db_err("commit unchanged fork slot")?;
+                return Ok(false);
+            };
+            let mut slot: ForkPoolSlotRecord =
+                serde_json::from_slice(&data).db_err("deserialize fork pool slot")?;
+            slot.state = next;
+            slot.updated_at = now;
+            slot.last_error = error;
+            let updated = serde_json::to_vec(&slot).db_err("serialize fork pool slot")?;
+            tx.execute(
+                "UPDATE fork_pool_slots SET state = ?2, data = ?3 WHERE machine_name = ?1",
+                params![machine_name, next.as_str(), updated],
+            )
+            .db_err(format!("update fork pool slot '{machine_name}'"))?;
+            tx.commit().db_err("commit fork slot update")?;
+            Ok(true)
+        })
+    }
+
+    /// Atomically consume one held worker and create its idempotent lease.
+    ///
+    /// The VM's `forkpoint_held` bit is cleared in the same transaction as the
+    /// slot claim. A crash after commit can waste this worker, but can never
+    /// make a released workload appear ready for a second caller.
+    pub fn claim_fork_pool_slot(
+        &self,
+        pool_name: &str,
+        lease_id: &str,
+        idempotency_key: &str,
+        assignment: &[(String, String)],
+        ttl_secs: u64,
+        now: u64,
+    ) -> Result<ClaimForkPoolSlot> {
+        self.with_conn(|conn| {
+            let tx = conn.transaction().db_err("begin fork pool claim")?;
+            if let Some(bytes) = tx
+                .query_row(
+                    "SELECT data FROM fork_leases
+                     WHERE pool_name = ?1 AND idempotency_key = ?2",
+                    params![pool_name, idempotency_key],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()
+                .db_err("look up idempotent fork lease")?
+            {
+                let lease = serde_json::from_slice(&bytes).db_err("deserialize fork lease")?;
+                tx.commit().db_err("commit idempotent fork claim")?;
+                return Ok(ClaimForkPoolSlot::Existing(lease));
+            }
+
+            let pool_data: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT data FROM fork_pools WHERE name = ?1",
+                    params![pool_name],
+                    |row| row.get(0),
+                )
+                .optional()
+                .db_err(format!("get fork pool '{pool_name}'"))?;
+            let Some(pool_data) = pool_data else {
+                tx.commit().db_err("commit missing fork pool claim")?;
+                return Ok(ClaimForkPoolSlot::PoolNotFound);
+            };
+            let pool: ForkPoolRecord =
+                serde_json::from_slice(&pool_data).db_err("deserialize fork pool")?;
+            if pool.deleting {
+                tx.commit().db_err("commit deleting fork pool claim")?;
+                return Ok(ClaimForkPoolSlot::PoolDeleting);
+            }
+            if let Some(max_active) = pool.max_active {
+                let active: u32 = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM fork_leases
+                         WHERE pool_name = ?1 AND state IN ('activating', 'active')",
+                        params![pool_name],
+                        |row| row.get(0),
+                    )
+                    .db_err("count active fork leases")?;
+                if active >= max_active {
+                    tx.commit().db_err("commit fork pool capacity check")?;
+                    return Ok(ClaimForkPoolSlot::AtCapacity);
+                }
+            }
+
+            let ready_rows: Vec<(String, Vec<u8>)> = {
+                let mut stmt = tx
+                    .prepare_cached(
+                        "SELECT machine_name, data FROM fork_pool_slots
+                         WHERE pool_name = ?1 AND state = 'ready'
+                         ORDER BY machine_name",
+                    )
+                    .db_err("prepare ready fork slot query")?;
+                let rows = stmt
+                    .query_map(params![pool_name], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .db_err("query ready fork slots")?;
+                let mut collected = Vec::new();
+                for row in rows {
+                    collected.push(row.db_err("read ready fork slot")?);
+                }
+                collected
+            };
+
+            let mut selected = None;
+            for (machine_name, slot_data) in ready_rows {
+                let mut slot: ForkPoolSlotRecord = serde_json::from_slice(&slot_data)
+                    .db_err("deserialize ready fork pool slot")?;
+                let vm_data: Option<Vec<u8>> = tx
+                    .query_row(
+                        "SELECT data FROM vms WHERE name = ?1",
+                        params![machine_name],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .db_err(format!("get pool worker '{machine_name}'"))?;
+                let valid = vm_data
+                    .as_deref()
+                    .map(|bytes| {
+                        serde_json::from_slice::<VmRecord>(bytes)
+                            .map(|vm| {
+                                vm.forkpoint_held
+                                    && vm.golden.as_deref() == Some(pool.golden.as_str())
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if valid {
+                    selected = Some((machine_name, slot, vm_data.expect("valid VM data")));
+                    break;
+                }
+                slot.state = ForkPoolSlotState::Retiring;
+                slot.updated_at = now;
+                slot.last_error = Some("ready slot no longer has a matching held VM".into());
+                let updated =
+                    serde_json::to_vec(&slot).db_err("serialize invalid fork pool slot")?;
+                tx.execute(
+                    "UPDATE fork_pool_slots SET state = 'retiring', data = ?2
+                     WHERE machine_name = ?1",
+                    params![machine_name, updated],
+                )
+                .db_err("retire invalid ready fork slot")?;
+            }
+
+            let Some((machine_name, mut slot, vm_data)) = selected else {
+                tx.commit().db_err("commit no-ready fork claim")?;
+                return Ok(ClaimForkPoolSlot::NoReadySlot);
+            };
+            let mut vm: VmRecord =
+                serde_json::from_slice(&vm_data).db_err("deserialize pool worker")?;
+            let merged = crate::agent::fork::merge_fork_env(&vm.fork_env, assignment);
+            crate::agent::fork::record_fork_activation(&mut vm, assignment, merged);
+            let vm_updated = serde_json::to_vec(&vm).db_err("serialize claimed pool worker")?;
+            tx.execute(
+                "UPDATE vms SET data = ?2 WHERE name = ?1",
+                params![machine_name, vm_updated],
+            )
+            .db_err("consume held pool worker")?;
+
+            slot.state = ForkPoolSlotState::Activating;
+            slot.lease_id = Some(lease_id.to_string());
+            slot.updated_at = now;
+            let slot_updated =
+                serde_json::to_vec(&slot).db_err("serialize claimed fork pool slot")?;
+            tx.execute(
+                "UPDATE fork_pool_slots SET state = 'activating', data = ?2
+                 WHERE machine_name = ?1",
+                params![machine_name, slot_updated],
+            )
+            .db_err("claim fork pool slot")?;
+
+            let lease = ForkLeaseRecord {
+                id: lease_id.to_string(),
+                pool_name: pool_name.to_string(),
+                machine_name,
+                idempotency_key: idempotency_key.to_string(),
+                state: ForkLeaseState::Activating,
+                assignment: assignment.to_vec(),
+                created_at: now,
+                updated_at: now,
+                expires_at: now.saturating_add(ttl_secs),
+                ttl_secs,
+                last_error: None,
+            };
+            let lease_data = serde_json::to_vec(&lease).db_err("serialize fork lease")?;
+            tx.execute(
+                "INSERT INTO fork_leases (id, pool_name, idempotency_key, state, data)
+                 VALUES (?1, ?2, ?3, 'activating', ?4)",
+                params![lease.id, pool_name, idempotency_key, lease_data],
+            )
+            .db_err("insert fork lease")?;
+            tx.commit().db_err("commit fork pool claim")?;
+            Ok(ClaimForkPoolSlot::Claimed(lease))
+        })
+    }
+
+    /// Read one lease by ID, scoped to its pool.
+    pub fn get_fork_lease(
+        &self,
+        pool_name: &str,
+        lease_id: &str,
+    ) -> Result<Option<ForkLeaseRecord>> {
+        self.with_read_conn(|conn| {
+            let data: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT data FROM fork_leases WHERE pool_name = ?1 AND id = ?2",
+                    params![pool_name, lease_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .db_err(format!("get fork lease '{lease_id}'"))?;
+            data.map(|bytes| serde_json::from_slice(&bytes).db_err("deserialize fork lease"))
+                .transpose()
+        })
+    }
+
+    /// Mark a claimed worker active after its guest release succeeds.
+    pub fn mark_fork_lease_active(
+        &self,
+        lease_id: &str,
+        now: u64,
+    ) -> Result<Option<ForkLeaseRecord>> {
+        self.transition_fork_lease(
+            lease_id,
+            ForkLeaseState::Activating,
+            ForkLeaseState::Active,
+            ForkPoolSlotState::Leased,
+            now,
+            None,
+        )
+    }
+
+    /// Fail a lease and retire its consumed worker after activation fails.
+    pub fn fail_fork_lease(
+        &self,
+        lease_id: &str,
+        now: u64,
+        error: String,
+    ) -> Result<Option<ForkLeaseRecord>> {
+        self.transition_fork_lease(
+            lease_id,
+            ForkLeaseState::Activating,
+            ForkLeaseState::Failed,
+            ForkPoolSlotState::Retiring,
+            now,
+            Some(error),
+        )
+    }
+
+    /// Fail an active lease whose worker process exited unexpectedly.
+    pub fn fail_active_fork_lease(
+        &self,
+        lease_id: &str,
+        now: u64,
+        error: String,
+    ) -> Result<Option<ForkLeaseRecord>> {
+        self.transition_fork_lease(
+            lease_id,
+            ForkLeaseState::Active,
+            ForkLeaseState::Failed,
+            ForkPoolSlotState::Retiring,
+            now,
+            Some(error),
+        )
+    }
+
+    fn transition_fork_lease(
+        &self,
+        lease_id: &str,
+        expected: ForkLeaseState,
+        next: ForkLeaseState,
+        slot_next: ForkPoolSlotState,
+        now: u64,
+        error: Option<String>,
+    ) -> Result<Option<ForkLeaseRecord>> {
+        self.with_conn(|conn| {
+            let tx = conn.transaction().db_err("begin fork lease transition")?;
+            let data: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT data FROM fork_leases WHERE id = ?1",
+                    params![lease_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .db_err(format!("get fork lease '{lease_id}'"))?;
+            let Some(data) = data else {
+                tx.commit().db_err("commit missing fork lease transition")?;
+                return Ok(None);
+            };
+            let mut lease: ForkLeaseRecord =
+                serde_json::from_slice(&data).db_err("deserialize fork lease")?;
+            if lease.state != expected {
+                tx.commit().db_err("commit unchanged fork lease")?;
+                return Ok(Some(lease));
+            }
+            lease.state = next;
+            lease.updated_at = now;
+            lease.last_error = error.clone();
+            let updated = serde_json::to_vec(&lease).db_err("serialize fork lease")?;
+            tx.execute(
+                "UPDATE fork_leases SET state = ?2, data = ?3 WHERE id = ?1",
+                params![lease_id, next.as_str(), updated],
+            )
+            .db_err(format!("transition fork lease '{lease_id}'"))?;
+
+            let slot_data: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT data FROM fork_pool_slots WHERE machine_name = ?1",
+                    params![lease.machine_name],
+                    |row| row.get(0),
+                )
+                .optional()
+                .db_err("get leased fork pool slot")?;
+            if let Some(slot_data) = slot_data {
+                let mut slot: ForkPoolSlotRecord = serde_json::from_slice(&slot_data)
+                    .db_err("deserialize leased fork pool slot")?;
+                slot.state = slot_next;
+                slot.updated_at = now;
+                slot.last_error = error;
+                let slot_updated =
+                    serde_json::to_vec(&slot).db_err("serialize leased fork pool slot")?;
+                tx.execute(
+                    "UPDATE fork_pool_slots SET state = ?2, data = ?3 WHERE machine_name = ?1",
+                    params![lease.machine_name, slot_next.as_str(), slot_updated],
+                )
+                .db_err("transition leased fork pool slot")?;
+            }
+            tx.commit().db_err("commit fork lease transition")?;
+            Ok(Some(lease))
+        })
+    }
+
+    /// Extend one active lease using its configured TTL.
+    pub fn heartbeat_fork_lease(
+        &self,
+        pool_name: &str,
+        lease_id: &str,
+        now: u64,
+    ) -> Result<Option<ForkLeaseRecord>> {
+        self.with_conn(|conn| {
+            let tx = conn.transaction().db_err("begin fork lease heartbeat")?;
+            let data: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT data FROM fork_leases WHERE pool_name = ?1 AND id = ?2",
+                    params![pool_name, lease_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .db_err(format!("get fork lease '{lease_id}'"))?;
+            let Some(data) = data else {
+                tx.commit().db_err("commit missing fork lease heartbeat")?;
+                return Ok(None);
+            };
+            let mut lease: ForkLeaseRecord =
+                serde_json::from_slice(&data).db_err("deserialize fork lease")?;
+            if lease.state == ForkLeaseState::Active && lease.expires_at > now {
+                lease.updated_at = now;
+                lease.expires_at = now.saturating_add(lease.ttl_secs);
+                let updated = serde_json::to_vec(&lease).db_err("serialize fork lease")?;
+                tx.execute(
+                    "UPDATE fork_leases SET data = ?2 WHERE id = ?1",
+                    params![lease_id, updated],
+                )
+                .db_err(format!("heartbeat fork lease '{lease_id}'"))?;
+            }
+            tx.commit().db_err("commit fork lease heartbeat")?;
+            Ok(Some(lease))
+        })
+    }
+
+    /// Complete one active lease and retire its one-shot worker.
+    pub fn complete_fork_lease(
+        &self,
+        pool_name: &str,
+        lease_id: &str,
+        now: u64,
+    ) -> Result<Option<ForkLeaseRecord>> {
+        let lease = self.get_fork_lease(pool_name, lease_id)?;
+        let Some(lease) = lease else {
+            return Ok(None);
+        };
+        if lease.state != ForkLeaseState::Active {
+            return Ok(Some(lease));
+        }
+        self.transition_fork_lease(
+            lease_id,
+            ForkLeaseState::Active,
+            ForkLeaseState::Completed,
+            ForkPoolSlotState::Retiring,
+            now,
+            None,
+        )
+    }
+
+    /// Expire overdue active or ambiguous-activation leases and retire workers.
+    pub fn expire_fork_leases(&self, now: u64) -> Result<Vec<ForkLeaseRecord>> {
+        self.with_conn(|conn| {
+            let tx = conn.transaction().db_err("begin fork lease expiry")?;
+            let rows: Vec<Vec<u8>> = {
+                let mut stmt = tx
+                    .prepare_cached(
+                        "SELECT data FROM fork_leases
+                         WHERE state IN ('activating', 'active')",
+                    )
+                    .db_err("prepare expiring fork leases")?;
+                let rows = stmt
+                    .query_map([], |row| row.get(0))
+                    .db_err("query expiring fork leases")?;
+                let mut collected = Vec::new();
+                for row in rows {
+                    collected.push(row.db_err("read expiring fork lease")?);
+                }
+                collected
+            };
+            let mut expired = Vec::new();
+            for data in rows {
+                let mut lease: ForkLeaseRecord =
+                    serde_json::from_slice(&data).db_err("deserialize fork lease")?;
+                if lease.expires_at > now {
+                    continue;
+                }
+                lease.state = ForkLeaseState::Expired;
+                lease.updated_at = now;
+                let updated = serde_json::to_vec(&lease).db_err("serialize expired fork lease")?;
+                tx.execute(
+                    "UPDATE fork_leases SET state = 'expired', data = ?2 WHERE id = ?1",
+                    params![lease.id, updated],
+                )
+                .db_err("expire fork lease")?;
+                if let Some(slot_data) = tx
+                    .query_row(
+                        "SELECT data FROM fork_pool_slots WHERE machine_name = ?1",
+                        params![lease.machine_name],
+                        |row| row.get::<_, Vec<u8>>(0),
+                    )
+                    .optional()
+                    .db_err("get expired lease slot")?
+                {
+                    let mut slot: ForkPoolSlotRecord = serde_json::from_slice(&slot_data)
+                        .db_err("deserialize expired lease slot")?;
+                    slot.state = ForkPoolSlotState::Retiring;
+                    slot.updated_at = now;
+                    let slot_updated =
+                        serde_json::to_vec(&slot).db_err("serialize expired lease slot")?;
+                    tx.execute(
+                        "UPDATE fork_pool_slots SET state = 'retiring', data = ?2
+                         WHERE machine_name = ?1",
+                        params![lease.machine_name, slot_updated],
+                    )
+                    .db_err("retire expired lease slot")?;
+                }
+                expired.push(lease);
+            }
+            tx.commit().db_err("commit fork lease expiry")?;
+            Ok(expired)
+        })
+    }
+
+    /// List active leases for worker-liveness reconciliation.
+    pub fn list_active_fork_leases(&self) -> Result<Vec<ForkLeaseRecord>> {
+        self.with_read_conn(|conn| {
+            let mut stmt = conn
+                .prepare_cached("SELECT data FROM fork_leases WHERE state = 'active'")
+                .db_err("prepare active fork leases")?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, Vec<u8>>(0))
+                .db_err("query active fork leases")?;
+            let mut leases = Vec::new();
+            for row in rows {
+                leases.push(
+                    serde_json::from_slice(&row.db_err("read active fork lease")?)
+                        .db_err("deserialize active fork lease")?,
+                );
+            }
+            Ok(leases)
+        })
+    }
+
+    /// List workers waiting for controller cleanup.
+    pub fn list_retiring_fork_pool_slots(&self) -> Result<Vec<ForkPoolSlotRecord>> {
+        self.with_read_conn(|conn| {
+            let mut stmt = conn
+                .prepare_cached("SELECT data FROM fork_pool_slots WHERE state = 'retiring'")
+                .db_err("prepare retiring fork slots")?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, Vec<u8>>(0))
+                .db_err("query retiring fork slots")?;
+            let mut slots = Vec::new();
+            for row in rows {
+                slots.push(
+                    serde_json::from_slice(&row.db_err("read retiring fork slot")?)
+                        .db_err("deserialize retiring fork slot")?,
+                );
+            }
+            Ok(slots)
+        })
+    }
+
+    /// Forget a slot after its machine and data directory are gone.
+    pub fn remove_fork_pool_slot(&self, machine_name: &str) -> Result<bool> {
+        self.with_conn(|conn| {
+            Ok(conn
+                .execute(
+                    "DELETE FROM fork_pool_slots WHERE machine_name = ?1",
+                    params![machine_name],
+                )
+                .db_err(format!("remove fork pool slot '{machine_name}'"))?
+                == 1)
+        })
+    }
+
+    /// Begin pool deletion and retire its workers atomically.
+    pub fn begin_delete_fork_pool(
+        &self,
+        name: &str,
+        force: bool,
+        now: u64,
+    ) -> Result<Option<bool>> {
+        self.with_conn(|conn| {
+            let tx = conn.transaction().db_err("begin fork pool deletion")?;
+            let data: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT data FROM fork_pools WHERE name = ?1",
+                    params![name],
+                    |row| row.get(0),
+                )
+                .optional()
+                .db_err(format!("get fork pool '{name}'"))?;
+            let Some(data) = data else {
+                tx.commit().db_err("commit missing fork pool deletion")?;
+                return Ok(None);
+            };
+            let active: u32 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM fork_leases
+                     WHERE pool_name = ?1 AND state IN ('activating', 'active')",
+                    params![name],
+                    |row| row.get(0),
+                )
+                .db_err("count active fork leases")?;
+            if active > 0 && !force {
+                tx.commit().db_err("commit refused fork pool deletion")?;
+                return Ok(Some(false));
+            }
+            let mut pool: ForkPoolRecord =
+                serde_json::from_slice(&data).db_err("deserialize fork pool")?;
+            pool.deleting = true;
+            let updated = serde_json::to_vec(&pool).db_err("serialize fork pool")?;
+            tx.execute(
+                "UPDATE fork_pools SET data = ?2 WHERE name = ?1",
+                params![name, updated],
+            )
+            .db_err("mark fork pool deleting")?;
+
+            let slot_rows: Vec<Vec<u8>> = {
+                let mut stmt = tx
+                    .prepare_cached("SELECT data FROM fork_pool_slots WHERE pool_name = ?1")
+                    .db_err("prepare deleting fork pool slots")?;
+                let rows = stmt
+                    .query_map(params![name], |row| row.get(0))
+                    .db_err("query deleting fork pool slots")?;
+                let mut collected = Vec::new();
+                for row in rows {
+                    collected.push(row.db_err("read deleting fork pool slot")?);
+                }
+                collected
+            };
+            for slot_data in slot_rows {
+                let mut slot: ForkPoolSlotRecord = serde_json::from_slice(&slot_data)
+                    .db_err("deserialize deleting fork pool slot")?;
+                slot.state = ForkPoolSlotState::Retiring;
+                slot.updated_at = now;
+                let slot_updated =
+                    serde_json::to_vec(&slot).db_err("serialize deleting fork pool slot")?;
+                tx.execute(
+                    "UPDATE fork_pool_slots SET state = 'retiring', data = ?2
+                     WHERE machine_name = ?1",
+                    params![slot.machine_name, slot_updated],
+                )
+                .db_err("retire deleting fork pool slot")?;
+            }
+            if force {
+                let lease_rows: Vec<Vec<u8>> = {
+                    let mut stmt = tx
+                        .prepare_cached(
+                            "SELECT data FROM fork_leases
+                             WHERE pool_name = ?1 AND state IN ('activating', 'active')",
+                        )
+                        .db_err("prepare cancelled fork leases")?;
+                    let rows = stmt
+                        .query_map(params![name], |row| row.get(0))
+                        .db_err("query cancelled fork leases")?;
+                    let mut collected = Vec::new();
+                    for row in rows {
+                        collected.push(row.db_err("read cancelled fork lease")?);
+                    }
+                    collected
+                };
+                for lease_data in lease_rows {
+                    let mut lease: ForkLeaseRecord = serde_json::from_slice(&lease_data)
+                        .db_err("deserialize cancelled fork lease")?;
+                    lease.state = ForkLeaseState::Cancelled;
+                    lease.updated_at = now;
+                    let lease_updated =
+                        serde_json::to_vec(&lease).db_err("serialize cancelled fork lease")?;
+                    tx.execute(
+                        "UPDATE fork_leases SET state = 'cancelled', data = ?2 WHERE id = ?1",
+                        params![lease.id, lease_updated],
+                    )
+                    .db_err("cancel fork lease")?;
+                }
+            }
+            tx.commit().db_err("commit fork pool deletion")?;
+            Ok(Some(true))
+        })
+    }
+
+    /// Remove fully drained deleting pools and their completed lease history.
+    pub fn finalize_deleted_fork_pools(&self) -> Result<Vec<String>> {
+        self.with_conn(|conn| {
+            let tx = conn.transaction().db_err("begin finalize fork pools")?;
+            let pool_rows: Vec<(String, Vec<u8>)> = {
+                let mut stmt = tx
+                    .prepare_cached("SELECT name, data FROM fork_pools")
+                    .db_err("prepare finalizing fork pools")?;
+                let rows = stmt
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .db_err("query finalizing fork pools")?;
+                let mut collected = Vec::new();
+                for row in rows {
+                    collected.push(row.db_err("read finalizing fork pool")?);
+                }
+                collected
+            };
+            let mut removed = Vec::new();
+            for (name, data) in pool_rows {
+                let pool: ForkPoolRecord =
+                    serde_json::from_slice(&data).db_err("deserialize fork pool")?;
+                if !pool.deleting {
+                    continue;
+                }
+                let slots: u32 = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM fork_pool_slots WHERE pool_name = ?1",
+                        params![name],
+                        |row| row.get(0),
+                    )
+                    .db_err("count draining fork pool slots")?;
+                if slots == 0 {
+                    tx.execute(
+                        "DELETE FROM fork_leases WHERE pool_name = ?1",
+                        params![name],
+                    )
+                    .db_err("remove deleted fork pool leases")?;
+                    tx.execute("DELETE FROM fork_pools WHERE name = ?1", params![name])
+                        .db_err("remove deleted fork pool")?;
+                    removed.push(name);
+                }
+            }
+            tx.commit().db_err("commit finalize fork pools")?;
+            Ok(removed)
         })
     }
 
@@ -940,5 +1955,311 @@ mod tests {
 
         let vms = db.list_vms().unwrap();
         assert_eq!(vms.len(), 1);
+    }
+
+    fn test_pool(name: &str, desired_ready: u32) -> ForkPoolRecord {
+        ForkPoolRecord {
+            name: name.into(),
+            golden: "golden".into(),
+            desired_ready,
+            max_active: None,
+            share_weights: true,
+            ready_timeout_secs: 30,
+            lease_ttl_secs: 60,
+            created_at: 100,
+            deleting: false,
+        }
+    }
+
+    fn insert_ready_pool_slot(db: &SmolvmDb, pool: &str, machine: &str) {
+        let mut vm = VmRecord::new(machine.into(), 2, 1024, vec![], vec![], false);
+        vm.golden = Some("golden".into());
+        vm.forkpoint_held = true;
+        vm.fork_env = vec![("BASE".into(), "1".into())];
+        db.insert_vm(machine, &vm).unwrap();
+        assert!(db.reserve_fork_pool_slot(pool, machine, 101).unwrap());
+        assert!(db.mark_fork_pool_slot_ready(machine, 102).unwrap());
+    }
+
+    #[test]
+    fn fork_pool_reservation_honors_desired_ready() {
+        let (_dir, db) = temp_db();
+        assert!(db
+            .insert_fork_pool_if_not_exists(&test_pool("rollouts", 2))
+            .unwrap());
+        assert!(!db
+            .insert_fork_pool_if_not_exists(&test_pool("rollouts", 2))
+            .unwrap());
+        assert!(db.reserve_fork_pool_slot("rollouts", "slot-1", 1).unwrap());
+        assert!(db.reserve_fork_pool_slot("rollouts", "slot-2", 1).unwrap());
+        assert!(!db.reserve_fork_pool_slot("rollouts", "slot-3", 1).unwrap());
+        assert_eq!(db.list_fork_pool_slots("rollouts").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn shrinking_fork_pool_retires_surplus_ready_workers() {
+        let (_dir, db) = temp_db();
+        db.insert_fork_pool_if_not_exists(&test_pool("rollouts", 3))
+            .unwrap();
+        for machine in ["slot-1", "slot-2", "slot-3"] {
+            insert_ready_pool_slot(&db, "rollouts", machine);
+        }
+        let resized = db.resize_fork_pool("rollouts", 1, 200).unwrap().unwrap();
+        assert_eq!(resized.desired_ready, 1);
+        let slots = db.list_fork_pool_slots("rollouts").unwrap();
+        assert_eq!(
+            slots
+                .iter()
+                .filter(|slot| slot.state == ForkPoolSlotState::Ready)
+                .count(),
+            1
+        );
+        assert_eq!(
+            slots
+                .iter()
+                .filter(|slot| slot.state == ForkPoolSlotState::Retiring)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn fork_pool_claim_is_idempotent_and_consumes_vm_atomically() {
+        let (_dir, db) = temp_db();
+        db.insert_fork_pool_if_not_exists(&test_pool("rollouts", 1))
+            .unwrap();
+        insert_ready_pool_slot(&db, "rollouts", "slot-1");
+        let assignment = vec![("EPISODE".into(), "42".into())];
+
+        let first = db
+            .claim_fork_pool_slot("rollouts", "lease-a", "request-a", &assignment, 60, 200)
+            .unwrap();
+        let lease = match first {
+            ClaimForkPoolSlot::Claimed(lease) => lease,
+            other => panic!("unexpected claim result: {other:?}"),
+        };
+        assert_eq!(lease.machine_name, "slot-1");
+        let vm = db.get_vm("slot-1").unwrap().unwrap();
+        assert!(!vm.forkpoint_held);
+        assert!(vm
+            .fork_env
+            .iter()
+            .any(|(key, value)| key == "EPISODE" && value == "42"));
+
+        let retry = db
+            .claim_fork_pool_slot(
+                "rollouts",
+                "unused-new-id",
+                "request-a",
+                &assignment,
+                60,
+                201,
+            )
+            .unwrap();
+        assert!(matches!(
+            retry,
+            ClaimForkPoolSlot::Existing(ref existing) if existing.id == "lease-a"
+        ));
+        let second_request = db
+            .claim_fork_pool_slot("rollouts", "lease-b", "request-b", &assignment, 60, 201)
+            .unwrap();
+        assert_eq!(second_request, ClaimForkPoolSlot::NoReadySlot);
+    }
+
+    #[test]
+    fn concurrent_idempotent_claims_return_one_lease() {
+        let (_dir, db) = temp_db();
+        db.insert_fork_pool_if_not_exists(&test_pool("rollouts", 1))
+            .unwrap();
+        insert_ready_pool_slot(&db, "rollouts", "slot-1");
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let handles: Vec<_> = ["lease-a", "lease-b"]
+            .into_iter()
+            .map(|lease_id| {
+                let db = db.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    db.claim_fork_pool_slot(
+                        "rollouts",
+                        lease_id,
+                        "same-request",
+                        &[("EPISODE".into(), "42".into())],
+                        60,
+                        200,
+                    )
+                    .unwrap()
+                })
+            })
+            .collect();
+        barrier.wait();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, ClaimForkPoolSlot::Claimed(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, ClaimForkPoolSlot::Existing(_)))
+                .count(),
+            1
+        );
+        let ids: Vec<_> = results
+            .iter()
+            .map(|result| match result {
+                ClaimForkPoolSlot::Claimed(lease) | ClaimForkPoolSlot::Existing(lease) => {
+                    lease.id.as_str()
+                }
+                other => panic!("unexpected result: {other:?}"),
+            })
+            .collect();
+        assert_eq!(ids[0], ids[1]);
+    }
+
+    #[test]
+    fn fork_pool_max_active_preserves_ready_capacity() {
+        let (_dir, db) = temp_db();
+        let mut pool = test_pool("rollouts", 2);
+        pool.max_active = Some(1);
+        db.insert_fork_pool_if_not_exists(&pool).unwrap();
+        insert_ready_pool_slot(&db, "rollouts", "slot-1");
+        insert_ready_pool_slot(&db, "rollouts", "slot-2");
+        db.claim_fork_pool_slot("rollouts", "lease-1", "request-1", &[], 60, 200)
+            .unwrap();
+        db.mark_fork_lease_active("lease-1", 201).unwrap();
+
+        assert_eq!(
+            db.claim_fork_pool_slot("rollouts", "lease-2", "request-2", &[], 60, 202)
+                .unwrap(),
+            ClaimForkPoolSlot::AtCapacity
+        );
+        assert_eq!(
+            db.list_fork_pool_slots("rollouts")
+                .unwrap()
+                .into_iter()
+                .filter(|slot| slot.state == ForkPoolSlotState::Ready)
+                .count(),
+            1,
+            "capacity rejection must not consume a clean worker"
+        );
+        assert!(matches!(
+            db.claim_fork_pool_slot("rollouts", "ignored", "request-1", &[], 60, 203)
+                .unwrap(),
+            ClaimForkPoolSlot::Existing(lease) if lease.id == "lease-1"
+        ));
+    }
+
+    #[test]
+    fn fork_lease_heartbeat_completion_and_expiry_retire_workers() {
+        let (_dir, db) = temp_db();
+        db.insert_fork_pool_if_not_exists(&test_pool("rollouts", 2))
+            .unwrap();
+        insert_ready_pool_slot(&db, "rollouts", "slot-complete");
+        insert_ready_pool_slot(&db, "rollouts", "slot-expire");
+
+        for (machine, lease, request) in [
+            ("slot-complete", "lease-complete", "req-complete"),
+            ("slot-expire", "lease-expire", "req-expire"),
+        ] {
+            let claimed = db
+                .claim_fork_pool_slot("rollouts", lease, request, &[], 10, 200)
+                .unwrap();
+            assert!(
+                matches!(claimed, ClaimForkPoolSlot::Claimed(ref l) if l.machine_name == machine)
+            );
+            let active = db.mark_fork_lease_active(lease, 201).unwrap().unwrap();
+            assert_eq!(active.state, ForkLeaseState::Active);
+        }
+
+        let heartbeat = db
+            .heartbeat_fork_lease("rollouts", "lease-complete", 205)
+            .unwrap()
+            .unwrap();
+        assert_eq!(heartbeat.expires_at, 215);
+        let completed = db
+            .complete_fork_lease("rollouts", "lease-complete", 206)
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.state, ForkLeaseState::Completed);
+
+        let expired = db.expire_fork_leases(211).unwrap();
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].id, "lease-expire");
+        assert_eq!(expired[0].state, ForkLeaseState::Expired);
+        let retiring = db.list_retiring_fork_pool_slots().unwrap();
+        assert_eq!(retiring.len(), 2);
+    }
+
+    #[test]
+    fn fork_pool_state_survives_database_reopen() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pool.db");
+        let db = SmolvmDb::open_at(&path).unwrap();
+        db.insert_fork_pool_if_not_exists(&test_pool("durable", 1))
+            .unwrap();
+        insert_ready_pool_slot(&db, "durable", "slot-durable");
+        drop(db);
+
+        let reopened = SmolvmDb::open_at(&path).unwrap();
+        let pool = reopened.get_fork_pool("durable").unwrap().unwrap();
+        assert_eq!(pool.desired_ready, 1);
+        let slots = reopened.list_fork_pool_slots("durable").unwrap();
+        assert_eq!(slots[0].state, ForkPoolSlotState::Ready);
+    }
+
+    #[test]
+    fn fork_pool_delete_refuses_active_lease_without_force() {
+        let (_dir, db) = temp_db();
+        db.insert_fork_pool_if_not_exists(&test_pool("rollouts", 1))
+            .unwrap();
+        insert_ready_pool_slot(&db, "rollouts", "slot-1");
+        db.claim_fork_pool_slot("rollouts", "lease-1", "request-1", &[], 60, 200)
+            .unwrap();
+        db.mark_fork_lease_active("lease-1", 201).unwrap();
+
+        assert_eq!(
+            db.begin_delete_fork_pool("rollouts", false, 202).unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            db.begin_delete_fork_pool("rollouts", true, 203).unwrap(),
+            Some(true)
+        );
+        let lease = db.get_fork_lease("rollouts", "lease-1").unwrap().unwrap();
+        assert_eq!(lease.state, ForkLeaseState::Cancelled);
+        assert_eq!(
+            db.list_fork_pool_slots("rollouts").unwrap()[0].state,
+            ForkPoolSlotState::Retiring
+        );
+    }
+
+    #[test]
+    fn dead_active_worker_failure_is_terminal_and_retired() {
+        let (_dir, db) = temp_db();
+        db.insert_fork_pool_if_not_exists(&test_pool("rollouts", 1))
+            .unwrap();
+        insert_ready_pool_slot(&db, "rollouts", "slot-1");
+        db.claim_fork_pool_slot("rollouts", "lease-1", "request-1", &[], 60, 200)
+            .unwrap();
+        db.mark_fork_lease_active("lease-1", 201).unwrap();
+
+        let failed = db
+            .fail_active_fork_lease("lease-1", 202, "worker exited".into())
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.state, ForkLeaseState::Failed);
+        assert_eq!(failed.last_error.as_deref(), Some("worker exited"));
+        assert!(db.list_active_fork_leases().unwrap().is_empty());
+        assert_eq!(
+            db.get_fork_pool_slot("slot-1").unwrap().unwrap().state,
+            ForkPoolSlotState::Retiring
+        );
     }
 }
