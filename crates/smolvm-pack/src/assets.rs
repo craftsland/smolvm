@@ -154,6 +154,14 @@ fn decompress_sparse(src: &Path, dest: &Path) -> std::io::Result<()> {
     use std::io::Read as _;
 
     let file = File::create(dest)?;
+    // On Windows/NTFS, File::create makes a non-sparse file: seeking past the
+    // zero runs and set_len-ing to the full 20 GiB would allocate and zero-fill
+    // the whole gap, ballooning the template to its full logical size on disk.
+    // Mark it sparse first so only the written extents consume space — matching
+    // the implicit sparse behavior the seek/set_len path already gets on ext4
+    // and APFS.
+    #[cfg(windows)]
+    crate::extract::mark_file_sparse(&file)?;
     let mut out = std::io::BufWriter::new(file);
 
     let mut decoder = zstd::Decoder::new(File::open(src)?)?;
@@ -1106,6 +1114,44 @@ mod template_expand_tests {
             meta.blocks() < dense / 4,
             "expected a sparse file, got {} blocks vs {dense} if dense",
             meta.blocks()
+        );
+    }
+
+    /// The same guarantee on Windows/NTFS, where holes exist only after the file
+    /// is explicitly marked sparse — the plain seek/set_len path leaves it dense.
+    /// `GetCompressedFileSizeW` reports the bytes actually allocated on disk, so a
+    /// sparse expansion reads far below the logical size while a dense one matches
+    /// it. Cross-compilation cannot exercise this; it needs a native Windows run.
+    #[cfg(windows)]
+    #[test]
+    fn the_hole_is_left_unallocated() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::GetCompressedFileSizeW;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("t.ext4.zst");
+        let dest = tmp.path().join("t.ext4");
+        let data = template_bytes();
+        compress_to(&src, &data);
+
+        materialize_template(&src, &dest).expect("materialize");
+
+        assert_eq!(
+            fs::metadata(&dest).expect("stat").len(),
+            data.len() as u64,
+            "logical size must match"
+        );
+
+        let wide: Vec<u16> = dest.as_os_str().encode_wide().chain([0]).collect();
+        let mut high: u32 = 0;
+        // SAFETY: `wide` is a valid NUL-terminated path; `high` is a valid out ptr.
+        let low = unsafe { GetCompressedFileSizeW(wide.as_ptr(), &mut high) };
+        assert_ne!(low, u32::MAX, "GetCompressedFileSizeW failed");
+        let on_disk = ((high as u64) << 32) | low as u64;
+        assert!(
+            on_disk < data.len() as u64 / 4,
+            "expected a sparse file, got {on_disk} bytes on disk vs {} logical",
+            data.len()
         );
     }
 

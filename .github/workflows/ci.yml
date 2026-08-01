@@ -318,6 +318,36 @@ jobs:
         run: cargo clippy --release --target x86_64-pc-windows-gnu --all-targets -- -D warnings
 
   # ==========================================================================
+  # Windows native unit tests (real NTFS, not cross-compiled)
+  # ==========================================================================
+  # The cross job above only builds + lints; it cannot exercise filesystem
+  # behavior. Sparse-file expansion of the disk templates depends on NTFS
+  # semantics (a file is only sparse after FSCTL_SET_SPARSE), which a Linux
+  # cross-build silently gets wrong. This job runs the pack unit tests on a
+  # real Windows runner so that class of regression is caught in CI.
+  windows-native-test:
+    name: Windows (x86_64, native tests)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: windows-msvc-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: windows-msvc-cargo-
+
+      - name: Pack unit tests (native NTFS)
+        run: cargo test -p smolvm-pack --lib
+
+  # ==========================================================================
   # Build agent (Linux musl for static binary)
   # ==========================================================================
   agent:

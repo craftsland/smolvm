@@ -3272,6 +3272,9 @@ mod tests {
         assert!(!dest.join("unknown-type-entry").exists());
     }
 
+    // Sets directory mtimes via libc::utimes to drive the LRU ordering, so it
+    // only compiles on Unix; the eviction logic under test is platform-agnostic.
+    #[cfg(unix)]
     #[test]
     fn test_evict_cache_to_size_lru() {
         use std::ffi::CString;
@@ -3307,6 +3310,7 @@ mod tests {
         assert!(mid.exists() && new.exists(), "newer extractions kept");
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_evict_cache_protects_current_extraction() {
         use std::ffi::CString;
