@@ -5,9 +5,8 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
-use crate::api::handlers::machines::{delete_one, fork_machine_inner};
+use crate::api::handlers::machines::{delete_one, fork_held_machines_inner};
 use crate::api::state::ApiState;
-use crate::api::types::ForkRequest;
 use crate::pool::{ForkPoolRecord, ForkPoolSlotState};
 
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
@@ -307,8 +306,9 @@ impl ForkPoolController {
 
     async fn fill_pool(state: Arc<ApiState>, pool: ForkPoolRecord) {
         // Bound each pool's work so a large cold fill cannot starve expiry and
-        // cleanup for every other pool. Successful ticks still add several
-        // workers, while failures stop immediately to avoid a tight loop.
+        // cleanup for every other pool. Reserve the bounded deficit first so all
+        // workers in this tick can share one golden checkpoint.
+        let mut machines = Vec::new();
         for _ in 0..MAX_PROVISIONS_PER_POOL_TICK {
             let suffix = crate::util::generate_short_id();
             // Pool names are validated ASCII. Keep room for `pool-`, `-`, and
@@ -341,18 +341,33 @@ impl ForkPoolController {
             if !reserved {
                 break;
             }
+            machines.push(machine);
+        }
+        if machines.is_empty() {
+            return;
+        }
 
-            let request = ForkRequest {
-                name: machine.clone(),
-                ports: Vec::new(),
-                share_weights: pool.share_weights,
-                wait_ready: true,
-                hold: true,
-                ready_timeout_secs: Some(pool.ready_timeout_secs),
-                env: Vec::new(),
-                secrets: Default::default(),
-            };
-            match fork_machine_inner(state.clone(), pool.golden.clone(), request).await {
+        let results = match fork_held_machines_inner(
+            state.clone(),
+            pool.golden.clone(),
+            machines.clone(),
+            pool.share_weights,
+            Duration::from_secs(pool.ready_timeout_secs),
+        )
+        .await
+        {
+            Ok(results) => results,
+            Err(error) => {
+                tracing::warn!(pool = %pool.name, error = ?error, workers = machines.len(), "failed to prepare fork pool worker batch");
+                for machine in machines {
+                    Self::retire_failed_provision(&state, machine, format!("{error:?}")).await;
+                }
+                return;
+            }
+        };
+
+        for (machine, result) in results {
+            let retirement_reason = match result {
                 Ok(info) if info.forkpoint_held => {
                     let db = state.db().clone();
                     let machine_ready = machine.clone();
@@ -366,53 +381,44 @@ impl ForkPoolController {
                     {
                         Ok(Ok(true)) => {
                             tracing::info!(pool = %pool.name, machine = %machine, "fork pool worker ready");
-                            // Continue immediately until the durable target says
-                            // no more capacity is needed.
                             continue;
                         }
                         Ok(Ok(false)) => {
                             tracing::info!(pool = %pool.name, machine = %machine, "pool changed while worker was provisioning; retiring worker");
+                            "pool changed while worker was provisioning".into()
                         }
                         Ok(Err(error)) => {
                             tracing::warn!(pool = %pool.name, machine = %machine, %error, "failed to mark fork pool worker ready");
+                            error.to_string()
                         }
                         Err(error) => {
                             tracing::warn!(pool = %pool.name, machine = %machine, %error, "fork pool ready task failed");
+                            error.to_string()
                         }
                     }
                 }
                 Ok(_) => {
                     tracing::warn!(pool = %pool.name, machine = %machine, "forked pool worker was not held");
+                    "forked pool worker was not held".into()
                 }
                 Err(error) => {
                     tracing::warn!(pool = %pool.name, machine = %machine, error = ?error, "failed to provision fork pool worker");
-                    let db = state.db().clone();
-                    let machine_retiring = machine.clone();
-                    let message = format!("{error:?}");
-                    let _ = tokio::task::spawn_blocking(move || {
-                        db.mark_fork_pool_slot_retiring(
-                            &machine_retiring,
-                            crate::util::current_timestamp(),
-                            Some(message),
-                        )
-                    })
-                    .await;
-                    // Avoid a tight failure loop when the golden is not ready.
-                    break;
+                    format!("{error:?}")
                 }
-            }
-
-            let db = state.db().clone();
-            let machine_retiring = machine;
-            let _ = tokio::task::spawn_blocking(move || {
-                db.mark_fork_pool_slot_retiring(
-                    &machine_retiring,
-                    crate::util::current_timestamp(),
-                    Some("worker could not enter ready state".into()),
-                )
-            })
-            .await;
-            break;
+            };
+            Self::retire_failed_provision(&state, machine, retirement_reason).await;
         }
+    }
+
+    async fn retire_failed_provision(state: &Arc<ApiState>, machine: String, message: String) {
+        let db = state.db().clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            db.mark_fork_pool_slot_retiring(
+                &machine,
+                crate::util::current_timestamp(),
+                Some(message),
+            )
+        })
+        .await;
     }
 }

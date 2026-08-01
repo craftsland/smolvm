@@ -1369,6 +1369,122 @@ pub(crate) async fn fork_machine_inner(
         .map_err(classify_fork_error)?
     };
 
+    boot_prepared_fork_inner(
+        state,
+        clone,
+        prep,
+        req_share_weights,
+        fork_env,
+        wait_ready,
+        req_hold,
+    )
+    .await
+}
+
+/// Prepare several clean held workers from one golden checkpoint and boot them
+/// concurrently. Preparation is all-or-nothing; once booting begins, successful
+/// workers remain usable and each failed worker is reported independently.
+pub(crate) async fn fork_held_machines_inner(
+    state: Arc<ApiState>,
+    golden: String,
+    clones: Vec<String>,
+    share_weights: bool,
+    ready_timeout: std::time::Duration,
+) -> Result<Vec<(String, Result<MachineInfo, ApiError>)>, ApiError> {
+    if clones.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let golden_for_wait = golden.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::agent::fork::wait_for_forkpoint(&golden_for_wait, ready_timeout)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("task error: {e}")))?
+    .map_err(classify_fork_error)?;
+
+    // Keep every clone lifecycle locked through registration and boot. Names are
+    // sorted so this remains deadlock-free if another internal batch ever
+    // overlaps it; pool-generated names are unique in normal operation.
+    let mut lock_names = clones.clone();
+    lock_names.sort();
+    lock_names.dedup();
+    let mut guards = Vec::with_capacity(lock_names.len());
+    for clone in &lock_names {
+        guards.push(state.lifecycle_lock(clone).lock_owned().await);
+    }
+
+    let prepared = {
+        let db = state.db().clone();
+        let golden_for_prep = golden.clone();
+        let clones_for_prep = clones.clone();
+        tokio::task::spawn_blocking(move || {
+            let empty_secrets = std::collections::BTreeMap::new();
+            let specs: Vec<_> = clones_for_prep
+                .iter()
+                .map(|clone| crate::agent::fork::ForkSpec {
+                    clone,
+                    pinned_ports: &[],
+                    clone_forkable: false,
+                    fork_env: &[],
+                    fork_secrets: &empty_secrets,
+                    hold: true,
+                })
+                .collect();
+            crate::agent::fork::prepare_forks(&db, &golden_for_prep, &specs)
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("task error: {e}")))?
+        .map_err(classify_fork_error)?
+    };
+
+    let snapshot_dir = prepared[0].snapshot_dir.clone();
+    let resume_golden_on_rollback = prepared[0].resume_golden_on_rollback;
+    let boots = prepared.into_iter().zip(clones).map(|(prep, clone)| {
+        let state = state.clone();
+        async move {
+            let result = boot_prepared_fork_inner(
+                state,
+                clone.clone(),
+                prep,
+                share_weights,
+                Vec::new(),
+                true,
+                true,
+            )
+            .await;
+            (clone, result)
+        }
+    });
+    let results = futures_util::future::join_all(boots).await;
+
+    // If every restore failed, no clone depends on this checkpoint and an
+    // initially-running golden can safely resume for a later retry. A partial
+    // success must retain the paused golden and shared snapshot.
+    if results.iter().all(|(_, result)| result.is_err()) {
+        if let Err(error) = std::fs::remove_dir_all(&snapshot_dir) {
+            tracing::warn!(path = %snapshot_dir.display(), %error, "failed to remove unused batch fork snapshot");
+        }
+        if resume_golden_on_rollback {
+            if let Err(error) = crate::agent::fork::resume_golden(&golden) {
+                tracing::warn!(%golden, %error, "failed to resume golden after batch restore failure");
+            }
+        }
+    }
+
+    drop(guards);
+    Ok(results)
+}
+
+async fn boot_prepared_fork_inner(
+    state: Arc<ApiState>,
+    clone: String,
+    prep: crate::agent::fork::PreparedFork,
+    share_weights: bool,
+    fork_env: Vec<(String, String)>,
+    wait_ready: bool,
+    hold: bool,
+) -> Result<MachineInfo, ApiError> {
     // Phase 2: boot the clone from the golden's in-memory snapshot (warm — its
     // processes are already running in the restored RAM, so unlike a cold start
     // there is no image workload to launch), then rejuvenate its identity.
@@ -1392,7 +1508,7 @@ pub(crate) async fn fork_machine_inner(
         .map_err(|e| format!("failed to prepare packed layers: {}", e))?;
         // Boot from the golden's snapshot instead of cold-booting.
         features.snapshot_dir = Some(prep.snapshot_dir);
-        features.cuda_share_weights = req_share_weights;
+        features.cuda_share_weights = share_weights;
         features.cuda_fork_pool_size = record.cuda_fork_pool_size;
         features.cuda_vram_limit_mib = record.cuda_vram_limit_mib;
 
@@ -1426,7 +1542,7 @@ pub(crate) async fn fork_machine_inner(
             teardown,
         )
         .map_err(|e| format!("fork env delivery failed: {}", e))?;
-        if wait_ready && !req_hold {
+        if wait_ready && !hold {
             crate::agent::fork::fail_closed_on_rejuvenation(
                 crate::agent::fork::release_forkpoint(&clone_b),
                 teardown,
