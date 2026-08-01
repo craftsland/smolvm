@@ -2114,6 +2114,40 @@ pub async fn export_machine(
     }))
 }
 
+/// True if `host` is a loopback, link-local, or private-range address — an
+/// SSRF-prone pull destination on a fleet node (its own `127.0.0.1` services, the
+/// cloud metadata endpoint at `169.254.169.254`, or a neighbour on the private
+/// network). Hostnames that are not IP literals return false (a DNS-rebind to a
+/// private address is a residual not covered here).
+fn is_ssrf_prone_registry_host(host: &str) -> bool {
+    // localhost / 127.0.0.0/8 / ::1 / 0.0.0.0 — reuse the registry classifier.
+    if smolvm_registry::is_local_registry(host) {
+        return true;
+    }
+    // Extract the bare host (strip IPv6 brackets and any :port), then classify it
+    // only if it parses as an IP literal.
+    let bare = if let Some(rest) = host.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else if host.matches(':').count() == 1 {
+        host.split(':').next().unwrap_or(host)
+    } else {
+        host
+    };
+    match bare.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => {
+            v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()
+        }
+        Ok(std::net::IpAddr::V6(v6)) => {
+            let first = v6.segments()[0];
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (first & 0xffc0) == 0xfe80 // link-local fe80::/10
+                || (first & 0xfe00) == 0xfc00 // unique-local fc00::/7
+        }
+        Err(_) => false,
+    }
+}
+
 async fn pull_from_registry(
     registry_ref: &str,
     identity_token: Option<&str>,
@@ -2152,6 +2186,18 @@ pub(crate) async fn pull_smolmachine(
         "docker.io" => "registry-1.docker.io",
         h => h,
     };
+
+    // A control-plane tenant pull (identity_token present) must never target a
+    // loopback/link-local/private-range host: on a fleet node that is an SSRF
+    // pivot into node-local services, not a real registry. Local dev (no token)
+    // is unaffected, and legitimate tenant pulls resolve public registries.
+    if identity_token.is_some() && is_ssrf_prone_registry_host(api_host) {
+        return Err(ApiError::BadRequest(format!(
+            "registry host '{}' is a private/loopback address and is not permitted for tenant image pulls",
+            api_host
+        )));
+    }
+
     let base_url = if smolvm_registry::is_local_registry(api_host) {
         format!("http://{}", api_host)
     } else {
@@ -2239,6 +2285,39 @@ mod tests {
     use super::*;
     use crate::db::SmolvmDb;
     use tempfile::TempDir;
+
+    #[test]
+    fn ssrf_prone_registry_host_flags_loopback_linklocal_and_private() {
+        for host in [
+            "127.0.0.1:8081",
+            "localhost:5000",
+            "0.0.0.0",
+            "169.254.169.254", // cloud metadata
+            "10.0.0.5",
+            "172.16.4.4",
+            "192.168.1.10",
+            "[::1]:5000",
+            "[fe80::1]",
+            "[fc00::1]:443",
+        ] {
+            assert!(
+                is_ssrf_prone_registry_host(host),
+                "{host} should be flagged"
+            );
+        }
+        for host in [
+            "registry-1.docker.io",
+            "registry.smolmachines.com",
+            "ghcr.io",
+            "8.8.8.8",
+            "203.0.113.7:5000",
+        ] {
+            assert!(
+                !is_ssrf_prone_registry_host(host),
+                "{host} should NOT be flagged"
+            );
+        }
+    }
 
     #[test]
     fn export_stub_path_is_not_the_sidecar_name() {
