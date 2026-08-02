@@ -1107,11 +1107,12 @@ impl RunCmd {
             // Auth gate: resolve + authorize the image on the HOST before baking
             // or serving a cached bake. A private image the caller cannot pull is
             // rejected here — the same registry-authorization gate the cloud path
-            // uses, so caching never bypasses pull authorization. Anonymous auth
-            // covers public images; docker-config credentials are a follow-up.
+            // uses, so caching never bypasses pull authorization. `FromConfig`
+            // reads the local docker-config credentials (so `docker login`ed
+            // private images resolve); anonymous is the fallback for public ones.
             if self.oci_cache {
                 if let Some(image) = params.image.as_deref() {
-                    let auth = smolvm::image_store::PullAuth::anonymous();
+                    let auth = smolvm::registry::PullAuth::FromConfig;
                     let rt = tokio::runtime::Runtime::new()
                         .map_err(|e| Error::config("oci-cache", e.to_string()))?;
                     let digest =

@@ -1485,48 +1485,20 @@ async fn run_inspect(
 }
 
 /// Build a `RegistryClient` from a registry hostname, applying auth from config.
+///
+/// Delegates to the shared [`smolvm::registry::registry_client`] gate with the
+/// `FromConfig` credential source so pack push/pull and the OCI image cache
+/// authorize through one identical code path (docker-config → identity token /
+/// direct bearer / Basic, plus the docker.io API-host rewrite and mirrors).
 fn build_registry_client(
     registry: &str,
     config: &smolvm::registry::RegistryConfig,
 ) -> smolvm::Result<smolvm_registry::RegistryClient> {
-    let effective = config.get_mirror(registry).unwrap_or(registry);
-
-    // Docker Hub: the user-facing name is "docker.io" but the Distribution API
-    // endpoint is "registry-1.docker.io". The config key stays "docker.io" so
-    // credential lookup is consistent; only the HTTP endpoint changes.
-    let api_host = match effective {
-        "docker.io" => "registry-1.docker.io",
-        h => h,
-    };
-
-    let base_url = if smolvm_registry::is_local_registry(api_host) {
-        format!("http://{}", api_host)
-    } else {
-        format!("https://{}", api_host)
-    };
-
-    let mut client = smolvm_registry::RegistryClient::new(base_url);
-
-    if let Some(entry) = config.registries.get(registry) {
-        if let Some(identity_token) = &entry.identity_token {
-            // Upstream credential (e.g. Auth0 JWT): exchanged with the token service
-            // per-operation to obtain a short-lived OCI bearer token.
-            client = client.with_identity_token(identity_token.clone());
-        } else if let Some(auth) = config.get_credentials(registry) {
-            if auth.username == "token" {
-                // Legacy direct-bearer convention: username="token" means the
-                // password value IS the bearer token, sent on every request.
-                client = client.with_token(auth.password);
-            } else {
-                // Standard Docker/OCI path: username+password are sent as Basic auth
-                // to the registry's token endpoint after a 401 Bearer challenge.
-                // Used for Docker Hub, GHCR, ECR, GCR, ACR, Harbor, and Quay.
-                client = client.with_basic_credentials(auth.username, auth.password);
-            }
-        }
-    }
-
-    Ok(client)
+    Ok(smolvm::registry::registry_client(
+        registry,
+        config,
+        &smolvm::registry::PullAuth::FromConfig,
+    ))
 }
 
 /// Format a byte count as a human-readable string (KB for < 1 MB, MB otherwise).

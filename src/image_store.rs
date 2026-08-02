@@ -14,41 +14,8 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-use crate::registry::Reference;
+use crate::registry::{registry_client, PullAuth, Reference};
 use crate::{Error, Result};
-
-/// Credentials a caller presents to authorize a pull. Locally this is the user's
-/// docker-config token (or nothing, for anonymous public pulls); on the cloud it
-/// is the control-plane-minted per-tenant `registry_identity_token` that already
-/// flows to the node. The value only decides authorization — never the cache key.
-#[derive(Clone, Default)]
-pub struct PullAuth {
-    /// Bearer token sent directly to the registry (a pre-minted scoped token).
-    pub bearer: Option<String>,
-    /// Identity/refresh token exchanged at the registry's auth service after a
-    /// `WWW-Authenticate: Bearer` challenge.
-    pub identity_token: Option<String>,
-}
-
-impl PullAuth {
-    /// Anonymous — used for public images with no credentials.
-    pub fn anonymous() -> Self {
-        Self::default()
-    }
-
-    fn apply(
-        &self,
-        mut client: smolvm_registry::RegistryClient,
-    ) -> smolvm_registry::RegistryClient {
-        if let Some(t) = &self.bearer {
-            client = client.with_token(t.clone());
-        }
-        if let Some(t) = &self.identity_token {
-            client = client.with_identity_token(t.clone());
-        }
-        client
-    }
-}
 
 /// A content-addressed OCI image store rooted at a shared directory. On a node
 /// this is the same `_shared` tree used by packs, so images and packs dedup in
@@ -76,31 +43,12 @@ impl ImageStore {
     /// the cache is consulted, so a cache hit cannot leak an image the caller is
     /// not authorized to pull.
     pub async fn ensure_image(&self, reference: &str, auth: &PullAuth) -> Result<PathBuf> {
-        let parsed = Reference::parse(reference)
-            .map_err(|e| Error::config("image-store", format!("bad reference: {}", e.reason)))?;
-        let repo = repo_path(&parsed);
-        let want = parsed
-            .digest
-            .clone()
-            .or_else(|| parsed.tag.clone())
-            .unwrap_or_else(|| "latest".to_string());
-
-        let base_url = api_base_url(&parsed.registry);
-        let client = auth.apply(smolvm_registry::RegistryClient::new(base_url));
-
-        // ── AUTH GATE ──────────────────────────────────────────────────────
-        // Resolve the manifest WITH the caller's credentials. The registry
-        // authorizes `repository:<repo>:pull` here; an unauthorized caller is
-        // rejected (401/403) and never reaches the cache below. Runs on hits too.
-        let manifest_bytes = client
-            .get_manifest_resolved(&repo, &want)
-            .await
-            .map_err(|e| Error::agent("image-store: resolve manifest", e.to_string()))?;
-
-        // The manifest digest is the content address / cache key. Tag→digest is
-        // resolved fresh every call, so a moved `:latest` becomes a new key.
-        let digest = format!("sha256:{}", hex::encode(Sha256::digest(&manifest_bytes)));
-        let entry = self.root.join(digest_dir(&digest));
+        // ── AUTH GATE + content address ─────────────────────────────────────
+        // Resolve + authorize the manifest with the caller's credentials, across
+        // the candidate registries the guest would try. Runs before the cache is
+        // consulted, so a hit cannot leak an image the caller can't pull.
+        let r = resolve_authorized(reference, auth).await?;
+        let entry = self.root.join(digest_dir(&r.digest));
         let layers = entry.join("layers");
 
         // ── CACHE HIT (already authorized above) ───────────────────────────
@@ -109,15 +57,15 @@ impl ImageStore {
         }
 
         // ── MISS: materialize host-side, verify digests, atomic-stage ──────
-        let manifest: smolvm_registry::OciManifest = serde_json::from_slice(&manifest_bytes)
+        let manifest: smolvm_registry::OciManifest = serde_json::from_slice(&r.manifest_bytes)
             .map_err(|e| Error::agent("image-store: parse manifest", e.to_string()))?;
         let staging = self.root.join(format!(
             ".staging-{}-{}",
-            digest_dir(&digest),
+            digest_dir(&r.digest),
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&staging);
-        materialize_layers(&client, &repo, &manifest, &staging)
+        materialize_layers(&r.client, &r.repo, &manifest, &staging)
             .await
             .inspect_err(|_| {
                 let _ = std::fs::remove_dir_all(&staging);
@@ -144,13 +92,22 @@ impl ImageStore {
     }
 }
 
-/// The auth gate on its own: resolve `reference`'s manifest with the caller's
-/// credentials and return the content digest. A caller who cannot pull the repo
-/// is rejected here (401/403). Used by the paths that materialize the image
-/// through the proven pack pipeline but still need the per-caller authorization
-/// and the content address as their cache key — so the security property holds
-/// identically whether the layers come from `ensure_image` or a bake.
-pub async fn authorized_digest(reference: &str, auth: &PullAuth) -> Result<String> {
+/// The outcome of the auth gate: the authorized client + repo it succeeded
+/// against, the manifest bytes, and their digest (the content-address key).
+struct Resolved {
+    client: smolvm_registry::RegistryClient,
+    repo: String,
+    manifest_bytes: Vec<u8>,
+    digest: String,
+}
+
+/// Resolve + authorize `reference` across the candidate registries the guest
+/// would try, returning the winning client, repo, manifest, and content digest.
+///
+/// The registry authorizes `repository:<repo>:pull` for the caller's credentials
+/// here; an unauthorized caller is rejected (401/403). This is the single gate
+/// behind both [`authorized_digest`] and [`ImageStore::ensure_image`].
+async fn resolve_authorized(reference: &str, auth: &PullAuth) -> Result<Resolved> {
     let parsed = Reference::parse(reference)
         .map_err(|e| Error::config("image-store", format!("bad reference: {}", e.reason)))?;
     let want = parsed
@@ -158,19 +115,26 @@ pub async fn authorized_digest(reference: &str, auth: &PullAuth) -> Result<Strin
         .clone()
         .or_else(|| parsed.tag.clone())
         .unwrap_or_else(|| "latest".to_string());
+    // OCI-image credentials live under `images` (docker.io/ghcr/...), the same
+    // config the guest pull consults.
+    let config = crate::SmolSettings::load()?.images;
 
-    // Resolve the registry the way the GUEST does — via `registry_pull_hosts`,
-    // not the configured default — so the host-side gate and the in-guest pull
-    // target the same registry. A bare `alpine` resolves to Docker Hub here, not
-    // the smol registry, matching what the guest would actually pull.
-    let hosts = crate::registry::registry_pull_hosts(reference);
+    // Resolve the registry the way the GUEST does — via `registry_pull_hosts`, not
+    // the configured default — so the host-side gate targets the same registry the
+    // in-guest pull would (a bare `alpine` is Docker Hub, not the smol registry).
     let mut last_err: Option<String> = None;
-    for host in &hosts {
-        let (base_url, repo) = endpoint_for(host, &parsed);
-        let client = auth.apply(smolvm_registry::RegistryClient::new(base_url));
+    for host in &crate::registry::registry_pull_hosts(reference) {
+        let client = registry_client(host, &config, auth);
+        let repo = repo_for(host, &parsed);
         match client.get_manifest_resolved(&repo, &want).await {
-            Ok(bytes) => {
-                return Ok(format!("sha256:{}", hex::encode(Sha256::digest(&bytes))));
+            Ok(manifest_bytes) => {
+                let digest = format!("sha256:{}", hex::encode(Sha256::digest(&manifest_bytes)));
+                return Ok(Resolved {
+                    client,
+                    repo,
+                    manifest_bytes,
+                    digest,
+                });
             }
             Err(e) => last_err = Some(e.to_string()),
         }
@@ -181,42 +145,26 @@ pub async fn authorized_digest(reference: &str, auth: &PullAuth) -> Result<Strin
     ))
 }
 
-/// Map a candidate pull host (from `registry_pull_hosts`) plus the parsed name to
-/// the registry API base URL and repository path. Docker Hub's OCI API lives at
-/// `registry-1.docker.io` and official images sit under `library/`; the smol
-/// registry serves its API at `registry.smolmachines.com`.
-fn endpoint_for(host: &str, parsed: &Reference) -> (String, String) {
-    let repo_with = |prefix_library: bool| -> String {
-        match &parsed.namespace {
-            Some(ns) => format!("{}/{}", ns, parsed.name),
-            None if prefix_library => format!("library/{}", parsed.name),
-            None => parsed.name.clone(),
-        }
-    };
-    match host {
-        "docker.io" | "docker.com" | "index.docker.io" | "registry-1.docker.io" => {
-            ("https://registry-1.docker.io".to_string(), repo_with(true))
-        }
-        h if h.ends_with("smolmachines.com") => (
-            "https://registry.smolmachines.com".to_string(),
-            repo_with(false),
-        ),
-        h if smolvm_registry::is_local_registry(h) => (format!("http://{}", h), repo_with(false)),
-        h => (format!("https://{}", h), repo_with(false)),
-    }
+/// The auth gate on its own: resolve `reference` with the caller's credentials and
+/// return the content digest. A caller who cannot pull the repo is rejected here.
+/// Used by paths that materialize the image through the proven pack pipeline but
+/// still need the per-caller authorization and the content address as their key.
+pub async fn authorized_digest(reference: &str, auth: &PullAuth) -> Result<String> {
+    Ok(resolve_authorized(reference, auth).await?.digest)
 }
 
-/// The registry repository path for a reference (`namespace/name` or `name`).
-///
-/// Docker Hub official images (no namespace on `docker.io`) live under the
-/// implicit `library/` namespace, so a bare `alpine` resolves to `library/alpine`
-/// — without this the pull-scope is wrong and the registry answers 401.
-fn repo_path(r: &Reference) -> String {
+/// The repository path for a reference against a candidate `host`. Docker Hub
+/// official images (no namespace) live under the implicit `library/` namespace,
+/// so a bare `alpine` becomes `library/alpine` — without which the pull-scope is
+/// wrong and the registry answers 401.
+fn repo_for(host: &str, r: &Reference) -> String {
+    let docker_hub = matches!(
+        host,
+        "docker.io" | "docker.com" | "index.docker.io" | "registry-1.docker.io"
+    );
     match &r.namespace {
         Some(ns) => format!("{}/{}", ns, r.name),
-        None if r.registry == crate::registry::DEFAULT_REGISTRY => {
-            format!("library/{}", r.name)
-        }
+        None if docker_hub => format!("library/{}", r.name),
         None => r.name.clone(),
     }
 }
@@ -224,20 +172,6 @@ fn repo_path(r: &Reference) -> String {
 /// A filesystem-safe directory name for a digest (`sha256:abc` → `sha256-abc`).
 fn digest_dir(digest: &str) -> String {
     digest.replace(':', "-")
-}
-
-/// The registry API base URL for a hostname. Local registries are plaintext; the
-/// Docker Hub apex (`docker.io`) is a namespace alias whose OCI API is served at
-/// `registry-1.docker.io`, so it is rewritten here (the token service at
-/// `auth.docker.io` is discovered from the `WWW-Authenticate` challenge).
-fn api_base_url(registry: &str) -> String {
-    if smolvm_registry::is_local_registry(registry) {
-        format!("http://{}", registry)
-    } else if registry == crate::registry::DEFAULT_REGISTRY {
-        "https://registry-1.docker.io".to_string()
-    } else {
-        format!("https://{}", registry)
-    }
 }
 
 /// A cache entry is usable only if its `layers/` dir holds the layer-order index
@@ -302,35 +236,15 @@ mod tests {
     }
 
     #[test]
-    fn auth_only_affects_the_client_not_the_key() {
-        // The cache key is the manifest digest, independent of who authorized —
-        // so two tenants pulling the same public image share one entry.
-        let a = PullAuth {
-            bearer: Some("tenant-a".into()),
-            identity_token: None,
-        };
-        let b = PullAuth::anonymous();
-        // Both apply cleanly; the point is they never enter the digest path.
-        let _ = a.apply(smolvm_registry::RegistryClient::new("http://x".into()));
-        let _ = b.apply(smolvm_registry::RegistryClient::new("http://x".into()));
-    }
-
-    #[test]
-    fn endpoint_for_maps_registries_correctly() {
+    fn repo_for_maps_docker_hub_and_namespaced_refs() {
+        // Docker Hub official image (no namespace) → implicit `library/`.
         let bare = Reference::parse("alpine").unwrap();
-        // Docker Hub official image → API endpoint + implicit `library/`.
-        assert_eq!(
-            endpoint_for("docker.io", &bare),
-            (
-                "https://registry-1.docker.io".to_string(),
-                "library/alpine".to_string()
-            )
-        );
+        assert_eq!(repo_for("docker.io", &bare), "library/alpine");
+        // A namespaced ref keeps its namespace on any host.
         let ns = Reference::parse("ghcr.io/org/tool:v1").unwrap();
-        assert_eq!(
-            endpoint_for("ghcr.io", &ns),
-            ("https://ghcr.io".to_string(), "org/tool".to_string())
-        );
+        assert_eq!(repo_for("ghcr.io", &ns), "org/tool");
+        // A bare name on a non-Docker-Hub host is not `library/`-prefixed.
+        assert_eq!(repo_for("ghcr.io", &bare), "alpine");
     }
 
     /// THE security property: a cache HIT must not bypass authorization. Even
@@ -380,18 +294,12 @@ mod tests {
             assert!(is_intact(&tmp.path().join(digest_dir(&digest))));
 
             // DENY: unauthorized caller is rejected at the gate despite the hit.
-            let denied = store.ensure_image(&reference, &PullAuth::anonymous()).await;
+            let denied = store.ensure_image(&reference, &PullAuth::Anonymous).await;
             assert!(denied.is_err(), "cache hit must NOT bypass authorization");
 
             // ALLOW: authorized caller resolves and is served the cached layers.
             let allowed = store
-                .ensure_image(
-                    &reference,
-                    &PullAuth {
-                        bearer: Some("good-token".into()),
-                        identity_token: None,
-                    },
-                )
+                .ensure_image(&reference, &PullAuth::Bearer("good-token".into()))
                 .await;
             assert_eq!(
                 allowed.expect("authorized caller should be served"),

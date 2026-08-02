@@ -9,7 +9,94 @@
 //! `[machines]` and `[images]` sections. See [`crate::settings::SmolSettings`].
 
 use serde::{Deserialize, Serialize};
+use smolvm_registry::RegistryClient;
 use std::collections::HashMap;
+
+/// How a caller authorizes a registry pull.
+///
+/// [`PullAuth::FromConfig`] (the default) resolves credentials from the local
+/// registry config — `docker login` / `smolvm.toml` — which is what the CLI
+/// uses. The explicit variants are for programmatic callers: the smol SDK passes
+/// [`PullAuth::Basic`] or [`PullAuth::Bearer`] from its `registryAuth` option,
+/// and the cloud passes the control-plane per-tenant token as
+/// [`PullAuth::Identity`] or [`PullAuth::Bearer`]. Every surface authorizes
+/// through the one [`registry_client`] path below, so behavior is identical.
+#[derive(Clone, Debug, Default)]
+pub enum PullAuth {
+    /// Resolve credentials from `RegistryConfig` (the CLI default).
+    #[default]
+    FromConfig,
+    /// No credentials — anonymous/public pulls.
+    Anonymous,
+    /// Username + password, sent as Basic to the registry's auth service.
+    Basic {
+        /// Registry account username.
+        username: String,
+        /// Registry account password or personal access token.
+        password: String,
+    },
+    /// A pre-minted OCI bearer token, sent directly on every request.
+    Bearer(String),
+    /// An identity/refresh token exchanged at the auth service for a scoped token.
+    Identity(String),
+}
+
+/// Build a [`RegistryClient`] for `registry`, resolving its API endpoint (Docker
+/// Hub's `registry-1.docker.io`, configured mirrors, local plaintext) and
+/// applying `auth`: an explicit credential, or the ones from `config` when
+/// [`PullAuth::FromConfig`].
+///
+/// This is the single credential-resolution path shared by the pack tooling and
+/// the OCI image cache, so a pull authorizes the same way whoever drives it.
+pub fn registry_client(registry: &str, config: &RegistryConfig, auth: &PullAuth) -> RegistryClient {
+    // Resolve the config-key hostname to its Distribution API endpoint. The config
+    // key stays the user-facing name so credential lookup is consistent — only the
+    // HTTP endpoint changes:
+    //   * Docker Hub is "docker.io" to users but serves the API at
+    //     "registry-1.docker.io".
+    //   * The smol registry's apex "smolmachines.com" (what the guest's
+    //     `registry_pull_hosts` yields) serves the API at the "registry." subdomain;
+    //     the already-canonical "registry.smolmachines.com" maps to itself.
+    let effective = config.get_mirror(registry).unwrap_or(registry);
+    let api_host = match effective {
+        "docker.io" => "registry-1.docker.io",
+        h if h.ends_with("smolmachines.com") => SMOLMACHINES_REGISTRY,
+        h => h,
+    };
+    let base_url = if smolvm_registry::is_local_registry(api_host) {
+        format!("http://{}", api_host)
+    } else {
+        format!("https://{}", api_host)
+    };
+
+    let client = RegistryClient::new(base_url);
+    match auth {
+        PullAuth::Anonymous => client,
+        PullAuth::Basic { username, password } => {
+            client.with_basic_credentials(username.clone(), password.clone())
+        }
+        PullAuth::Bearer(token) => client.with_token(token.clone()),
+        PullAuth::Identity(token) => client.with_identity_token(token.clone()),
+        PullAuth::FromConfig => {
+            let Some(entry) = config.registries.get(registry) else {
+                return client;
+            };
+            if let Some(identity_token) = &entry.identity_token {
+                client.with_identity_token(identity_token.clone())
+            } else if let Some(cred) = config.get_credentials(registry) {
+                // Legacy convention: username "token" means the password IS the
+                // bearer token; otherwise it's standard Docker/OCI Basic auth.
+                if cred.username == "token" {
+                    client.with_token(cred.password)
+                } else {
+                    client.with_basic_credentials(cred.username, cred.password)
+                }
+            } else {
+                client
+            }
+        }
+    }
+}
 
 /// Registry credentials and defaults for a set of OCI registries.
 ///
