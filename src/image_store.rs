@@ -104,25 +104,46 @@ impl ImageStore {
         // the candidate registries the guest would try. Runs before the cache is
         // consulted, so a hit cannot leak an image the caller can't pull.
         let r = resolve_authorized(reference, auth).await?;
-        let entry = self.root.join(digest_dir(&r.digest));
+        // The key binds the manifest digest to the REGISTRY + REPO it was
+        // authorized against (see `entry_key`), so passing the gate at one
+        // registry never unlocks an entry filled from another.
+        let key = entry_key(&r.registry, &r.repo, &r.digest);
+        let entry = self.root.join(&key);
         let layers = entry.join("layers");
 
         // ── CACHE HIT (already authorized above) ───────────────────────────
         if is_intact(&entry) {
+            touch(&entry);
             return Ok(CachedImage {
                 config: read_config(&entry)?,
                 layers,
             });
         }
 
-        // ── MISS: materialize host-side, verify digests, atomic-stage ──────
+        // ── MISS ────────────────────────────────────────────────────────────
+        // Serialize fills of the SAME key across processes AND tasks with an
+        // exclusive lock, mirroring the pack store. Without it two fillers share
+        // a staging dir: one wipes the other's extracted layers and then
+        // publishes an entry whose `layer-order` lists dirs that do not exist.
+        std::fs::create_dir_all(&self.root)
+            .map_err(|e| Error::config("image-store", e.to_string()))?;
+        let _guard = FillLock::acquire(&self.root.join(format!(".lock-{key}")))?;
+
+        // Re-check under the lock: whoever held it before us may have filled it.
+        if is_intact(&entry) {
+            touch(&entry);
+            return Ok(CachedImage {
+                config: read_config(&entry)?,
+                layers,
+            });
+        }
+
         let manifest: smolvm_registry::OciManifest = serde_json::from_slice(&r.manifest_bytes)
             .map_err(|e| Error::agent("image-store: parse manifest", e.to_string()))?;
-        let staging = self.root.join(format!(
-            ".staging-{}-{}",
-            digest_dir(&r.digest),
-            std::process::id()
-        ));
+        // Unique per fill (pid + nanos): the lock already excludes concurrent
+        // fillers, and uniqueness keeps a crashed fill's debris from being
+        // mistaken for ours. `sweep_staging` reaps whatever a crash leaves.
+        let staging = self.root.join(format!(".staging-{key}-{}", fill_nonce()));
         let _ = std::fs::remove_dir_all(&staging);
         let config = materialize_entry(&r.client, &r.repo, &manifest, &staging)
             .await
@@ -130,23 +151,31 @@ impl ImageStore {
                 let _ = std::fs::remove_dir_all(&staging);
             })?;
 
-        // Atomic publish: the last writer wins; a crash leaves a `.staging-*`
-        // dir the next run overwrites, never a half-populated cache entry.
-        if let Some(parent) = entry.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| Error::config("image-store", e.to_string()))?;
-        }
+        // Atomic publish. A pre-existing directory here is debris (a crash, or a
+        // partially removed entry): rename would fail with ENOTEMPTY forever, so
+        // clear it and retry once rather than poisoning the key permanently.
         match std::fs::rename(&staging, &entry) {
             Ok(()) => {}
             Err(_) if is_intact(&entry) => {
-                // A concurrent caller published the same digest first — fine.
+                // A concurrent caller published the same key first — fine.
                 let _ = std::fs::remove_dir_all(&staging);
+            }
+            Err(_) if entry.exists() => {
+                let _ = std::fs::remove_dir_all(&entry);
+                std::fs::rename(&staging, &entry).map_err(|e| {
+                    let _ = std::fs::remove_dir_all(&staging);
+                    Error::config("image-store: publish", e.to_string())
+                })?;
             }
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&staging);
                 return Err(Error::config("image-store: publish", e.to_string()));
             }
         }
+
+        // Bound the store AFTER publishing, never evicting what we just made.
+        sweep_staging(&self.root);
+        prune_store(&self.root, image_cache_max_bytes(), &entry);
         Ok(CachedImage { layers, config })
     }
 }
@@ -166,6 +195,10 @@ fn read_config(entry: &Path) -> Result<ImageConfig> {
 /// against, the manifest bytes, and their digest (the content-address key).
 struct Resolved {
     client: smolvm_registry::RegistryClient,
+    /// The registry host the manifest was actually authorized against. Part of
+    /// the cache key so an entry is only ever served to a caller who passed the
+    /// gate at the SAME registry.
+    registry: String,
     repo: String,
     manifest_bytes: Vec<u8>,
     digest: String,
@@ -201,6 +234,7 @@ async fn resolve_authorized(reference: &str, auth: &PullAuth) -> Result<Resolved
                 let digest = format!("sha256:{}", hex::encode(Sha256::digest(&manifest_bytes)));
                 return Ok(Resolved {
                     client,
+                    registry: host.clone(),
                     repo,
                     manifest_bytes,
                     digest,
@@ -244,6 +278,249 @@ fn digest_dir(digest: &str) -> String {
     digest.replace(':', "-")
 }
 
+/// Stream a blob to `dest`, hashing as it goes, and reject it unless the content
+/// hashes to `digest`. Streaming (rather than `pull_blob`) removes both the
+/// 64 MiB body cap and the full-blob memory buffer; verifying from the streamed
+/// bytes keeps the content-addressing guarantee — the file is only accepted if
+/// it hashes to the digest the authorized manifest named.
+async fn stream_blob_verified(
+    client: &smolvm_registry::RegistryClient,
+    repo: &str,
+    digest: &str,
+    dest: &Path,
+) -> Result<()> {
+    use futures_util::StreamExt;
+    use std::io::Write;
+
+    let mut stream = client
+        .pull_blob_stream(repo, digest)
+        .await
+        .map_err(|e| Error::agent("image-store: pull layer", e.to_string()))?;
+    let file =
+        std::fs::File::create(dest).map_err(|e| Error::config("image-store", e.to_string()))?;
+    let mut writer = std::io::BufWriter::new(file);
+    let mut hasher = Sha256::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| Error::agent("image-store: pull layer", e.to_string()))?;
+        hasher.update(&chunk);
+        writer
+            .write_all(&chunk)
+            .map_err(|e| Error::config("image-store: write layer", e.to_string()))?;
+    }
+    writer
+        .flush()
+        .map_err(|e| Error::config("image-store: write layer", e.to_string()))?;
+
+    let got = format!("sha256:{}", hex::encode(hasher.finalize()));
+    if got != digest {
+        let _ = std::fs::remove_file(dest);
+        return Err(Error::agent(
+            "image-store: layer digest",
+            format!("blob content mismatch: expected {digest}, got {got}"),
+        ));
+    }
+    Ok(())
+}
+
+/// The cache key for an image: the manifest digest bound to the registry and
+/// repository it was authorized against.
+///
+/// Keying on the manifest digest ALONE would make the auth gate bypassable.
+/// `resolve_authorized` accepts the first candidate registry that answers 200 —
+/// including one the caller controls. Anyone holding a private image's manifest
+/// bytes (manifests leak far more easily than blobs: an old public tag, a CI
+/// log, `docker manifest inspect`) could serve those exact bytes from their own
+/// registry, pass the gate there, compute the identical digest, and be handed
+/// the private image's extracted layers without ever authenticating to the real
+/// registry. Binding the key to (registry, repo) means passing the gate at one
+/// registry can only ever unlock content filled from that same registry.
+///
+/// Dedup is preserved where it matters: every tenant pulling
+/// `docker.io/library/alpine` at the same digest still shares one entry.
+fn entry_key(registry: &str, repo: &str, manifest_digest: &str) -> String {
+    let scoped = format!("{registry}/{repo}@{manifest_digest}");
+    format!("sha256-{}", hex::encode(Sha256::digest(scoped.as_bytes())))
+}
+
+/// Environment override (bytes) for the maximum on-disk size of the image store.
+const IMAGE_CACHE_MAX_BYTES_ENV: &str = "SMOLVM_IMAGE_CACHE_MAX_BYTES";
+
+/// Size ceiling for the extracted-image store, default 20 GiB.
+///
+/// EXTRACTED layers are substantially larger than the compressed blobs they came
+/// from (measured: `node:20` is 379 MiB compressed, 636 MiB extracted), so an
+/// unbounded store fills a node's disk and every tenant on it then fails to
+/// start. The default is deliberately larger than the init-bake cache's 10 GiB
+/// for that reason.
+fn image_cache_max_bytes() -> u64 {
+    std::env::var(IMAGE_CACHE_MAX_BYTES_ENV)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20 * 1024 * 1024 * 1024)
+}
+
+/// Mark an entry as recently used, so LRU eviction keeps hot images.
+fn touch(entry: &Path) {
+    if let Ok(f) = std::fs::File::open(entry) {
+        let _ = f.set_modified(std::time::SystemTime::now());
+    }
+}
+
+/// A unique-per-fill suffix so a crashed fill's debris is never confused with an
+/// in-progress one. (Uniqueness only; the lock provides the mutual exclusion.)
+fn fill_nonce() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{}", std::process::id(), nanos)
+}
+
+/// An exclusive advisory lock held for the duration of one cache fill, released
+/// when the file handle closes. Mirrors the pack store's `flock` discipline so
+/// two fillers of the same key never interleave — including two async tasks in
+/// ONE process, which a pid-keyed staging path alone does not separate.
+struct FillLock(
+    // Never read: the handle IS the lock. The OS releases the advisory lock when
+    // this file closes, so the field's only job is to live as long as the guard.
+    #[allow(dead_code)] std::fs::File,
+);
+
+impl FillLock {
+    fn acquire(path: &Path) -> Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|e| Error::config("image-store: lock", e.to_string()))?;
+        lock_exclusive(&file).map_err(|e| Error::config("image-store: lock", e.to_string()))?;
+        Ok(Self(file))
+    }
+}
+
+#[cfg(unix)]
+fn lock_exclusive(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: `fd` is a valid open descriptor for the lifetime of the call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn lock_exclusive(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK};
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    // SAFETY: handle is valid; overlapped is a zeroed, correctly sized struct.
+    let ok = unsafe {
+        LockFileEx(
+            file.as_raw_handle() as _,
+            LOCKFILE_EXCLUSIVE_LOCK,
+            0,
+            !0,
+            !0,
+            &mut overlapped,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Remove staging debris left by a crashed fill. Without this every crash leaks
+/// a full extracted image (hundreds of MiB) that nothing ever reclaims.
+fn sweep_staging(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(".staging-") {
+            continue;
+        }
+        // Only reap debris that is demonstrably stale, so a concurrent fill on
+        // another node process is never pulled out from under itself.
+        let stale = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .map(|t| {
+                t.elapsed()
+                    .map(|age| age > std::time::Duration::from_secs(3600))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if stale {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
+/// Evict least-recently-used entries until the store fits `max_bytes`, never
+/// removing `keep` (the entry the caller is about to use).
+fn prune_store(root: &Path, max_bytes: u64, keep: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let mut items: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
+    let mut total = 0u64;
+    for e in entries.flatten() {
+        let path = e.path();
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        // Only content entries participate; locks and staging are not evictable.
+        if name.starts_with('.') || !path.is_dir() {
+            continue;
+        }
+        let size = dir_size(&path);
+        total += size;
+        let mtime = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        items.push((mtime, size, path));
+    }
+    if total <= max_bytes {
+        return;
+    }
+    // Oldest first.
+    items.sort_by_key(|(mtime, _, _)| *mtime);
+    for (_, size, path) in items {
+        if total <= max_bytes {
+            break;
+        }
+        if path == keep {
+            continue;
+        }
+        if std::fs::remove_dir_all(&path).is_ok() {
+            total = total.saturating_sub(size);
+        }
+    }
+}
+
+/// Recursive on-disk size of a directory, following no symlinks.
+fn dir_size(path: &Path) -> u64 {
+    let mut total = 0;
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    for e in entries.flatten() {
+        let Ok(md) = e.metadata() else { continue };
+        if md.is_dir() {
+            total += dir_size(&e.path());
+        } else {
+            total += md.len();
+        }
+    }
+    total
+}
+
 /// A cache entry is usable only if its cached `config.json` is present AND its
 /// `layers/` dir holds the layer-order index. The layer-order index is written
 /// last, so its presence means the whole entry (layers + config) is complete —
@@ -280,17 +557,24 @@ async fn materialize_entry(
     for descriptor in &manifest.layers {
         smolvm_registry::validate_digest(&descriptor.digest)
             .map_err(|e| Error::agent("image-store: layer digest", e.to_string()))?;
-        // pull_blob verifies the returned bytes hash to `digest`, so a mirror or
-        // peer cannot substitute different content under the same address. The
-        // digest covers the COMPRESSED blob, so it is verified before extraction.
-        let blob = client
-            .pull_blob(repo, &descriptor.digest)
-            .await
-            .map_err(|e| Error::agent("image-store: pull layer", e.to_string()))?;
+        // Stream the blob to disk rather than `pull_blob`, which buffers the whole
+        // layer in memory and caps it at 64 MiB — a limit essentially every real
+        // base image (python, node, cuda) exceeds. The digest is verified from the
+        // streamed bytes before extraction, so a mirror or peer still cannot
+        // substitute different content under the same address.
+        let blob_path = staging.join(format!("{}.blob", digest_dir(&descriptor.digest)));
+        stream_blob_verified(client, repo, &descriptor.digest, &blob_path).await?;
+
         let dir = layers_dir.join(digest_dir(&descriptor.digest));
         std::fs::create_dir_all(&dir).map_err(|e| Error::config("image-store", e.to_string()))?;
-        smolvm_oci_layer::extract_oci_layer(&blob[..], &dir)
-            .map_err(|e| Error::agent("image-store: extract layer", e.to_string()))?;
+        let blob = std::fs::File::open(&blob_path)
+            .map_err(|e| Error::config("image-store: open layer", e.to_string()))?;
+        let extracted = smolvm_oci_layer::extract_oci_layer(std::io::BufReader::new(blob), &dir)
+            .map_err(|e| Error::agent("image-store: extract layer", e.to_string()));
+        // The compressed blob is scratch — drop it either way so a fill never
+        // leaves both representations on disk.
+        let _ = std::fs::remove_file(&blob_path);
+        extracted?;
         order.push(digest_dir(&descriptor.digest));
     }
 
@@ -324,6 +608,78 @@ mod tests {
     #[test]
     fn digest_dir_is_filesystem_safe() {
         assert_eq!(digest_dir("sha256:abc123"), "sha256-abc123");
+    }
+
+    /// THE key-scoping property: the same manifest digest served from a DIFFERENT
+    /// registry (or repo) must land on a different entry. Without this, an
+    /// attacker holding a private image's manifest bytes could serve them from a
+    /// registry they control, pass the gate there, and be handed the cached
+    /// private layers.
+    #[test]
+    fn entry_key_is_scoped_to_registry_and_repo() {
+        let d = "sha256:abc";
+        let real = entry_key("registry.example.com", "team/private", d);
+        assert_ne!(
+            real,
+            entry_key("evil.example.com", "team/private", d),
+            "same digest from another REGISTRY must not share an entry"
+        );
+        assert_ne!(
+            real,
+            entry_key("registry.example.com", "other/repo", d),
+            "same digest under another REPO must not share an entry"
+        );
+        assert_ne!(
+            real,
+            entry_key("registry.example.com", "team/private", "sha256:def"),
+            "a different digest is a different entry"
+        );
+        // Dedup still holds for the identical (registry, repo, digest) triple.
+        assert_eq!(real, entry_key("registry.example.com", "team/private", d));
+        // And the key is a filesystem-safe single component.
+        assert!(!real.contains('/') && !real.contains(':'));
+    }
+
+    /// The store must stay bounded: extracted layers are far larger than the
+    /// blobs they came from, so an unbounded store fills a node's disk and every
+    /// tenant on it fails to start. Eviction is LRU and never drops `keep`.
+    #[test]
+    fn prune_store_evicts_oldest_and_never_the_kept_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mk = |name: &str, bytes: usize, age_secs: u64| -> PathBuf {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("blob"), vec![0u8; bytes]).unwrap();
+            let f = std::fs::File::open(&dir).unwrap();
+            let _ = f.set_modified(
+                std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs),
+            );
+            dir
+        };
+        let oldest = mk("a", 4096, 300);
+        let middle = mk("b", 4096, 200);
+        let newest = mk("c", 4096, 100);
+        // Cap admits two of the three entries → exactly one eviction.
+        prune_store(root, 9000, &newest);
+        assert!(!oldest.exists(), "least-recently-used entry evicted");
+        assert!(middle.exists(), "entry within the cap survives");
+        assert!(newest.exists(), "the kept entry is never evicted");
+    }
+
+    /// A `keep` that is itself the oldest must survive even when over the cap —
+    /// evicting the entry the caller is about to boot would be self-defeating.
+    #[test]
+    fn prune_store_keeps_the_active_entry_even_when_oldest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let old = root.join("old");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("blob"), vec![0u8; 8192]).unwrap();
+        let f = std::fs::File::open(&old).unwrap();
+        let _ = f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(999));
+        prune_store(root, 1, &old);
+        assert!(old.exists(), "the active entry survives an over-cap prune");
     }
 
     #[test]
@@ -395,12 +751,12 @@ mod tests {
             let host = server.uri().strip_prefix("http://").unwrap().to_string();
             let reference = format!("{host}/myrepo:latest");
 
-            // Pre-create a VALID cache entry for the manifest digest — the bytes
-            // are already present on disk.
+            // Pre-create a VALID cache entry under the SCOPED key (registry +
+            // repo + manifest digest) — the bytes are already present on disk.
             let digest = format!("sha256:{}", hex::encode(Sha256::digest(&body)));
             let tmp = tempfile::tempdir().unwrap();
             let store = ImageStore::new(tmp.path().to_path_buf());
-            let entry = tmp.path().join(digest_dir(&digest));
+            let entry = tmp.path().join(entry_key(&host, "myrepo", &digest));
             let layers = entry.join("layers");
             std::fs::create_dir_all(&layers).unwrap();
             std::fs::write(layers.join("layer-order"), "").unwrap();

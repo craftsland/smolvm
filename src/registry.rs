@@ -69,6 +69,17 @@ pub fn registry_client(registry: &str, config: &RegistryConfig, auth: &PullAuth)
         format!("https://{}", api_host)
     };
 
+    // Credential lookup must follow the SAME normalization as the endpoint, or a
+    // caller-supplied alias silently resolves to no credentials. The guest's
+    // `registry_pull_hosts` yields the apex `smolmachines.com`, but credentials
+    // are stored under the canonical `registry.smolmachines.com` — looking up the
+    // raw name there degrades an authorized user to an anonymous client, and
+    // their private image 401s at the gate.
+    let cred_key = match registry {
+        h if h.ends_with("smolmachines.com") => SMOLMACHINES_REGISTRY,
+        h => h,
+    };
+
     let client = RegistryClient::new(base_url);
     match auth {
         PullAuth::Anonymous => client,
@@ -78,12 +89,12 @@ pub fn registry_client(registry: &str, config: &RegistryConfig, auth: &PullAuth)
         PullAuth::Bearer(token) => client.with_token(token.clone()),
         PullAuth::Identity(token) => client.with_identity_token(token.clone()),
         PullAuth::FromConfig => {
-            let Some(entry) = config.registries.get(registry) else {
+            let Some(entry) = config.registries.get(cred_key) else {
                 return client;
             };
             if let Some(identity_token) = &entry.identity_token {
                 client.with_identity_token(identity_token.clone())
-            } else if let Some(cred) = config.get_credentials(registry) {
+            } else if let Some(cred) = config.get_credentials(cred_key) {
                 // Legacy convention: username "token" means the password IS the
                 // bearer token; otherwise it's standard Docker/OCI Basic auth.
                 if cred.username == "token" {
@@ -1184,6 +1195,40 @@ mirror = "ghcr-mirror.example.com"
         let creds = config.get_credentials("registry.smolmachines.com").unwrap();
         assert_eq!(creds.username, "token");
         assert_eq!(creds.password, "eyJhbGci.test");
+    }
+
+    /// The guest's `registry_pull_hosts` yields the smol registry's APEX
+    /// (`smolmachines.com`), while credentials are stored under the canonical
+    /// `registry.smolmachines.com`. Credential lookup must normalize the same way
+    /// the API endpoint does — otherwise an authorized user silently gets an
+    /// anonymous client and their private image 401s at the auth gate.
+    #[test]
+    fn registry_client_finds_credentials_via_the_smol_registry_apex() {
+        let mut config = RegistryConfig::default();
+        config.registries.insert(
+            "registry.smolmachines.com".to_string(),
+            RegistryEntry {
+                identity_token: Some("eyJ_upstream_jwt".to_string()),
+                ..Default::default()
+            },
+        );
+
+        // Canonical name resolves (the pre-existing behavior).
+        let canonical =
+            registry_client("registry.smolmachines.com", &config, &PullAuth::FromConfig);
+        assert_eq!(canonical.identity_token(), Some("eyJ_upstream_jwt"));
+
+        // The apex must resolve to the SAME credential, not silently to anonymous.
+        let apex = registry_client("smolmachines.com", &config, &PullAuth::FromConfig);
+        assert_eq!(
+            apex.identity_token(),
+            Some("eyJ_upstream_jwt"),
+            "apex must resolve to the canonical registry's credentials"
+        );
+
+        // An unrelated host still gets no credentials.
+        let other = registry_client("ghcr.io", &config, &PullAuth::FromConfig);
+        assert_eq!(other.identity_token(), None);
     }
 
     #[test]
