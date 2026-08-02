@@ -1302,6 +1302,30 @@ fn start_vm_named_with_db(
             features.packed_layers_dir = Some(dir);
         }
     }
+    // Host-side image store (opt-in): pull + extract the registry image ONCE into
+    // content-addressed overlay lowerdirs and mount those, so this and every other
+    // machine on the same image skips both the in-guest pull and the per-VM
+    // flatten. The store re-authorizes the image against its registry on every
+    // call, so a cached entry is never served to a caller who cannot pull it.
+    // Carries the image's own entrypoint/cmd/env when the store supplies the
+    // layers: with no in-guest pull there is no pulled `ImageInfo` to adopt them
+    // from, so the config cached beside the layers stands in for it.
+    let mut store_config: Option<smolvm::image_store::ImageConfig> = None;
+    if features.packed_layers_dir.is_none() && smolvm::image_store::image_store_enabled() {
+        if let Some(image) = record.image.as_deref() {
+            let cached = smolvm::image_store::ensure_image_blocking(
+                image,
+                &smolvm::registry::PullAuth::FromConfig,
+            )?;
+            features.packed_layers_dir = Some(cached.layers);
+            store_config = Some(cached.config);
+        }
+    }
+
+    // Whether the guest's layers are already mounted via virtiofs. Captured here
+    // because `features` is moved into the launch below, and the in-guest pull
+    // further down must be skipped exactly when this is true.
+    let uses_packed_layers = features.packed_layers_dir.is_some();
 
     // First boot pulls the base image in-guest, subject to the egress filter —
     // fold the image's registry into the enforced policy so a hostname scope
@@ -1343,11 +1367,13 @@ fn start_vm_named_with_db(
     // starts, skip both — image manifests/layers persist on the storage disk
     // and the container overlay is remounted (not recreated).
     if !record.init_completed {
-        let uses_packed_layers = record.source_smolmachine.is_some()
-            || record
-                .image
-                .as_deref()
-                .is_some_and(smolvm::data::image_source::is_local_ref);
+        // `uses_packed_layers` comes from the launch features (captured above),
+        // not re-derived from the record: `packed_layers_dir` is the one place
+        // that knows whether layers are already mounted via virtiofs, and it is
+        // set from three sources (a `.smolmachine`'s extracted layers, a local
+        // image archive's dir, and the host-side image store). Re-deriving the
+        // answer here would miss any source it does not enumerate, and the machine
+        // would pull in-guest even though the layers are already there.
         let image_info = if uses_packed_layers {
             // Layers already mounted via virtiofs — no pull needed.
             None
@@ -1387,12 +1413,24 @@ fn start_vm_named_with_db(
         // VM runs its image's program on start (and forked clones inherit it).
         // Persisted here on first boot (where the image config is available) so
         // later starts reuse it without re-pulling.
-        if let Some(info) = image_info.as_ref() {
+        // The image's own entrypoint+cmd come from the pull when there was one,
+        // and otherwise from the config the store cached beside its layers — so a
+        // machine booted from the store still runs its image's program instead of
+        // failing with "image defines no entrypoint or cmd".
+        let image_defaults = image_info
+            .as_ref()
+            .map(|i| (i.entrypoint.clone(), i.cmd.clone()))
+            .or_else(|| {
+                store_config
+                    .as_ref()
+                    .map(|c| (c.entrypoint.clone(), c.cmd.clone()))
+            });
+        if let Some((img_ep, img_cmd)) = image_defaults {
             let (ep, cmd) = default_workload_to_image(
                 record.entrypoint.clone(),
                 record.cmd.clone(),
-                &info.entrypoint,
-                &info.cmd,
+                &img_ep,
+                &img_cmd,
             );
             if ep != record.entrypoint || cmd != record.cmd {
                 record.entrypoint = ep.clone();
