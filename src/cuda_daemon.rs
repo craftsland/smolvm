@@ -1714,18 +1714,18 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
                     "CUDA module handoff fd is invalid",
                 )
             })?;
-            Some(read_module_blob_fd(module_fd)?)
+            Some(map_module_blob_fd(module_fd)?)
         } else {
             None
         };
     #[cfg(not(target_os = "linux"))]
-    let inherited_module_blob: Option<Vec<u8>> = None;
+    let inherited_module_blob: Option<smolvm_cuda::host::ModuleHandoffBytes> = None;
     let module_blob = if inherited_module_blob.is_some() {
         inherited_module_blob
     } else if let Ok(modpath) = std::env::var("SMOLVM_CUDA_CLONE_MODULES") {
         let result = std::fs::read(&modpath);
         let _ = std::fs::remove_file(&modpath);
-        Some(result?)
+        Some(smolvm_cuda::host::ModuleHandoffBytes::from_owned(result?))
     } else {
         None
     };
@@ -1743,7 +1743,7 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
         // This installs immutable process-global fallbacks as well as the main
         // thread's fast-path maps. Attached channels use those fallbacks rather
         // than deep-copying every module image and function record.
-        smolvm_cuda::host::set_handle_trans(mod_images, func_meta, streams, events);
+        smolvm_cuda::host::set_shared_handle_trans(mod_images, func_meta, streams, events);
         // Re-create the golden's top-level cuBLAS/cuBLASLt/cuDNN handles in
         // THIS process and map the clone's inherited values to them — library
         // handles are process-local, so a pre-fork handle would otherwise fail
@@ -2745,17 +2745,16 @@ fn reconstruct_golden_memory(
 }
 
 #[cfg(target_os = "linux")]
-fn read_module_blob_fd(fd: std::os::fd::RawFd) -> io::Result<Vec<u8>> {
-    use std::os::unix::fs::FileExt;
-
+fn map_module_blob_fd(fd: std::os::fd::RawFd) -> io::Result<smolvm_cuda::host::ModuleHandoffBytes> {
     // Take an independent owned descriptor before closing the inherited slot.
-    // Reads use pread so workers forked from the same cached source never share
-    // or race an open-file offset.
+    // Every worker maps the same immutable file pages, so staging does not
+    // allocate and copy the entire handoff into private anonymous memory.
     let owned = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-    if owned < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    let duplicate_error = io::Error::last_os_error();
     unsafe { libc::close(fd) };
+    if owned < 0 {
+        return Err(duplicate_error);
+    }
     let file = unsafe { std::fs::File::from_raw_fd(owned) };
     let metadata = file.metadata()?;
     let bytes = metadata.len();
@@ -2771,25 +2770,10 @@ fn read_module_blob_fd(fd: std::os::fd::RawFd) -> io::Result<Vec<u8>> {
             "CUDA module handoff source does not fit in address space",
         )
     })?;
-    let mut blob = Vec::new();
-    blob.try_reserve_exact(bytes)
-        .map_err(|error| io::Error::other(format!("CUDA module handoff allocation: {error}")))?;
-    blob.resize(bytes, 0);
-    let mut offset = 0usize;
-    while offset < blob.len() {
-        match file.read_at(&mut blob[offset..], offset as u64) {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "CUDA module handoff source was truncated",
-                ))
-            }
-            Ok(read) => offset += read,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(blob)
+    // SAFETY: `file` is a read-only reopen of the daemon-owned unnamed handoff
+    // inode. Its only writable descriptor was dropped before caching, so the
+    // inode cannot be changed or truncated while workers map it.
+    unsafe { smolvm_cuda::host::ModuleHandoffBytes::map_read_only(&file, bytes) }
 }
 
 /// M3a: parse the golden's module IMAGES + function METADATA (for LAZY reload in
@@ -2803,15 +2787,16 @@ fn read_module_blob_fd(fd: std::os::fd::RawFd) -> io::Result<Vec<u8>> {
 #[allow(clippy::type_complexity)]
 fn reconstruct_golden_modules(
     b: &mut dyn Backend,
-    buf: &[u8],
+    source: &smolvm_cuda::host::ModuleHandoffBytes,
 ) -> (
-    Vec<(u64, Vec<u8>)>,
+    Vec<(u64, smolvm_cuda::host::ModuleHandoffBytes)>,
     Vec<smolvm_cuda::host::FuncMeta>,
     Vec<(u64, u64)>,
     Vec<(u64, u64)>,
     Vec<(u64, u64, smolvm_cuda::host::GraphSer)>,
     Vec<(u8, u16, u64, Vec<u8>)>,
 ) {
+    let buf = source.as_slice();
     let mut mod_images = Vec::new();
     let mut func_meta = Vec::new();
     let mut stream_trans = Vec::new();
@@ -2855,7 +2840,8 @@ fn reconstruct_golden_modules(
         let gh = ru64!();
         let ilen = ru32!() as usize;
         need!(ilen);
-        mod_images.push((gh, buf[p..p + ilen].to_vec()));
+        // `need!` proved this range is within the immutable source.
+        mod_images.push((gh, source.slice(p, ilen).unwrap()));
         p += ilen;
     }
     // Functions: stage golden fn → (golden module, name); resolved lazily.
@@ -5160,10 +5146,11 @@ mod mps_tests {
         consume_procmem_preamble, create_host_snapshot_memfd, create_private_mps_paths,
         daemon_has_live_cuda_clients, decode_attach_procmem, disabled_worker_route,
         encode_attach_procmem, fork_snapshot_enabled, golden_eviction_enabled, host_snapshot_fits,
-        host_snapshot_reconstructable, lift_owned_fds, live_host_snapshot_count, mps_enabled,
-        ordinary_regions_are_reserved, prepare_module_blob, range_is_reserved, read_host_snapshot,
-        read_module_blob_fd, recv_fd, redeem_tensor_bundle_from_stream, seal_host_snapshot,
-        select_golden_owner, send_fd, send_tensor_bundle_to_parent, serve_tensor_bundle_consumer,
+        host_snapshot_reconstructable, lift_owned_fds, live_host_snapshot_count,
+        map_module_blob_fd, mps_enabled, ordinary_regions_are_reserved, prepare_module_blob,
+        range_is_reserved, read_host_snapshot, reconstruct_golden_modules, recv_fd,
+        redeem_tensor_bundle_from_stream, seal_host_snapshot, select_golden_owner, send_fd,
+        send_tensor_bundle_to_parent, serve_tensor_bundle_consumer,
         spawn_clone_attach_listener_with_timeout, spawn_tensor_bundle_receiver,
         unique_live_clone_worker, validate_tensor_bundle_metadata, TENSOR_CONSUME_MAGIC,
     };
@@ -5196,7 +5183,7 @@ mod mps_tests {
     }
 
     #[test]
-    fn module_blob_fd_reads_are_offset_independent() {
+    fn module_blob_fd_mappings_are_offset_independent() {
         use std::io::{Seek as _, Write as _};
         use std::os::fd::AsRawFd as _;
 
@@ -5208,9 +5195,68 @@ mod mps_tests {
         let second = unsafe { libc::dup(file.as_raw_fd()) };
         assert!(first >= 0 && second >= 0);
 
-        assert_eq!(read_module_blob_fd(first).unwrap(), expected);
-        assert_eq!(read_module_blob_fd(second).unwrap(), expected);
+        let first = map_module_blob_fd(first).unwrap();
+        let second = map_module_blob_fd(second).unwrap();
+        assert_eq!(first.as_slice(), expected);
+        assert_eq!(second.as_slice(), expected);
         assert_eq!(file.stream_position().unwrap(), expected.len() as u64);
+    }
+
+    #[test]
+    fn module_blob_mapping_rejects_empty_and_non_file_sources() {
+        use std::os::fd::IntoRawFd as _;
+
+        let empty = tempfile::tempfile().unwrap();
+        assert_eq!(
+            map_module_blob_fd(empty.into_raw_fd())
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let directory = std::fs::File::open(directory.path()).unwrap();
+        assert_eq!(
+            map_module_blob_fd(directory.into_raw_fd())
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn parsed_module_images_keep_the_mapped_blob_alive() {
+        use std::io::Write as _;
+        use std::os::fd::IntoRawFd as _;
+
+        let image = b"mapped-cubin";
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&1_u32.to_le_bytes());
+        blob.extend_from_slice(&0x1234_u64.to_le_bytes());
+        blob.extend_from_slice(&(image.len() as u32).to_le_bytes());
+        blob.extend_from_slice(image);
+        blob.extend_from_slice(&0_u32.to_le_bytes()); // functions
+        blob.extend_from_slice(&0_u32.to_le_bytes()); // streams
+        blob.extend_from_slice(&0_u32.to_le_bytes()); // events
+
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&blob).unwrap();
+        let source = map_module_blob_fd(file.into_raw_fd()).unwrap();
+        let mut backend = smolvm_cuda::host::CpuBackend::default();
+        let (images, functions, streams, events, graphs, handles) =
+            reconstruct_golden_modules(&mut backend, &source);
+        drop(source);
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].0, 0x1234);
+        assert_eq!(images[0].1.as_slice(), image);
+        assert!(functions.is_empty());
+        assert!(streams.is_empty());
+        assert!(events.is_empty());
+        assert!(graphs.is_empty());
+        assert!(handles.is_empty());
     }
 
     #[test]
