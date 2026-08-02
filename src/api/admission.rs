@@ -21,9 +21,9 @@ const VRAM_RESERVE_PERCENT: u64 = 10;
 const CPU_SATURATION_PERCENT: f64 = 90.0;
 const MARGINAL_GAIN_PERCENT: f64 = 2.0;
 
-/// One node-wide GPU sample. Multi-GPU nodes are represented as aggregate
-/// memory and memory-weighted utilization so the policy stays conservative
-/// without assuming a pool-to-device mapping the current runtime does not have.
+/// One node-wide GPU sample. Utilization and public memory counters remain
+/// aggregate, while admission uses the least-safe individual device because
+/// the current runtime does not yet have a durable pool-to-device mapping.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GpuSample {
     /// Memory-weighted mean streaming-multiprocessor utilization.
@@ -32,16 +32,58 @@ pub struct GpuSample {
     pub used_memory_mib: u64,
     /// Aggregate device-memory capacity in MiB.
     pub total_memory_mib: u64,
+    /// Free memory on the device closest to violating its own reserve.
+    limiting_device_free_memory_mib: u64,
+    /// Capacity-derived reserve required on that limiting device.
+    limiting_device_reserve_mib: u64,
 }
 
 impl GpuSample {
-    fn free_memory_mib(self) -> u64 {
-        self.total_memory_mib.saturating_sub(self.used_memory_mib)
+    fn from_devices(devices: impl IntoIterator<Item = GpuDeviceSample>) -> Option<Self> {
+        let mut count = 0_u32;
+        let mut total_memory_mib = 0_u64;
+        let mut used_memory_mib = 0_u64;
+        let mut weighted_utilization = 0_f64;
+        let mut limiting_device = None::<(i128, u64, u64)>;
+
+        for device in devices {
+            count = count.saturating_add(1);
+            total_memory_mib = total_memory_mib.saturating_add(device.total_memory_mib);
+            used_memory_mib = used_memory_mib.saturating_add(device.used_memory_mib);
+            weighted_utilization += device.utilization_percent * device.total_memory_mib as f64;
+
+            let reserve_mib = device_reserve_mib(device.total_memory_mib);
+            let headroom = i128::from(device.free_memory_mib) - i128::from(reserve_mib);
+            if limiting_device.is_none_or(|(least_headroom, _, _)| headroom < least_headroom) {
+                limiting_device = Some((headroom, device.free_memory_mib, reserve_mib));
+            }
+        }
+
+        let (_, limiting_device_free_memory_mib, limiting_device_reserve_mib) = limiting_device?;
+        (count > 0 && total_memory_mib > 0).then_some(Self {
+            utilization_percent: weighted_utilization / total_memory_mib as f64,
+            used_memory_mib,
+            total_memory_mib,
+            limiting_device_free_memory_mib,
+            limiting_device_reserve_mib,
+        })
     }
 
-    fn reserve_mib(self) -> u64 {
-        MIN_VRAM_RESERVE_MIB.max(self.total_memory_mib.saturating_mul(VRAM_RESERVE_PERCENT) / 100)
+    fn memory_safe(self) -> bool {
+        self.limiting_device_free_memory_mib >= self.limiting_device_reserve_mib
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GpuDeviceSample {
+    utilization_percent: f64,
+    used_memory_mib: u64,
+    free_memory_mib: u64,
+    total_memory_mib: u64,
+}
+
+fn device_reserve_mib(total_memory_mib: u64) -> u64 {
+    MIN_VRAM_RESERVE_MIB.max(total_memory_mib.saturating_mul(VRAM_RESERVE_PERCENT) / 100)
 }
 
 /// Public, read-only controller state returned with pool status.
@@ -249,7 +291,7 @@ impl PoolAdmissionState {
             gpu_utilization_percent: mean_gpu,
             completion_rate,
         };
-        let memory_safe = gpu.free_memory_mib() >= gpu.reserve_mib();
+        let memory_safe = gpu.memory_safe();
         let cpu_safe = mean_cpu < CPU_SATURATION_PERCENT;
 
         if let Some((prior_limit, prior_score)) = self.testing_from.take() {
@@ -262,8 +304,9 @@ impl PoolAdmissionState {
                 self.last_probe = now;
                 self.reason = if !memory_safe {
                     format!(
-                        "returned to {prior_limit}: preserving {} MiB GPU reserve",
-                        gpu.reserve_mib()
+                        "returned to {prior_limit}: limiting GPU has {} MiB free; preserving {} MiB reserve",
+                        gpu.limiting_device_free_memory_mib,
+                        gpu.limiting_device_reserve_mib
                     )
                 } else if !cpu_safe {
                     format!("returned to {prior_limit}: host CPU saturated at {mean_cpu:.1}%")
@@ -297,8 +340,9 @@ impl PoolAdmissionState {
                 self.last_probe = now;
                 self.reason = if !memory_safe {
                     format!(
-                        "returned to {lower_limit}: preserving {} MiB GPU reserve",
-                        gpu.reserve_mib()
+                        "returned to {lower_limit}: limiting GPU has {} MiB free; preserving {} MiB reserve",
+                        gpu.limiting_device_free_memory_mib,
+                        gpu.limiting_device_reserve_mib
                     )
                 } else {
                     format!("returned to {lower_limit}: host CPU saturated at {mean_cpu:.1}%")
@@ -323,9 +367,10 @@ impl PoolAdmissionState {
         self.last_probe = now;
         self.reason = if !memory_safe {
             format!(
-                "holding at {} to preserve {} MiB GPU reserve",
+                "holding at {}: limiting GPU has {} MiB free; preserving {} MiB reserve",
                 self.effective_limit,
-                gpu.reserve_mib()
+                gpu.limiting_device_free_memory_mib,
+                gpu.limiting_device_reserve_mib
             )
         } else if !cpu_safe {
             format!(
@@ -562,7 +607,7 @@ impl NvmlSampler {
         }
     }
 
-    /// Sample aggregate memory and utilization across visible NVIDIA devices.
+    /// Sample aggregate utilization and per-device memory safety across NVIDIA devices.
     pub fn sample(&mut self) -> Option<GpuSample> {
         // SAFETY: NVML owns device handles; all output pointers target valid,
         // initialized storage with the ABI layouts documented by NVML.
@@ -571,9 +616,7 @@ impl NvmlSampler {
             if (self.device_count)(&mut count) != 0 || count == 0 {
                 return None;
             }
-            let mut total_bytes = 0_u64;
-            let mut used_bytes = 0_u64;
-            let mut weighted_utilization = 0_f64;
+            let mut devices = Vec::with_capacity(count as usize);
             for index in 0..count {
                 let mut device = std::ptr::null_mut();
                 if (self.device_handle)(index, &mut device) != 0 || device.is_null() {
@@ -586,15 +629,14 @@ impl NvmlSampler {
                 {
                     return None;
                 }
-                total_bytes = total_bytes.saturating_add(memory.total);
-                used_bytes = used_bytes.saturating_add(memory.used);
-                weighted_utilization += f64::from(utilization.gpu) * memory.total as f64;
+                devices.push(GpuDeviceSample {
+                    utilization_percent: f64::from(utilization.gpu),
+                    used_memory_mib: memory.used / (1024 * 1024),
+                    free_memory_mib: memory.free / (1024 * 1024),
+                    total_memory_mib: memory.total / (1024 * 1024),
+                });
             }
-            Some(GpuSample {
-                utilization_percent: weighted_utilization / total_bytes.max(1) as f64,
-                used_memory_mib: used_bytes / (1024 * 1024),
-                total_memory_mib: total_bytes / (1024 * 1024),
-            })
+            GpuSample::from_devices(devices)
         }
     }
 }
@@ -646,11 +688,12 @@ mod tests {
     }
 
     fn gpu(utilization: f64, used: u64) -> Option<GpuSample> {
-        Some(GpuSample {
+        GpuSample::from_devices([GpuDeviceSample {
             utilization_percent: utilization,
             used_memory_mib: used,
+            free_memory_mib: 80 * 1024 - used,
             total_memory_mib: 80 * 1024,
-        })
+        }])
     }
 
     fn stable_window(
@@ -670,6 +713,80 @@ mod tests {
                 start + Duration::from_secs(second),
             );
         }
+    }
+
+    fn multi_gpu_sample(devices: &[(f64, u64, u64, u64)]) -> GpuSample {
+        GpuSample::from_devices(devices.iter().map(
+            |&(utilization_percent, used_memory_mib, free_memory_mib, total_memory_mib)| {
+                GpuDeviceSample {
+                    utilization_percent,
+                    used_memory_mib,
+                    free_memory_mib,
+                    total_memory_mib,
+                }
+            },
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn imbalanced_multi_gpu_memory_uses_the_limiting_device() {
+        let sample = multi_gpu_sample(&[
+            (95.0, 75 * 1024, 5 * 1024, 80 * 1024),
+            (5.0, 0, 80 * 1024, 80 * 1024),
+        ]);
+
+        assert_eq!(sample.used_memory_mib, 75 * 1024);
+        assert_eq!(sample.total_memory_mib, 160 * 1024);
+        assert!(sample.total_memory_mib - sample.used_memory_mib > 16 * 1024);
+        assert_eq!(sample.limiting_device_free_memory_mib, 5 * 1024);
+        assert_eq!(sample.limiting_device_reserve_mib, 8 * 1024);
+        assert!(!sample.memory_safe());
+    }
+
+    #[test]
+    fn heterogeneous_devices_each_use_their_own_reserve() {
+        let sample = multi_gpu_sample(&[
+            (70.0, 15 * 1024, 9 * 1024, 24 * 1024),
+            (80.0, 135 * 1024, 25 * 1024, 160 * 1024),
+        ]);
+
+        assert_eq!(sample.limiting_device_free_memory_mib, 9 * 1024);
+        assert_eq!(sample.limiting_device_reserve_mib, 8 * 1024);
+        assert!(sample.memory_safe());
+    }
+
+    #[test]
+    fn per_device_pressure_rejects_a_larger_candidate() {
+        let registry = AdmissionRegistry::default();
+        let pool = pool(12);
+        let start = Instant::now();
+        registry.observe_at(&pool, 0, 0, gpu(0.0, 10_000), Some(10.0), start);
+        registry.note_blocked("rollouts");
+        stable_window(&registry, &pool, start, (4, 0, 50.0, 30_000, 50.0));
+        assert_eq!(registry.limit(&pool), Some(8));
+
+        let imbalanced = multi_gpu_sample(&[
+            (95.0, 75 * 1024, 5 * 1024, 80 * 1024),
+            (5.0, 0, 80 * 1024, 80 * 1024),
+        ]);
+        for second in 0..=8 {
+            registry.observe_at(
+                &pool,
+                8,
+                0,
+                Some(imbalanced),
+                Some(50.0),
+                start + Duration::from_secs(9 + second),
+            );
+        }
+
+        assert_eq!(registry.limit(&pool), Some(4));
+        let reason = registry.snapshot(&pool).unwrap().reason;
+        assert!(
+            reason.contains("limiting GPU has 5120 MiB free"),
+            "{reason}"
+        );
     }
 
     #[test]
