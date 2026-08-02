@@ -65,6 +65,7 @@ fn tensor_bundle_socket_path(cuda_socket: &Path) -> PathBuf {
 /// The descriptor is owned by the caller. Dropping it releases only this
 /// process's reference; a descriptor already transferred with `SCM_RIGHTS`
 /// remains valid in the receiving process.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) struct RedeemedTensorBundle {
     pub(crate) allocation: OwnedFd,
     pub(crate) allocation_size: u64,
@@ -384,6 +385,7 @@ fn serve_tensor_bundle_consumer(mut stream: UnixStream) -> io::Result<()> {
     send_tensor_bundle_to_consumer(&mut stream, &bundle)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn redeem_tensor_bundle_from_stream(
     mut stream: UnixStream,
     token: &[u8],
@@ -430,6 +432,7 @@ fn redeem_tensor_bundle_from_stream(
 /// Redeem a clone worker's random one-use publication token into an owned GPU
 /// allocation. This is intentionally crate-private: only smolvm's managed
 /// rollout executor may cross the daemon's bearer-token boundary.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn redeem_tensor_bundle(token: &[u8]) -> io::Result<RedeemedTensorBundle> {
     let stream = UnixStream::connect(tensor_bundle_socket_path(&socket_path()))?;
     redeem_tensor_bundle_from_stream(stream, token)
