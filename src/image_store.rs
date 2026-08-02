@@ -180,9 +180,19 @@ fn is_intact(entry: &Path) -> bool {
     entry.join("layers").join("layer-order").is_file()
 }
 
-/// Pull each layer blob, verify it against its digest, write it under
-/// `staging/layers/<digest>/`, and record the stacking order last so the entry
-/// only looks intact once every layer is present.
+/// Pull each layer blob, verify it against its digest, and EXTRACT it into
+/// `staging/layers/<digest>/` as an overlayfs-ready lowerdir (decompressed,
+/// untarred, OCI whiteouts translated to overlay char-devices) — the same
+/// `smolvm_oci_layer::extract_oci_layer` the guest agent uses. The stacking
+/// order is recorded last, so the entry only looks intact once every layer is
+/// present. The guest then mounts these dirs read-only as overlay lowerdirs
+/// (via the packed-layers path) and boots with no in-VM pull or flatten.
+///
+/// Extraction is Linux+root: whiteout translation needs `mknod`/`setxattr`, and
+/// ownership preservation needs `CAP_CHOWN`. Both hold on the node (root); the
+/// host image-cache path is not used on macOS (which keeps the bake path), so
+/// the non-Linux `extract_oci_layer` stub returning `Unsupported` is never hit
+/// in a real cache-fill.
 async fn materialize_layers(
     client: &smolvm_registry::RegistryClient,
     repo: &str,
@@ -198,15 +208,16 @@ async fn materialize_layers(
         smolvm_registry::validate_digest(&descriptor.digest)
             .map_err(|e| Error::agent("image-store: layer digest", e.to_string()))?;
         // pull_blob verifies the returned bytes hash to `digest`, so a mirror or
-        // peer cannot substitute different content under the same address.
+        // peer cannot substitute different content under the same address. The
+        // digest covers the COMPRESSED blob, so it is verified before extraction.
         let blob = client
             .pull_blob(repo, &descriptor.digest)
             .await
             .map_err(|e| Error::agent("image-store: pull layer", e.to_string()))?;
         let dir = layers_dir.join(digest_dir(&descriptor.digest));
         std::fs::create_dir_all(&dir).map_err(|e| Error::config("image-store", e.to_string()))?;
-        std::fs::write(dir.join("layer.tar"), &blob)
-            .map_err(|e| Error::config("image-store", e.to_string()))?;
+        smolvm_oci_layer::extract_oci_layer(&blob[..], &dir)
+            .map_err(|e| Error::agent("image-store: extract layer", e.to_string()))?;
         order.push(digest_dir(&descriptor.digest));
     }
     // Written last: its presence is the "entry is complete" marker `is_intact`

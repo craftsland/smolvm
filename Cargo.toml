@@ -42,6 +42,11 @@ smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.7.2" }
 smolvm-cuda = { path = "crates/smolvm-cuda", version = "1.7.2" }
 smolvm-pack = { path = "crates/smolvm-pack", version = "1.7.2" }
 smolvm-registry = { path = "crates/smolvm-registry", version = "1.7.2" }
+# Shared OCI layer extraction — the host image cache fills content-addressed
+# overlay lowerdirs through the SAME code the guest agent uses (decompress +
+# untar + whiteout→overlay translation). Whiteout translation is Linux+root, so
+# the host-side extraction path is gated to Linux (macOS local uses the bake path).
+smolvm-oci-layer = { path = "crates/smolvm-oci-layer", version = "1.7.2" }
 smolfile = { path = "crates/smolvm-smolfile", version = "1.7.2" }
 thiserror = "1"
 clap = { version = "4", features = ["derive"] }
