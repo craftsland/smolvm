@@ -1235,7 +1235,7 @@ pub fn prewarm_clone_worker(b: &mut dyn Backend) {
         return;
     }
     let t0 = std::time::Instant::now();
-    let mods: Vec<u64> = MOD_IMAGES.with(|m| m.borrow().keys().copied().collect());
+    let mods = staged_module_handles();
     let nmods = mods.len();
     for g in mods {
         let _ = xlat_mod(b, g);
@@ -1515,23 +1515,12 @@ pub fn set_handle_trans(
     }
     MOD_TRANS.with(|m| m.borrow_mut().clear());
     FUNC_TRANS.with(|m| m.borrow_mut().clear());
-    MOD_IMAGES.with(|m| {
-        let mut m = m.borrow_mut();
-        m.clear();
-        m.extend(mod_images.iter().cloned());
-    });
-    FUNC_META.with(|m| {
-        let mut m = m.borrow_mut();
-        m.clear();
-        m.extend(
-            func_meta
-                .iter()
-                .cloned()
-                .map(|(f, gm, n, a)| (f, (gm, n, a))),
-        );
-    });
-    // Process-global copies too, so a channel served on a thread that was
-    // never seeded still lazy-resolves instead of leaking golden handles.
+    // Lazy source state is immutable for the worker lifetime and can be tens
+    // of megabytes. Keep one process-global copy instead of duplicating every
+    // module image and function record into this thread as well; all serving
+    // threads already fall back to these maps before resolving a handle.
+    MOD_IMAGES.with(|m| m.borrow_mut().clear());
+    FUNC_META.with(|m| m.borrow_mut().clear());
     *MOD_IMAGES_GLOBAL.lock().unwrap() = Some(mod_images.into_iter().collect());
     *FUNC_META_GLOBAL.lock().unwrap() = Some(
         func_meta
@@ -1543,6 +1532,19 @@ pub fn set_handle_trans(
     *EVENT_TRANS_GLOBAL.lock().unwrap() = Some(events.iter().copied().collect());
     put_h(&STREAM_TRANS, streams);
     put_h(&EVENT_TRANS, events);
+}
+
+fn staged_module_handles() -> Vec<u64> {
+    let local: Vec<u64> = MOD_IMAGES.with(|m| m.borrow().keys().copied().collect());
+    if !local.is_empty() {
+        return local;
+    }
+    MOD_IMAGES_GLOBAL
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|images| images.keys().copied().collect())
+        .unwrap_or_default()
 }
 
 /// Lazily reload the golden module `golden` in THIS worker's context (once),
@@ -3594,7 +3596,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 // the lazy paths to retry; later sessions adopt from the
                 // registry.
                 if prereplay_enabled() {
-                    let mods: Vec<u64> = MOD_IMAGES.with(|m| m.borrow().keys().copied().collect());
+                    let mods = staged_module_handles();
                     if !mods.is_empty() {
                         let t0 = std::time::Instant::now();
                         let mut loaded = 0u32;
@@ -5637,6 +5639,37 @@ mod tests {
             ),
             other => panic!("expected param data, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn clone_handle_sources_are_available_to_unseeded_threads() {
+        let golden_module = 0x6f00_0000_0000_0001;
+        let golden_function = 0x6f00_0000_0000_0002;
+        let golden_stream = 0x6f00_0000_0000_0003;
+        let worker_stream = 0x6f00_0000_0000_0004;
+        let golden_event = 0x6f00_0000_0000_0005;
+        let worker_event = 0x6f00_0000_0000_0006;
+        set_handle_trans(
+            vec![(golden_module, vec![1, 2, 3, 4])],
+            vec![(golden_function, golden_module, "vecadd".into(), Vec::new())],
+            vec![(golden_stream, worker_stream)],
+            vec![(golden_event, worker_event)],
+        );
+
+        std::thread::spawn(move || {
+            assert!(MOD_IMAGES.with(|images| images.borrow().is_empty()));
+            assert!(FUNC_META.with(|functions| functions.borrow().is_empty()));
+            assert!(staged_module_handles().contains(&golden_module));
+            assert_eq!(xlat_stream(golden_stream), worker_stream);
+            assert_eq!(xlat_event(golden_event), worker_event);
+
+            let mut backend = CpuBackend::default();
+            let worker_function = xlat_func(&mut backend, golden_function);
+            assert_ne!(worker_function, 0);
+            assert_ne!(worker_function, golden_function);
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]
