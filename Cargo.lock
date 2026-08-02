@@ -3045,7 +3045,6 @@ dependencies = [
  "smolfile",
  "smolvm-cuda",
  "smolvm-network",
- "smolvm-oci-layer",
  "smolvm-pack",
  "smolvm-protocol",
  "smolvm-registry",
