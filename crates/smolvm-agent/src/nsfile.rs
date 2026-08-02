@@ -101,6 +101,7 @@ pub fn run_helper() -> i32 {
 /// The container carries no user namespace (the OCI spec requests only
 /// pid/mount/ipc/uts), so uid/gid stay meaningful across the switch and only the
 /// mount namespace has to be entered.
+#[cfg(target_os = "linux")]
 fn enter_mount_namespace(pid: u32) -> Result<(), String> {
     let ns = format!("/proc/{pid}/ns/mnt");
     let file = std::fs::File::open(&ns).map_err(|e| format!("open {ns}: {e}"))?;
@@ -119,6 +120,15 @@ fn enter_mount_namespace(pid: u32) -> Result<(), String> {
     // `..` walk from it would resolve outside the container.
     std::env::set_current_dir("/").map_err(|e| format!("chdir /: {e}"))?;
     Ok(())
+}
+
+/// Non-Linux stub. `setns`/`CLONE_NEWNS` are Linux-only, and the agent's unit
+/// tests build on macOS. Unreachable in practice: the agent runs in a Linux
+/// guest, and [`workload_container_pid`] already yields `None` elsewhere, so no
+/// caller ever spawns the helper off Linux.
+#[cfg(not(target_os = "linux"))]
+fn enter_mount_namespace(_pid: u32) -> Result<(), String> {
+    Err("mount namespaces are Linux-only".to_string())
 }
 
 fn helper_read(path: &str) -> Result<(), String> {
