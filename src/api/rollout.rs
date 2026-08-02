@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, OnceCell, RwLock, Semaphore};
 use utoipa::ToSchema;
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use crate::api::device_handoff::DeviceHandoffClient;
 
 const DEFAULT_MAX_CONCURRENT: u32 = 32;
@@ -402,6 +402,7 @@ struct PolicyEntry {
     adapter_sha256: String,
     backend_model: String,
     source: AdapterSource,
+    #[cfg(target_os = "linux")]
     device_token_fingerprint: Option<[u8; 32]>,
     active: AtomicUsize,
     retiring: AtomicBool,
@@ -412,6 +413,7 @@ struct PolicyEntry {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AdapterSource {
     Filesystem,
+    #[cfg(target_os = "linux")]
     Device,
 }
 
@@ -419,6 +421,7 @@ impl AdapterSource {
     fn as_str(self) -> &'static str {
         match self {
             Self::Filesystem => "filesystem",
+            #[cfg(target_os = "linux")]
             Self::Device => "device",
         }
     }
@@ -440,7 +443,7 @@ struct ExecutorConfig {
     name: String,
     endpoint: String,
     adapter_root: PathBuf,
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     device_handoff: Option<DeviceHandoffClient>,
     fallback_pool: Option<String>,
     max_concurrent: u32,
@@ -592,7 +595,7 @@ impl RolloutExecutor {
             .connect_timeout(Duration::from_secs(5))
             .build()
             .map_err(|error| RolloutError::Backend(format!("build rollout client: {error}")))?;
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         let device_handoff = request
             .device_adapter_socket
             .as_deref()
@@ -600,10 +603,10 @@ impl RolloutExecutor {
                 DeviceHandoffClient::new(Path::new(path), Duration::from_secs(timeout_secs))
             })
             .transpose()?;
-        #[cfg(not(unix))]
+        #[cfg(not(target_os = "linux"))]
         if request.device_adapter_socket.is_some() {
             return Err(RolloutError::BadRequest(
-                "device-resident rollout handoff requires a Unix host".into(),
+                "device-resident rollout handoff requires Linux".into(),
             ));
         }
         Ok(Self {
@@ -611,7 +614,7 @@ impl RolloutExecutor {
                 name: request.name,
                 endpoint,
                 adapter_root,
-                #[cfg(unix)]
+                #[cfg(target_os = "linux")]
                 device_handoff,
                 fallback_pool: request.fallback_pool,
                 max_concurrent,
@@ -650,7 +653,7 @@ impl RolloutExecutor {
                 response.status()
             )));
         }
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         if let Some(handoff) = &self.config.device_handoff {
             handoff.health().await?;
         }
@@ -674,32 +677,41 @@ impl RolloutExecutor {
             })
             .collect();
         policies.sort_by(|a, b| (&a.policy, &a.version).cmp(&(&b.policy, &b.version)));
-        let mut capabilities = vec![
+        let device_handoff_enabled = {
+            #[cfg(target_os = "linux")]
+            {
+                self.config.device_handoff.is_some()
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                false
+            }
+        };
+        let capabilities = vec![
             "multi_lora".into(),
             "text_prompts".into(),
             "token_id_prompts".into(),
             "token_id_outputs".into(),
             "logprobs".into(),
             "continuous_batching".into(),
-        ];
-        #[cfg(unix)]
-        if self.config.device_handoff.is_some() {
-            capabilities.push("device_lora_handoff".into());
-        }
+        ]
+        .into_iter()
+        .chain(device_handoff_enabled.then(|| "device_lora_handoff".into()))
+        .collect();
         RolloutExecutorInfo {
             name: self.config.name.clone(),
             backend: "vllm".into(),
             endpoint: self.config.endpoint.clone(),
             adapter_root: self.config.adapter_root.display().to_string(),
             device_adapter_socket: {
-                #[cfg(unix)]
+                #[cfg(target_os = "linux")]
                 {
                     self.config
                         .device_handoff
                         .as_ref()
                         .map(|client| client.path().display().to_string())
                 }
-                #[cfg(not(unix))]
+                #[cfg(not(target_os = "linux"))]
                 {
                     None
                 }
@@ -793,6 +805,7 @@ impl RolloutExecutor {
             adapter_sha256: request.adapter_sha256,
             backend_model: backend_model.clone(),
             source: AdapterSource::Filesystem,
+            #[cfg(target_os = "linux")]
             device_token_fingerprint: None,
             active: AtomicUsize::new(0),
             retiring: AtomicBool::new(false),
@@ -849,7 +862,7 @@ impl RolloutExecutor {
         })
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     pub(crate) async fn publish_device_policy(
         self: &Arc<Self>,
         request: PublishDeviceRolloutPolicyRequest,
@@ -1071,8 +1084,8 @@ impl RolloutExecutor {
         }
         match entry.source {
             AdapterSource::Filesystem => self.unload_adapter(&entry.backend_model).await?,
+            #[cfg(target_os = "linux")]
             AdapterSource::Device => {
-                #[cfg(unix)]
                 self.config
                     .device_handoff
                     .as_ref()
@@ -1083,10 +1096,6 @@ impl RolloutExecutor {
                     })?
                     .unload(&entry.backend_model)
                     .await?;
-                #[cfg(not(unix))]
-                return Err(RolloutError::Unavailable(
-                    "device-resident rollout handoff requires a Unix host".into(),
-                ));
             }
         }
         let mut state = self.policy_state.write().await;

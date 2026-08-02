@@ -19,7 +19,7 @@
 //! ```
 
 pub mod admission;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub(crate) mod device_handoff;
 #[path = "errors.rs"]
 pub mod error;

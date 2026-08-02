@@ -160,7 +160,7 @@ pub async fn publish_device_policy(
     Path(name): Path<String>,
     Json(request): Json<PublishDeviceRolloutPolicyRequest>,
 ) -> Result<(StatusCode, Json<RolloutPolicyInfo>), ApiError> {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         let executor = state.rollout().get(&name).await.map_err(ApiError::from)?;
         let policy = executor
@@ -169,11 +169,11 @@ pub async fn publish_device_policy(
             .map_err(ApiError::from)?;
         Ok((StatusCode::CREATED, Json(policy)))
     }
-    #[cfg(not(unix))]
+    #[cfg(not(target_os = "linux"))]
     {
         let _ = (state, name, request);
         Err(ApiError::BadRequest(
-            "device-resident rollout handoff requires a Unix host".into(),
+            "device-resident rollout handoff requires Linux".into(),
         ))
     }
 }
