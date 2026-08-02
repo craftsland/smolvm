@@ -902,6 +902,16 @@ struct GoldenLayout {
     /// worker). Shared with the process-wide content cache and handoff snapshots
     /// so preparing a clone never deep-copies multi-gigabyte module state.
     modules: HashMap<u64, std::sync::Arc<[u8]>>,
+    /// Linux keeps a second, append-only representation of module images in an
+    /// unlinked regular file while the golden loads. Clone handoffs can then
+    /// serialize only handle metadata and map these already-materialized bytes
+    /// instead of rewriting every image at first fork.
+    #[cfg(target_os = "linux")]
+    module_image_store: Option<ModuleImageStore>,
+    /// A store write failure permanently selects the existing owned-image
+    /// fallback for this layout; repeatedly retrying could mix partial stores.
+    #[cfg(target_os = "linux")]
+    module_image_store_failed: bool,
     /// M3a: golden function handle → (module handle, name) — the worker re-resolves
     /// it in its reloaded module and remaps the inherited raw CUfunction handle.
     functions: HashMap<u64, (u64, String)>,
@@ -941,6 +951,13 @@ struct GoldenLayout {
     lib_handles: Vec<(u8, u16, u64, Vec<u8>)>,
     /// Host GPU the golden is pinned to — clones must reconstruct on it.
     device_base: i32,
+}
+
+#[cfg(target_os = "linux")]
+struct ModuleImageStore {
+    writable: std::fs::File,
+    bytes: u64,
+    ranges: HashMap<u64, (u64, u64)>,
 }
 type LayoutCell = std::sync::Mutex<GoldenLayout>;
 static DPTR_HANDOFF: std::sync::Mutex<Option<HashMap<u64, std::sync::Weak<AllocTable>>>> =
@@ -1265,6 +1282,60 @@ pub fn module_handoff_snapshot(
     let graphs = g.graphs.clone();
     let lib_handles = g.lib_handles.clone();
     Some((modules, funcs, streams, events, graphs, lib_handles))
+}
+
+/// Read-only snapshot of the append-only Linux module-image store.
+///
+/// The returned ranges cover every module in the same process layout or the
+/// function returns `None`, allowing the daemon to retain its existing
+/// self-contained handoff fallback after any store failure.
+#[cfg(target_os = "linux")]
+pub struct ModuleImageStoreSnapshot {
+    pub file: std::fs::File,
+    pub ranges: HashMap<u64, (u64, u64)>,
+    pub bytes: u64,
+}
+
+#[cfg(target_os = "linux")]
+pub fn module_image_store_snapshot(
+    token: u64,
+) -> std::io::Result<Option<ModuleImageStoreSnapshot>> {
+    use std::os::fd::AsRawFd;
+
+    let Some(layout) = layout_handoff_lookup(token) else {
+        return Ok(None);
+    };
+    let golden = layout.lock().unwrap();
+    let Some(store) = golden.module_image_store.as_ref() else {
+        return Ok(None);
+    };
+    if golden.modules.len() != store.ranges.len()
+        || golden
+            .modules
+            .keys()
+            .any(|handle| !store.ranges.contains_key(handle))
+        || store.ranges.values().any(|(offset, length)| {
+            offset
+                .checked_add(*length)
+                .is_none_or(|end| end > store.bytes)
+        })
+    {
+        return Ok(None);
+    }
+    let path = format!("/proc/self/fd/{}", store.writable.as_raw_fd());
+    let file = std::fs::OpenOptions::new().read(true).open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() || metadata.len() < store.bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "CUDA module image store is truncated or not a regular file",
+        ));
+    }
+    Ok(Some(ModuleImageStoreSnapshot {
+        file,
+        ranges: store.ranges.clone(),
+        bytes: store.bytes,
+    }))
 }
 
 /// Current version of the module/handle state serialized for clone workers.
@@ -2198,6 +2269,76 @@ fn module_cache_put(image: std::sync::Arc<[u8]>) {
 
 fn module_cache_get(key: &ModuleCacheKey) -> Option<std::sync::Arc<[u8]>> {
     module_cache().lock().unwrap().get(key).cloned()
+}
+
+#[cfg(target_os = "linux")]
+fn create_module_image_store() -> std::io::Result<ModuleImageStore> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    static NEXT_STORE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let directory = std::env::temp_dir().join("smolvm");
+    std::fs::create_dir_all(&directory)?;
+    for _ in 0..16 {
+        let sequence = NEXT_STORE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = directory.join(format!(
+            "cuda-module-images-{}-{sequence:016x}",
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(file) => {
+                if let Err(error) = std::fs::remove_file(&path) {
+                    drop(file);
+                    let _ = std::fs::remove_file(path);
+                    return Err(error);
+                }
+                return Ok(ModuleImageStore {
+                    writable: file,
+                    bytes: 0,
+                    ranges: HashMap::new(),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique CUDA module image store",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn retain_module_image(layout: &mut GoldenLayout, handle: u64, image: &[u8]) {
+    if layout.module_image_store_failed {
+        return;
+    }
+    if layout.module_image_store.is_none() {
+        match create_module_image_store() {
+            Ok(store) => layout.module_image_store = Some(store),
+            Err(error) => {
+                layout.module_image_store_failed = true;
+                eprintln!("[cuda-module-store] disabled after create failure: {error}");
+                return;
+            }
+        }
+    }
+    let store = layout.module_image_store.as_mut().unwrap();
+    let offset = store.bytes;
+    let length = image.len() as u64;
+    if let Err(error) = store.writable.write_all(image) {
+        layout.module_image_store = None;
+        layout.module_image_store_failed = true;
+        eprintln!("[cuda-module-store] disabled after append failure: {error}");
+        return;
+    }
+    store.ranges.insert(handle, (offset, length));
+    store.bytes = store.bytes.saturating_add(length);
 }
 
 /// Mark the allocation containing `dptr` as loaded (H2D-written → read-only
@@ -4055,6 +4196,8 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             // its own context and remap this inherited handle.
             if path3_enabled() {
                 let mut layout = sess.golden_layout.lock().unwrap();
+                #[cfg(target_os = "linux")]
+                retain_module_image(&mut layout, raw, &image);
                 layout.modules.insert(raw, image);
                 layout.handoff_revision = layout.handoff_revision.wrapping_add(1);
             }
@@ -4649,6 +4792,8 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                     sess.owned_modules.insert(raw);
                     if path3_enabled() {
                         let mut layout = sess.golden_layout.lock().unwrap();
+                        #[cfg(target_os = "linux")]
+                        retain_module_image(&mut layout, raw, &image);
                         layout.modules.insert(raw, image.clone());
                         layout.handoff_revision = layout.handoff_revision.wrapping_add(1);
                     }
@@ -5336,6 +5481,43 @@ mod tests {
         drop(file);
         assert_eq!(range.as_slice(), b"3456");
         assert!(range.slice(4, 1).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn module_image_store_snapshot_covers_every_retained_module() {
+        use std::os::unix::fs::FileExt as _;
+
+        let layout: Arc<LayoutCell> = Arc::new(Mutex::new(GoldenLayout::default()));
+        let first: Arc<[u8]> = b"first-module-image".as_slice().into();
+        let second: Arc<[u8]> = b"second-module-image".as_slice().into();
+        {
+            let mut golden = layout.lock().unwrap();
+            retain_module_image(&mut golden, 0x10, &first);
+            retain_module_image(&mut golden, 0x20, &second);
+            golden.modules.insert(0x10, first.clone());
+            golden.modules.insert(0x20, second.clone());
+        }
+        let token = 0xA6A6_0000_0000_0001;
+        layout_handoff_register(&layout, token);
+
+        let snapshot = module_image_store_snapshot(token).unwrap().unwrap();
+        assert_eq!(snapshot.bytes, (first.len() + second.len()) as u64);
+        let mut actual = vec![0; snapshot.bytes as usize];
+        snapshot.file.read_exact_at(&mut actual, 0).unwrap();
+        assert_eq!(actual, [first.as_ref(), second.as_ref()].concat());
+        assert_eq!(snapshot.ranges.get(&0x10), Some(&(0, first.len() as u64)));
+        assert_eq!(
+            snapshot.ranges.get(&0x20),
+            Some(&(first.len() as u64, second.len() as u64))
+        );
+
+        layout
+            .lock()
+            .unwrap()
+            .modules
+            .insert(0x30, b"not-in-store".as_slice().into());
+        assert!(module_image_store_snapshot(token).unwrap().is_none());
     }
 
     #[test]
