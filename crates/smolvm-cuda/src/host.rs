@@ -16,6 +16,10 @@ use crate::proto::{
 };
 use std::collections::{hash_map::Entry, HashMap};
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::fd::OwnedFd;
+#[cfg(unix)]
+use std::sync::{Arc, Mutex};
 
 /// `Ok(value)` or `Err(CUresult)` — a non-zero CUDA error code.
 pub type CuResult<T> = Result<T, i32>;
@@ -27,6 +31,48 @@ const VHANDLE_TAG: u64 = 1 << 63;
 /// `CUDA_ERROR_NOT_FOUND`.
 pub const CUDA_ERROR_NOT_FOUND: i32 = 500;
 pub const CUDA_ERROR_NOT_SUPPORTED: i32 = 801;
+
+const MAX_PUBLISHED_TENSORS: usize = 65_536;
+const MAX_PUBLISHED_MANIFEST: usize = 1 << 20;
+const MAX_PUBLISHED_BYTES: u64 = 16 << 30;
+
+/// One range inside a packed device-resident tensor bundle. Offsets are chosen
+/// by the host from the explicit source ranges; the caller's manifest cannot
+/// redirect a consumer to memory outside this allocation.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublishedTensorRange {
+    pub offset: u64,
+    pub size: u64,
+}
+
+/// An immutable allocation staged for a local managed consumer. `allocation`
+/// owns the CUDA-export fd; dropping an unconsumed bundle releases that driver
+/// reference automatically.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct DeviceTensorBundle {
+    pub allocation: OwnedFd,
+    pub allocation_size: u64,
+    pub manifest: Vec<u8>,
+    pub tensors: Vec<PublishedTensorRange>,
+}
+
+#[cfg(unix)]
+pub type TensorBundlePublisher =
+    dyn Fn(DeviceTensorBundle) -> CuResult<Vec<u8>> + Send + Sync + 'static;
+
+/// Process-local publication hook installed only by an isolated clone worker.
+/// The shared daemon intentionally leaves this unset: a request can therefore
+/// never use a shared CUDA context to name another session's allocation.
+#[cfg(unix)]
+static TENSOR_BUNDLE_PUBLISHER: Mutex<Option<Arc<TensorBundlePublisher>>> = Mutex::new(None);
+
+/// Install or clear the clone worker's tensor-bundle sink.
+#[cfg(unix)]
+pub fn set_tensor_bundle_publisher(publisher: Option<Arc<TensorBundlePublisher>>) {
+    *TENSOR_BUNDLE_PUBLISHER.lock().unwrap() = publisher;
+}
 
 /// M3b: one KERNEL node of a captured CUDA graph, in a portable form. `func` is
 /// the golden's `CUfunction` (re-resolved in the worker); `params` are the raw
@@ -356,6 +402,101 @@ pub trait Backend: Send {
     fn mem_import_handle(&mut self, _fd: i32) -> CuResult<u64> {
         Err(CUDA_ERROR_NOT_SUPPORTED)
     }
+}
+
+#[cfg(unix)]
+fn tensor_publish_stage<T>(stage: &str, result: CuResult<T>) -> CuResult<T> {
+    if let Err(error) = &result {
+        eprintln!("[cuda-tensor-publish] {stage} failed code={error}");
+    }
+    result
+}
+
+#[cfg(unix)]
+fn publish_tensor_bundle(
+    b: &mut dyn Backend,
+    device: i32,
+    manifest: Vec<u8>,
+    tensors: Vec<(u64, u64)>,
+) -> CuResult<Vec<u8>> {
+    use std::os::fd::FromRawFd;
+
+    if manifest.len() > MAX_PUBLISHED_MANIFEST
+        || tensors.is_empty()
+        || tensors.len() > MAX_PUBLISHED_TENSORS
+        || tensors.iter().any(|&(dptr, size)| dptr == 0 || size == 0)
+    {
+        return Err(CUDA_ERROR_INVALID_HANDLE);
+    }
+    let publisher = TENSOR_BUNDLE_PUBLISHER
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or(CUDA_ERROR_NOT_SUPPORTED)?;
+    let payload_size = tensors.iter().try_fold(0u64, |total, &(_, size)| {
+        total.checked_add(size).ok_or(CUDA_ERROR_INVALID_HANDLE)
+    })?;
+    if payload_size > MAX_PUBLISHED_BYTES {
+        return Err(CUDA_ERROR_INVALID_HANDLE);
+    }
+    let granularity = tensor_publish_stage(
+        "allocation granularity",
+        b.mem_get_allocation_granularity(device, 0),
+    )?
+    .max(1 << 16);
+    let allocation_size = payload_size
+        .checked_add(granularity - 1)
+        .ok_or(CUDA_ERROR_INVALID_HANDLE)?
+        / granularity
+        * granularity;
+    let handle = tensor_publish_stage(
+        "exportable allocation",
+        b.mem_create_exportable(allocation_size, device),
+    )?;
+    let va = match b.mem_address_reserve(allocation_size, 0) {
+        Ok(va) => va,
+        Err(error) => {
+            eprintln!("[cuda-tensor-publish] address reservation failed code={error}");
+            let _ = b.mem_release(handle);
+            return Err(error);
+        }
+    };
+    let mut mapped = false;
+    let staged: CuResult<DeviceTensorBundle> = (|| {
+        tensor_publish_stage("allocation map", b.mem_map(va, allocation_size, 0, handle))?;
+        mapped = true;
+        tensor_publish_stage(
+            "allocation access",
+            b.mem_set_access(va, allocation_size, device),
+        )?;
+        let mut offset = 0u64;
+        let mut ranges = Vec::with_capacity(tensors.len());
+        for (dptr, size) in tensors {
+            tensor_publish_stage("device copy", b.memcpy_dtod(va + offset, dptr, size))?;
+            ranges.push(PublishedTensorRange { offset, size });
+            offset += size;
+        }
+        // The export must not become visible before work on framework-owned
+        // streams has settled and every D2D copy into the immutable allocation
+        // is complete.
+        tensor_publish_stage("copy synchronization", b.ctx_synchronize())?;
+        let fd = tensor_publish_stage("allocation export", b.mem_export_handle(handle))?;
+        // SAFETY: a successful backend export transfers one newly owned POSIX
+        // descriptor; OwnedFd closes it on every callback/error path.
+        let allocation = unsafe { OwnedFd::from_raw_fd(fd) };
+        Ok(DeviceTensorBundle {
+            allocation,
+            allocation_size,
+            manifest,
+            tensors: ranges,
+        })
+    })();
+    if mapped {
+        let _ = b.mem_unmap(va, allocation_size);
+    }
+    let _ = b.mem_address_free(va, allocation_size);
+    let _ = b.mem_release(handle);
+    tensor_publish_stage("parent publication channel", publisher(staged?))
 }
 
 /// Per-connection opaque→raw handle translation. Ids are dense and monotonic so
@@ -2189,6 +2330,15 @@ fn translate_dptrs(trans: &[(u64, u64, u64)], req: Request) -> Request {
             c: xlat(trans, c),
             ldc,
         },
+        Request::PublishTensorBundle {
+            manifest,
+            mut tensors,
+        } => {
+            for (dptr, _) in &mut tensors {
+                *dptr = xlat(trans, *dptr);
+            }
+            Request::PublishTensorBundle { manifest, tensors }
+        }
         // LibCall (cuBLAS/cuDNN) device-pointer args are translated TYPED in the
         // generated dispatch via `gpu::dptr_resolve` (a byte-scan of the packed,
         // mixed-width arg buffer would mis-align and corrupt scalars), driven by
@@ -4586,6 +4736,17 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         Request::MemGetAllocationGranularity { device, flags } => b
             .mem_get_allocation_granularity(dev(sess, device), flags)
             .map(Response::Bytes),
+        Request::PublishTensorBundle { manifest, tensors } => {
+            #[cfg(unix)]
+            {
+                publish_tensor_bundle(b, sess.device_base, manifest, tensors).map(Response::Data)
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (manifest, tensors);
+                Err(CUDA_ERROR_NOT_SUPPORTED)
+            }
+        }
     })();
     let (status, resp) = match r {
         Ok(resp) => (0, resp),

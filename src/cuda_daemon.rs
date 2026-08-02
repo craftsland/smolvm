@@ -13,10 +13,12 @@
 use crate::platform::uds::UdsListener;
 use smolvm_cuda::host::{serve, serve_with_options, Backend, CpuBackend, GpuBackend, ServeOptions};
 use std::io;
-use std::os::unix::net::UnixStream;
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -28,6 +30,448 @@ pub fn socket_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("smolvm"));
     root.join("cuda-daemon.sock")
+}
+
+const TENSOR_PUBLISH_MAGIC: [u8; 4] = *b"TBP1";
+const TENSOR_CONSUME_MAGIC: [u8; 4] = *b"TBC1";
+const TENSOR_RESPONSE_MAGIC: [u8; 4] = *b"TBR1";
+const MAX_TENSOR_BUNDLE_METADATA: usize = (2 << 20) + 64;
+const MAX_PENDING_TENSOR_BUNDLES: usize = 64;
+const MAX_PENDING_TENSOR_BYTES: u64 = 32 << 30;
+const TENSOR_BUNDLE_TTL: Duration = Duration::from_secs(60);
+static TENSOR_BUNDLE_SERVICE_READY: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug)]
+struct PendingTensorBundle {
+    allocation: OwnedFd,
+    allocation_size: u64,
+    metadata: Vec<u8>,
+    created: Instant,
+}
+
+fn pending_tensor_bundles(
+) -> &'static Mutex<std::collections::HashMap<Vec<u8>, PendingTensorBundle>> {
+    static BUNDLES: OnceLock<Mutex<std::collections::HashMap<Vec<u8>, PendingTensorBundle>>> =
+        OnceLock::new();
+    BUNDLES.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn tensor_bundle_socket_path(cuda_socket: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.tensors", cuda_socket.display()))
+}
+
+/// One immutable device allocation redeemed from a clone worker publication.
+///
+/// The descriptor is owned by the caller. Dropping it releases only this
+/// process's reference; a descriptor already transferred with `SCM_RIGHTS`
+/// remains valid in the receiving process.
+pub(crate) struct RedeemedTensorBundle {
+    pub(crate) allocation: OwnedFd,
+    pub(crate) allocation_size: u64,
+    pub(crate) metadata: Vec<u8>,
+}
+
+fn prune_tensor_bundles(
+    bundles: &mut std::collections::HashMap<Vec<u8>, PendingTensorBundle>,
+    now: Instant,
+) {
+    bundles.retain(|_, bundle| now.duration_since(bundle.created) < TENSOR_BUNDLE_TTL);
+}
+
+fn pending_tensor_bytes(bundles: &std::collections::HashMap<Vec<u8>, PendingTensorBundle>) -> u64 {
+    bundles.values().map(|bundle| bundle.allocation_size).sum()
+}
+
+fn fresh_tensor_token() -> io::Result<Vec<u8>> {
+    let mut token = vec![0u8; 32];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut token)?;
+    Ok(token)
+}
+
+fn encode_tensor_bundle_metadata(bundle: &smolvm_cuda::host::DeviceTensorBundle) -> Vec<u8> {
+    let mut metadata = Vec::with_capacity(8 + bundle.manifest.len() + bundle.tensors.len() * 16);
+    metadata.extend_from_slice(&(bundle.manifest.len() as u32).to_le_bytes());
+    metadata.extend_from_slice(&(bundle.tensors.len() as u32).to_le_bytes());
+    metadata.extend_from_slice(&bundle.manifest);
+    for tensor in &bundle.tensors {
+        metadata.extend_from_slice(&tensor.offset.to_le_bytes());
+        metadata.extend_from_slice(&tensor.size.to_le_bytes());
+    }
+    metadata
+}
+
+fn validate_tensor_bundle_metadata(metadata: &[u8], allocation_size: u64) -> io::Result<()> {
+    if metadata.len() < 8 || metadata.len() > MAX_TENSOR_BUNDLE_METADATA {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid tensor-bundle metadata length",
+        ));
+    }
+    let manifest_len = u32::from_le_bytes(metadata[0..4].try_into().unwrap()) as usize;
+    let count = u32::from_le_bytes(metadata[4..8].try_into().unwrap()) as usize;
+    let expected = 8usize
+        .checked_add(manifest_len)
+        .and_then(|size| size.checked_add(count.checked_mul(16)?))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "metadata overflow"))?;
+    if expected != metadata.len() || manifest_len > 1 << 20 || count == 0 || count > 65_536 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "inconsistent tensor-bundle metadata",
+        ));
+    }
+    let mut prior_end = 0u64;
+    for tensor in metadata[8 + manifest_len..].chunks_exact(16) {
+        let offset = u64::from_le_bytes(tensor[0..8].try_into().unwrap());
+        let size = u64::from_le_bytes(tensor[8..16].try_into().unwrap());
+        let end = offset
+            .checked_add(size)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "tensor range overflow"))?;
+        if size == 0 || offset != prior_end || end > allocation_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "tensor range falls outside its allocation",
+            ));
+        }
+        prior_end = end;
+    }
+    Ok(())
+}
+
+fn send_fd_header(stream: &UnixStream, fd: i32, header: &[u8; 16]) -> io::Result<()> {
+    let mut iov = libc::iovec {
+        iov_base: header.as_ptr() as *mut libc::c_void,
+        iov_len: header.len(),
+    };
+    // SAFETY: standard sendmsg with one immutable header and one owned fd. The
+    // receiving process gets its own descriptor reference through SCM_RIGHTS.
+    unsafe {
+        let mut cmsgbuf = [0u8; 32];
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsgbuf.as_mut_ptr().cast();
+        msg.msg_controllen = libc::CMSG_SPACE(4) as _;
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(4) as _;
+        std::ptr::copy_nonoverlapping((&fd as *const i32).cast::<u8>(), libc::CMSG_DATA(cmsg), 4);
+        let sent = libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL);
+        if sent < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if sent as usize != header.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short tensor-bundle control header",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn recv_fd_header(stream: &mut UnixStream) -> io::Result<Option<(OwnedFd, [u8; 16])>> {
+    let mut header = [0u8; 16];
+    let mut iov = libc::iovec {
+        iov_base: header.as_mut_ptr().cast(),
+        iov_len: header.len(),
+    };
+    // SAFETY: recvmsg writes within the fixed header/control buffers. A valid
+    // SCM_RIGHTS message transfers ownership of exactly one descriptor.
+    let (received, fd) = unsafe {
+        let mut cmsgbuf = [0u8; 32];
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsgbuf.as_mut_ptr().cast();
+        msg.msg_controllen = libc::CMSG_SPACE(4) as _;
+        #[cfg(target_os = "linux")]
+        let flags = libc::MSG_CMSG_CLOEXEC;
+        #[cfg(not(target_os = "linux"))]
+        let flags = 0;
+        let received = libc::recvmsg(stream.as_raw_fd(), &mut msg, flags);
+        if received < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if received == 0 {
+            return Ok(None);
+        }
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        if cmsg.is_null()
+            || msg.msg_flags & libc::MSG_CTRUNC != 0
+            || (*cmsg).cmsg_level != libc::SOL_SOCKET
+            || (*cmsg).cmsg_type != libc::SCM_RIGHTS
+            || (*cmsg).cmsg_len != libc::CMSG_LEN(4) as usize
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "tensor-bundle message did not contain one fd",
+            ));
+        }
+        let mut fd = -1;
+        std::ptr::copy_nonoverlapping(libc::CMSG_DATA(cmsg), (&mut fd as *mut i32).cast(), 4);
+        (received as usize, fd)
+    };
+    if received < header.len() {
+        stream.read_exact(&mut header[received..])?;
+    }
+    // SAFETY: SCM_RIGHTS returned a new descriptor owned by this process.
+    Ok(Some((unsafe { OwnedFd::from_raw_fd(fd) }, header)))
+}
+
+fn send_tensor_bundle_to_parent(
+    stream: &mut UnixStream,
+    bundle: smolvm_cuda::host::DeviceTensorBundle,
+) -> smolvm_cuda::host::CuResult<Vec<u8>> {
+    let channel_error = |stage: &'static str, error: io::Error| {
+        tracing::warn!(%error, stage, "tensor-bundle publication channel failed");
+        999
+    };
+    let metadata = encode_tensor_bundle_metadata(&bundle);
+    let mut header = [0u8; 16];
+    header[..4].copy_from_slice(&TENSOR_PUBLISH_MAGIC);
+    header[4..8].copy_from_slice(&(metadata.len() as u32).to_le_bytes());
+    header[8..16].copy_from_slice(&bundle.allocation_size.to_le_bytes());
+    send_fd_header(stream, bundle.allocation.as_raw_fd(), &header)
+        .map_err(|error| channel_error("descriptor", error))?;
+    stream
+        .write_all(&metadata)
+        .map_err(|error| channel_error("metadata", error))?;
+    let mut ack = [0u8; 8];
+    stream
+        .read_exact(&mut ack)
+        .map_err(|error| channel_error("acknowledgement", error))?;
+    let status = i32::from_le_bytes(ack[..4].try_into().unwrap());
+    let token_len = u32::from_le_bytes(ack[4..].try_into().unwrap()) as usize;
+    if status != 0 {
+        return Err(status);
+    }
+    if token_len == 0 || token_len > 256 {
+        return Err(999);
+    }
+    let mut token = vec![0u8; token_len];
+    stream
+        .read_exact(&mut token)
+        .map_err(|error| channel_error("token", error))?;
+    Ok(token)
+}
+
+fn tensor_bundle_receiver(mut stream: UnixStream, worker_pid: u32) {
+    loop {
+        let received = match recv_fd_header(&mut stream) {
+            Ok(Some(received)) => received,
+            Ok(None) => break,
+            Err(error) => {
+                tracing::warn!(%error, worker_pid, "tensor-bundle worker channel ended");
+                break;
+            }
+        };
+        let (allocation, header) = received;
+        let mut status = 0i32;
+        let mut token = Vec::new();
+        let mut close_after_ack = false;
+        let metadata_len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+        let allocation_size = u64::from_le_bytes(header[8..16].try_into().unwrap());
+        let mut metadata = vec![0u8; metadata_len.min(MAX_TENSOR_BUNDLE_METADATA)];
+        if header[..4] != TENSOR_PUBLISH_MAGIC
+            || metadata_len == 0
+            || metadata_len > MAX_TENSOR_BUNDLE_METADATA
+            || allocation_size == 0
+        {
+            status = 1;
+            close_after_ack = true;
+        } else if stream.read_exact(&mut metadata).is_err() {
+            status = 999;
+            close_after_ack = true;
+        } else if validate_tensor_bundle_metadata(&metadata, allocation_size).is_err() {
+            status = 1;
+        } else {
+            let mut bundles = pending_tensor_bundles().lock().unwrap();
+            prune_tensor_bundles(&mut bundles, Instant::now());
+            let capacity_available = bundles.len() < MAX_PENDING_TENSOR_BUNDLES
+                && pending_tensor_bytes(&bundles)
+                    .checked_add(allocation_size)
+                    .is_some_and(|total| total <= MAX_PENDING_TENSOR_BYTES);
+            if !capacity_available {
+                status = 2;
+            } else {
+                for _ in 0..4 {
+                    match fresh_tensor_token() {
+                        Ok(candidate) if !bundles.contains_key(&candidate) => {
+                            token = candidate;
+                            break;
+                        }
+                        Ok(_) => continue,
+                        Err(_) => break,
+                    }
+                }
+                if token.is_empty() {
+                    status = 999;
+                } else {
+                    bundles.insert(
+                        token.clone(),
+                        PendingTensorBundle {
+                            allocation,
+                            allocation_size,
+                            metadata,
+                            created: Instant::now(),
+                        },
+                    );
+                }
+            }
+        }
+        let mut ack = [0u8; 8];
+        ack[..4].copy_from_slice(&status.to_le_bytes());
+        ack[4..].copy_from_slice(&(token.len() as u32).to_le_bytes());
+        if stream.write_all(&ack).is_err()
+            || (!token.is_empty() && stream.write_all(&token).is_err())
+            || close_after_ack
+        {
+            if !token.is_empty() {
+                pending_tensor_bundles().lock().unwrap().remove(&token);
+            }
+            break;
+        }
+    }
+}
+
+fn spawn_tensor_bundle_receiver(stream: UnixStream, worker_pid: u32) -> io::Result<()> {
+    thread::Builder::new()
+        .name(format!("cuda-tensor-publisher-{worker_pid}"))
+        .spawn(move || tensor_bundle_receiver(stream, worker_pid))?;
+    Ok(())
+}
+
+fn send_tensor_bundle_to_consumer(
+    stream: &mut UnixStream,
+    bundle: &PendingTensorBundle,
+) -> io::Result<()> {
+    let mut header = [0u8; 16];
+    header[..4].copy_from_slice(&TENSOR_RESPONSE_MAGIC);
+    header[4..8].copy_from_slice(&(bundle.metadata.len() as u32).to_le_bytes());
+    header[8..16].copy_from_slice(&bundle.allocation_size.to_le_bytes());
+    send_fd_header(stream, bundle.allocation.as_raw_fd(), &header)?;
+    stream.write_all(&bundle.metadata)
+}
+
+fn serve_tensor_bundle_consumer(mut stream: UnixStream) -> io::Result<()> {
+    let mut header = [0u8; 6];
+    stream.read_exact(&mut header)?;
+    if header[..4] != TENSOR_CONSUME_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid tensor-bundle consume request",
+        ));
+    }
+    let token_len = u16::from_le_bytes(header[4..6].try_into().unwrap()) as usize;
+    if token_len == 0 || token_len > 256 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid tensor-bundle token length",
+        ));
+    }
+    let mut token = vec![0u8; token_len];
+    stream.read_exact(&mut token)?;
+    let bundle = {
+        let mut bundles = pending_tensor_bundles().lock().unwrap();
+        prune_tensor_bundles(&mut bundles, Instant::now());
+        bundles.remove(&token)
+    }
+    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "tensor bundle expired"))?;
+    // Once SCM_RIGHTS starts, the receiver may own a descriptor even when a
+    // later metadata write fails. Never restore the token and risk two
+    // consumers observing one supposedly one-use publication.
+    send_tensor_bundle_to_consumer(&mut stream, &bundle)
+}
+
+fn redeem_tensor_bundle_from_stream(
+    mut stream: UnixStream,
+    token: &[u8],
+) -> io::Result<RedeemedTensorBundle> {
+    if token.is_empty() || token.len() > 256 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid tensor-bundle token length",
+        ));
+    }
+    stream.write_all(&TENSOR_CONSUME_MAGIC)?;
+    stream.write_all(&(token.len() as u16).to_le_bytes())?;
+    stream.write_all(token)?;
+    let (allocation, header) = recv_fd_header(&mut stream)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "tensor-bundle service closed without a response",
+        )
+    })?;
+    if header[..4] != TENSOR_RESPONSE_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid tensor-bundle response",
+        ));
+    }
+    let metadata_len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+    let allocation_size = u64::from_le_bytes(header[8..16].try_into().unwrap());
+    if metadata_len == 0 || metadata_len > MAX_TENSOR_BUNDLE_METADATA || allocation_size == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid tensor-bundle response dimensions",
+        ));
+    }
+    let mut metadata = vec![0u8; metadata_len];
+    stream.read_exact(&mut metadata)?;
+    validate_tensor_bundle_metadata(&metadata, allocation_size)?;
+    Ok(RedeemedTensorBundle {
+        allocation,
+        allocation_size,
+        metadata,
+    })
+}
+
+/// Redeem a clone worker's random one-use publication token into an owned GPU
+/// allocation. This is intentionally crate-private: only smolvm's managed
+/// rollout executor may cross the daemon's bearer-token boundary.
+pub(crate) fn redeem_tensor_bundle(token: &[u8]) -> io::Result<RedeemedTensorBundle> {
+    let stream = UnixStream::connect(tensor_bundle_socket_path(&socket_path()))?;
+    redeem_tensor_bundle_from_stream(stream, token)
+}
+
+fn spawn_tensor_bundle_service(cuda_socket: &Path) -> io::Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = tensor_bundle_socket_path(cuda_socket);
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    let service_path = path.clone();
+    thread::Builder::new()
+        .name("cuda-tensor-consumer".into())
+        .spawn(move || {
+            for connection in listener.incoming() {
+                match connection {
+                    Ok(stream) => {
+                        let _ = thread::Builder::new()
+                            .name("cuda-tensor-consume".into())
+                            .spawn(move || {
+                                if let Err(error) = serve_tensor_bundle_consumer(stream) {
+                                    tracing::debug!(%error, "tensor-bundle consume failed");
+                                }
+                            });
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, "tensor-bundle listener ended");
+                        break;
+                    }
+                }
+            }
+        })?;
+    thread::Builder::new()
+        .name("cuda-tensor-reaper".into())
+        .spawn(|| loop {
+            thread::sleep(Duration::from_secs(5));
+            let mut bundles = pending_tensor_bundles().lock().unwrap();
+            prune_tensor_bundles(&mut bundles, Instant::now());
+        })?;
+    Ok(service_path)
 }
 
 /// Pure policy helper for the managed MPS default.
@@ -622,6 +1066,16 @@ pub fn run(sock: &Path) -> io::Result<()> {
     #[cfg(unix)]
     install_shutdown_handler(sock);
     let listener = UdsListener::bind(sock)?;
+    match spawn_tensor_bundle_service(sock) {
+        Ok(path) => {
+            TENSOR_BUNDLE_SERVICE_READY.store(true, Ordering::Release);
+            tracing::info!(socket = %path.display(), "device-resident tensor service listening");
+        }
+        Err(error) => tracing::warn!(
+            %error,
+            "device-resident tensor publication disabled; CUDA serving remains available"
+        ),
+    }
     // Must precede listener threads and the first GpuBackend::load. Clone
     // workers inherit the endpoint from this daemon. Starting only after the
     // socket is exclusively bound avoids briefly starting MPS in a losing
@@ -1150,6 +1604,20 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
     // Our own primary context (separate process ⇒ own UVA), so we can place memory
     // at the golden's exact VAs.
     let _ = backend.init();
+    if let Some(fd) = std::env::var("SMOLVM_CUDA_CLONE_PUBLISH_CTRL")
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+    {
+        // SAFETY: spawn_clone_worker transfers sole ownership of this inherited
+        // descriptor to the worker and clears CLOEXEC before exec.
+        let stream = unsafe { UnixStream::from_raw_fd(fd) };
+        let stream = Arc::new(Mutex::new(stream));
+        let publisher: Arc<smolvm_cuda::host::TensorBundlePublisher> = Arc::new(move |bundle| {
+            let mut stream = stream.lock().map_err(|_| 999)?;
+            send_tensor_bundle_to_parent(&mut stream, bundle)
+        });
+        smolvm_cuda::host::set_tensor_bundle_publisher(Some(publisher));
+    }
     // Reconstruct on the GOLDEN's GPU: the exported physical lives there.
     let clone_dev: i32 = std::env::var("SMOLVM_CUDA_CLONE_DEVICE")
         .ok()
@@ -4060,8 +4528,25 @@ fn spawn_clone_worker(
         }
         return Err(error);
     }
+    let publish_enabled = TENSOR_BUNDLE_SERVICE_READY.load(Ordering::Acquire);
+    let mut publish_sp = [-1i32; 2];
+    if publish_enabled
+        && unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, publish_sp.as_mut_ptr()) }
+            != 0
+    {
+        let error = io::Error::last_os_error();
+        unsafe {
+            libc::close(sp[0]);
+            libc::close(sp[1]);
+        }
+        for fd in export_fds {
+            unsafe { libc::close(fd) };
+        }
+        return Err(error);
+    }
     let ctrl_slot = 4 + export_fds.len() as i32;
-    let source_minimum = ctrl_slot + 1;
+    let publish_slot = ctrl_slot + 1;
+    let source_minimum = publish_slot + i32::from(publish_enabled);
     // Lift the control source and every exported-memory source above the whole
     // dup2 destination range. Hundreds of VMM chunks can extend beyond any
     // fixed descriptor floor.
@@ -4072,17 +4557,46 @@ fn spawn_clone_worker(
         let error = io::Error::last_os_error();
         // SAFETY: closing the parent end we created above.
         unsafe { libc::close(sp[0]) };
+        if publish_enabled {
+            unsafe {
+                libc::close(publish_sp[0]);
+                libc::close(publish_sp[1]);
+            }
+        }
         for fd in export_fds {
             unsafe { libc::close(fd) };
         }
         return Err(error);
     }
+    let publish_child = if publish_enabled {
+        let fd = unsafe { libc::fcntl(publish_sp[1], libc::F_DUPFD_CLOEXEC, source_minimum) };
+        unsafe { libc::close(publish_sp[1]) };
+        if fd < 0 {
+            let error = io::Error::last_os_error();
+            unsafe {
+                libc::close(sp[0]);
+                libc::close(ctrl_child);
+                libc::close(publish_sp[0]);
+            }
+            for fd in export_fds {
+                unsafe { libc::close(fd) };
+            }
+            return Err(error);
+        }
+        fd
+    } else {
+        -1
+    };
     let export_fds = match lift_owned_fds(export_fds, source_minimum) {
         Ok(fds) => fds,
         Err(error) => {
             unsafe {
                 libc::close(sp[0]);
                 libc::close(ctrl_child);
+                if publish_enabled {
+                    libc::close(publish_sp[0]);
+                    libc::close(publish_child);
+                }
             }
             return Err(error);
         }
@@ -4092,6 +4606,9 @@ fn spawn_clone_worker(
     cmd.env("SMOLVM_CUDA_CLONE_LAYOUT", layout);
     cmd.env("SMOLVM_CUDA_CLONE_DEVICE", golden_dev.to_string());
     cmd.env("SMOLVM_CUDA_CLONE_CTRL", ctrl_slot.to_string());
+    if publish_enabled {
+        cmd.env("SMOLVM_CUDA_CLONE_PUBLISH_CTRL", publish_slot.to_string());
+    }
     if let Some(limit) = options.vram_limit_bytes {
         cmd.env("SMOLVM_CUDA_VRAM_LIMIT_BYTES", limit.to_string());
     }
@@ -4156,6 +4673,14 @@ fn spawn_clone_worker(
             if libc::fcntl(ctrl_slot, libc::F_SETFD, 0) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
+            if publish_enabled {
+                if libc::dup2(publish_child, publish_slot) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::fcntl(publish_slot, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
             Ok(())
         });
     }
@@ -4168,11 +4693,33 @@ fn spawn_clone_worker(
     }
     // SAFETY: the child inherited its own copy of the control child-end.
     unsafe { libc::close(ctrl_child) };
+    if publish_enabled {
+        // SAFETY: as above for the dedicated publication child-end.
+        unsafe { libc::close(publish_child) };
+    }
     match spawned {
-        Ok(pid) => Ok((pid, sp[0])),
+        Ok(pid) => {
+            if publish_enabled {
+                // SAFETY: the parent owns this socketpair end after spawn.
+                let stream = unsafe { UnixStream::from_raw_fd(publish_sp[0]) };
+                if let Err(error) = spawn_tensor_bundle_receiver(stream, pid) {
+                    unsafe {
+                        libc::close(sp[0]);
+                        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                    }
+                    return Err(error);
+                }
+            }
+            Ok((pid, sp[0]))
+        }
         Err(e) => {
             // SAFETY: no worker took ownership; close the parent control end.
-            unsafe { libc::close(sp[0]) };
+            unsafe {
+                libc::close(sp[0]);
+                if publish_enabled {
+                    libc::close(publish_sp[0]);
+                }
+            }
             Err(e)
         }
     }
@@ -4261,11 +4808,13 @@ mod mps_tests {
         encode_attach_procmem, fork_snapshot_enabled, golden_eviction_enabled, host_snapshot_fits,
         host_snapshot_reconstructable, lift_owned_fds, live_host_snapshot_count, mps_enabled,
         ordinary_regions_are_reserved, range_is_reserved, read_host_snapshot, recv_fd,
-        seal_host_snapshot, select_golden_owner, send_fd, spawn_clone_attach_listener_with_timeout,
-        unique_live_clone_worker,
+        redeem_tensor_bundle_from_stream, seal_host_snapshot, select_golden_owner, send_fd,
+        send_tensor_bundle_to_parent, serve_tensor_bundle_consumer,
+        spawn_clone_attach_listener_with_timeout, spawn_tensor_bundle_receiver,
+        unique_live_clone_worker, validate_tensor_bundle_metadata, TENSOR_CONSUME_MAGIC,
     };
     use std::collections::HashMap;
-    use std::io;
+    use std::io::{self, Write};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -4543,6 +5092,98 @@ mod mps_tests {
             libc::close(sockets[0]);
             libc::close(sockets[1]);
         }
+    }
+
+    #[test]
+    fn tensor_bundle_metadata_rejects_ranges_outside_the_export() {
+        let mut metadata = Vec::new();
+        metadata.extend_from_slice(&2u32.to_le_bytes());
+        metadata.extend_from_slice(&2u32.to_le_bytes());
+        metadata.extend_from_slice(b"{}");
+        metadata.extend_from_slice(&0u64.to_le_bytes());
+        metadata.extend_from_slice(&64u64.to_le_bytes());
+        metadata.extend_from_slice(&64u64.to_le_bytes());
+        metadata.extend_from_slice(&32u64.to_le_bytes());
+        validate_tensor_bundle_metadata(&metadata, 128).unwrap();
+
+        metadata[26..34].copy_from_slice(&96u64.to_le_bytes());
+        assert!(validate_tensor_bundle_metadata(&metadata, 128).is_err());
+    }
+
+    #[test]
+    fn tensor_bundle_token_transfers_one_fd_once() {
+        use smolvm_cuda::host::{DeviceTensorBundle, PublishedTensorRange};
+        use std::os::fd::OwnedFd;
+
+        let (mut worker, parent) = std::os::unix::net::UnixStream::pair().unwrap();
+        spawn_tensor_bundle_receiver(parent, std::process::id()).unwrap();
+        let allocation: OwnedFd = tempfile::tempfile().unwrap().into();
+        let token = send_tensor_bundle_to_parent(
+            &mut worker,
+            DeviceTensorBundle {
+                allocation,
+                allocation_size: 4096,
+                manifest: br#"{"name":"adapter"}"#.to_vec(),
+                tensors: vec![
+                    PublishedTensorRange {
+                        offset: 0,
+                        size: 64,
+                    },
+                    PublishedTensorRange {
+                        offset: 64,
+                        size: 32,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(token.len(), 32);
+
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let served = std::thread::spawn(move || serve_tensor_bundle_consumer(server));
+        let redeemed = redeem_tensor_bundle_from_stream(client, &token).unwrap();
+        assert_eq!(redeemed.allocation_size, 4096);
+        validate_tensor_bundle_metadata(&redeemed.metadata, redeemed.allocation_size).unwrap();
+        drop(redeemed);
+        served.join().unwrap().unwrap();
+
+        let (mut retry, retry_server) = std::os::unix::net::UnixStream::pair().unwrap();
+        retry.write_all(&TENSOR_CONSUME_MAGIC).unwrap();
+        retry
+            .write_all(&(token.len() as u16).to_le_bytes())
+            .unwrap();
+        retry.write_all(&token).unwrap();
+        assert!(serve_tensor_bundle_consumer(retry_server).is_err());
+    }
+
+    #[test]
+    fn published_tensor_bundle_outlives_its_clone_worker_channel() {
+        use smolvm_cuda::host::{DeviceTensorBundle, PublishedTensorRange};
+        use std::os::fd::OwnedFd;
+
+        let (mut worker, parent) = std::os::unix::net::UnixStream::pair().unwrap();
+        spawn_tensor_bundle_receiver(parent, u32::MAX).unwrap();
+        let allocation: OwnedFd = tempfile::tempfile().unwrap().into();
+        let token = send_tensor_bundle_to_parent(
+            &mut worker,
+            DeviceTensorBundle {
+                allocation,
+                allocation_size: 4096,
+                manifest: br#"{"name":"adapter"}"#.to_vec(),
+                tensors: vec![PublishedTensorRange {
+                    offset: 0,
+                    size: 64,
+                }],
+            },
+        )
+        .unwrap();
+        drop(worker);
+
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let served = std::thread::spawn(move || serve_tensor_bundle_consumer(server));
+        let redeemed = redeem_tensor_bundle_from_stream(client, &token).unwrap();
+        assert_eq!(redeemed.allocation_size, 4096);
+        served.join().unwrap().unwrap();
     }
 
     #[test]

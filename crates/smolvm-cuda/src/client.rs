@@ -1517,6 +1517,23 @@ impl<S: Read + Write> Client<S> {
         }
     }
 
+    /// Publish selected device ranges into an immutable device-resident bundle.
+    /// The returned token is meaningful only to smolvm's local managed rollout
+    /// consumer; callers never receive a CUDA allocation handle or raw fd.
+    pub fn publish_tensor_bundle(
+        &mut self,
+        manifest: Vec<u8>,
+        tensors: Vec<(u64, u64)>,
+    ) -> Result<Vec<u8>> {
+        match self.call(
+            &Request::PublishTensorBundle { manifest, tensors },
+            Op::PublishTensorBundle,
+        )? {
+            Response::Data(token) => Ok(token),
+            _ => Err(CudaRpcError::Protocol("expected Data")),
+        }
+    }
+
     /// Zero-copy H2D via the shared region (data already written at `offset`).
     pub fn memcpy_shm_htod(
         &mut self,

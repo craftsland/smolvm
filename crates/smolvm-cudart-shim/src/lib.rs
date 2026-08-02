@@ -46,6 +46,7 @@ const CUDA_ERROR_INITIALIZATION: c_int = 3;
 const CUDA_ERROR_INVALID_DEVICE_POINTER: c_int = 17;
 const CUDA_ERROR_INVALID_RESOURCE_HANDLE: c_int = 400;
 const CUDA_ERROR_NO_DEVICE: c_int = 100;
+const CUDA_ERROR_NOT_SUPPORTED: c_int = 801;
 const CUDA_ERROR_UNKNOWN: c_int = 999;
 
 // cudaMemcpyKind
@@ -260,6 +261,7 @@ fn map_err(e: CudaRpcError) -> c_int {
             2 => CUDA_ERROR_MEMORY_ALLOCATION,
             200 | 218 => CUDA_ERROR_INVALID_VALUE, // invalid image / PTX
             400 => CUDA_ERROR_INVALID_RESOURCE_HANDLE,
+            801 => CUDA_ERROR_NOT_SUPPORTED,
             other => {
                 if std::env::var_os("SMOLVM_CUDA_SHIM_TRACE").is_some() {
                     eprintln!("[map-err] unmapped driver code {other}");
@@ -311,6 +313,106 @@ pub extern "C" fn smolvm_cudart_fence() {
             let _ = st.client.drain();
         }
     }
+}
+
+fn tensor_publish_sync(client: &mut Client<Stream>) -> Result<(), CudaRpcError> {
+    client.drain()?;
+    let request = smolvm_cuda::proto::encode_request(&smolvm_cuda::proto::Request::CtxSynchronize);
+    let response = client.raw_call(&request)?;
+    if response.len() < 4 {
+        return Err(CudaRpcError::Protocol("short forced synchronize response"));
+    }
+    let status = i32::from_le_bytes(response[..4].try_into().unwrap());
+    if status != 0 {
+        return Err(CudaRpcError::Cuda(status));
+    }
+    match client.take_sticky() {
+        0 => Ok(()),
+        status => Err(CudaRpcError::Cuda(status)),
+    }
+}
+
+/// Publish selected CUDA tensors to smolvm's managed rollout consumer without
+/// serializing a checkpoint through guest RAM or disk. This is intentionally a
+/// smolvm-specific ABI rather than an implementation of generic CUDA IPC.
+///
+/// On success, `token_len` receives the opaque token length and `token` receives
+/// those bytes. `token_capacity` must be at least 64 bytes; smaller buffers are
+/// rejected before any allocation is published.
+#[no_mangle]
+pub extern "C" fn smolvm_cuda_publish_tensor_bundle(
+    manifest: *const u8,
+    manifest_len: usize,
+    dptrs: *const u64,
+    sizes: *const u64,
+    count: usize,
+    token: *mut u8,
+    token_capacity: usize,
+    token_len: *mut usize,
+) -> c_int {
+    if manifest_len > 1 << 20
+        || count == 0
+        || count > 65_536
+        || (manifest_len != 0 && manifest.is_null())
+        || dptrs.is_null()
+        || sizes.is_null()
+        || token.is_null()
+        || token_capacity < 64
+        || token_len.is_null()
+    {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    // SAFETY: the caller promises readable arrays of `count` u64s and a
+    // readable manifest of `manifest_len` bytes for the duration of this call.
+    let manifest = if manifest_len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(manifest, manifest_len) }.to_vec()
+    };
+    let dptrs = unsafe { std::slice::from_raw_parts(dptrs, count) };
+    let sizes = unsafe { std::slice::from_raw_parts(sizes, count) };
+    if dptrs
+        .iter()
+        .zip(sizes)
+        .any(|(&dptr, &size)| dptr == 0 || size == 0)
+    {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    // Quiesce framework-owned streams before the host copies their tensors.
+    // This idempotent preflight is also the clone-boundary reconnect barrier:
+    // the first post-restore call can race the inherited socket reset, so use
+    // the transport-safe retry path before the deliberately at-most-once
+    // publication request.
+    let trace = std::env::var_os("SMOLVM_CUDA_SHIM_TRACE").is_some();
+    if trace {
+        eprintln!("[tensor-publish] reconnect/sync preflight");
+    }
+    if let Err(error) = with_client_retrying(tensor_publish_sync) {
+        return set_last(error);
+    }
+    if trace {
+        eprintln!("[tensor-publish] preflight complete; sending publication");
+    }
+    let tensors = dptrs.iter().copied().zip(sizes.iter().copied()).collect();
+    // Publication is not retried implicitly: once the host has accepted a
+    // bundle, a lost reply may leave a short-lived orphan that its TTL reaps;
+    // replaying here would publish duplicate driver references.
+    let published = with_client(|client| client.publish_tensor_bundle(manifest, tensors));
+    let published = match published {
+        Ok(published) => published,
+        Err(error) => return set_last(error),
+    };
+    if trace {
+        eprintln!("[tensor-publish] publication accepted");
+    }
+    // SAFETY: token_len was validated non-null above.
+    unsafe { token_len.write(published.len()) };
+    if published.len() > token_capacity {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    // SAFETY: the caller supplied at least `token_capacity` writable bytes.
+    unsafe { std::ptr::copy_nonoverlapping(published.as_ptr(), token, published.len()) };
+    CUDA_SUCCESS
 }
 
 // ---- driver-shim bridge -------------------------------------------------------

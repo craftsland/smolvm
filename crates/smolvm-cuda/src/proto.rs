@@ -141,6 +141,12 @@ pub enum Op {
     /// Pin this session to a host GPU: guest device 0 maps to host device N
     /// and the guest sees exactly one device (CUDA_VISIBLE_DEVICES-style).
     SetDeviceBase = 0xE9,
+    /// Publish selected device-memory ranges as one immutable, device-resident
+    /// tensor bundle. This is a smolvm control-plane primitive rather than a
+    /// CUDA IPC emulation: the host copies only the explicitly named ranges
+    /// into a dedicated exportable allocation and returns an opaque one-use
+    /// token for a managed local consumer.
+    PublishTensorBundle = 0xEA,
 }
 
 impl Op {
@@ -211,6 +217,7 @@ impl Op {
             0xE1 => Op::MemCreate,
             0xE8 => Op::MemCreateVh,
             0xE9 => Op::SetDeviceBase,
+            0xEA => Op::PublishTensorBundle,
             0xE2 => Op::MemMap,
             0xE3 => Op::MemSetAccess,
             0xE4 => Op::MemUnmap,
@@ -590,6 +597,13 @@ pub enum Request {
         device: i32,
         flags: u32,
     },
+    /// Publish device ranges plus caller-defined tensor metadata. `manifest`
+    /// describes names/dtypes/shapes; the host owns layout offsets and never
+    /// trusts the manifest to select additional memory.
+    PublishTensorBundle {
+        manifest: Vec<u8>,
+        tensors: Vec<(u64, u64)>,
+    },
 }
 
 /// A decoded successful response body (the `status == 0` payload).
@@ -666,7 +680,14 @@ impl<'a> Cur<'a> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
     fn bytes(&mut self) -> io::Result<Vec<u8>> {
-        let n = self.u64()? as usize;
+        let n = usize::try_from(self.u64()?).map_err(|_| bad())?;
+        Ok(self.take(n)?.to_vec())
+    }
+    fn bytes_bounded(&mut self, maximum: usize) -> io::Result<Vec<u8>> {
+        let n = usize::try_from(self.u64()?).map_err(|_| bad())?;
+        if n > maximum {
+            return Err(bad());
+        }
         Ok(self.take(n)?.to_vec())
     }
     fn string(&mut self) -> io::Result<String> {
@@ -1212,6 +1233,15 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             w_i32(&mut b, *device);
             w_u32(&mut b, *flags);
         }
+        Request::PublishTensorBundle { manifest, tensors } => {
+            w_u8(&mut b, Op::PublishTensorBundle as u8);
+            w_bytes(&mut b, manifest);
+            w_u32(&mut b, tensors.len() as u32);
+            for (dptr, size) in tensors {
+                w_u64(&mut b, *dptr);
+                w_u64(&mut b, *size);
+            }
+        }
     }
     b
 }
@@ -1497,6 +1527,21 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
             device: c.i32()?,
             flags: c.u32()?,
         },
+        Op::PublishTensorBundle => {
+            let manifest = c.bytes_bounded(1 << 20)?;
+            let count = c.u32()? as usize;
+            if count > 65_536 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "tensor bundle contains too many ranges",
+                ));
+            }
+            let mut tensors = Vec::with_capacity(count);
+            for _ in 0..count {
+                tensors.push((c.u64()?, c.u64()?));
+            }
+            Request::PublishTensorBundle { manifest, tensors }
+        }
     })
 }
 
@@ -1563,7 +1608,9 @@ pub fn decode_response(op: Op, payload: &[u8]) -> io::Result<(i32, Response)> {
         Op::GraphGetNodes => Response::Bytes(c.u64()?),
         Op::StreamCaptureInfo => Response::Pair(c.u64()?, c.u64()?),
         Op::MemAlloc => Response::Dptr(c.u64()?),
-        Op::MemcpyDtoH | Op::DeviceGetUuid | Op::FuncGetParamInfo => Response::Data(c.bytes()?),
+        Op::MemcpyDtoH | Op::DeviceGetUuid | Op::FuncGetParamInfo | Op::PublishTensorBundle => {
+            Response::Data(c.bytes()?)
+        }
         Op::MemGetInfo => Response::Pair(c.u64()?, c.u64()?),
         // nvcomp calls carry their own nvcompStatus in the body (transport
         // status stays 0): TempSize -> (status, temp_bytes); Decompress -> status.
@@ -1775,6 +1822,10 @@ mod tests {
         });
         roundtrip(Request::EventQuery { event: 4 });
         roundtrip(Request::ThreadExchangeCaptureMode { mode: 2 });
+        roundtrip(Request::PublishTensorBundle {
+            manifest: br#"{"name":"adapter"}"#.to_vec(),
+            tensors: vec![(0x1000, 64), (0x2200, 128)],
+        });
     }
 
     #[test]
@@ -1792,6 +1843,10 @@ mod tests {
             (Op::StreamCreate, Response::Handle(21)),
             (Op::EventCreate, Response::Handle(22)),
             (Op::EventElapsedTime, Response::Millis(1.25)),
+            (
+                Op::PublishTensorBundle,
+                Response::Data(b"one-use-token".to_vec()),
+            ),
             (Op::ModuleUnload, Response::Ok),
             (Op::MemsetD8, Response::Ok),
         ] {
@@ -1800,6 +1855,17 @@ mod tests {
             assert_eq!(status, 0);
             assert_eq!(dec, resp);
         }
+    }
+
+    #[test]
+    fn tensor_publication_rejects_an_oversized_manifest_before_copying_it() {
+        let mut encoded = vec![Op::PublishTensorBundle as u8];
+        encoded.extend_from_slice(&((1 << 20) as u64 + 1).to_le_bytes());
+        encoded.resize(encoded.len() + (1 << 20) + 1, 0);
+        encoded.extend_from_slice(&1u32.to_le_bytes());
+        encoded.extend_from_slice(&0x1000u64.to_le_bytes());
+        encoded.extend_from_slice(&64u64.to_le_bytes());
+        assert!(decode_request(&encoded).is_err());
     }
 
     #[test]

@@ -42,12 +42,13 @@ pub fn set_guest_ram_provider(f: GuestRamProvider) {
 ///
 /// The caller passes the same path to `LaunchConfig::cuda_socket`. Returns once
 /// the listener is bound; serving continues until the process exits.
-pub fn start(socket_path: &Path) -> std::io::Result<()> {
+pub fn start(socket_path: &Path, is_fork_clone: bool) -> std::io::Result<()> {
     // Clean up any stale socket from a previous run.
     let _ = std::fs::remove_file(socket_path);
 
     let listener = UdsListener::bind(socket_path)?;
     let path_display = socket_path.display().to_string();
+    let clone_identity = clone_proxy_identity(is_fork_clone);
 
     // One-time, launch-time preflight: if this host can't load the CUDA driver,
     // every guest connection falls back to a CPU-emulation backend that only
@@ -109,7 +110,7 @@ pub fn start(socket_path: &Path) -> std::io::Result<()> {
             // CUDA call. The connection is held open as the worker's idle
             // primary channel; real guest channels attach to the live worker.
             if std::env::var("SMOLVM_CUDA_WARM_DIAL").as_deref() != Ok("0") {
-              if let (Some(addr), Some(p)) = (daemon.clone(), clone_preamble(true)) {
+              if let (Some(addr), Some(p)) = (daemon.clone(), clone_preamble(clone_identity, true)) {
                 thread::Builder::new()
                     .name("cuda-clone-warm".into())
                     .spawn(move || {
@@ -163,11 +164,14 @@ pub fn start(socket_path: &Path) -> std::io::Result<()> {
                     Ok(stream) => {
                         let daemon = daemon.clone();
                         let options = serve_options;
+                        let clone_identity = clone_identity;
                         thread::Builder::new()
                             .name("cuda-host-conn".into())
                             .spawn(move || {
                                 if let Some(addr) = daemon {
-                                    if let Err(e) = proxy_to_daemon(stream, &addr) {
+                                    if let Err(e) =
+                                        proxy_to_daemon(stream, &addr, clone_identity)
+                                    {
                                         tracing::debug!(error = %e, "CUDA daemon proxy ended");
                                     }
                                     return;
@@ -191,26 +195,31 @@ pub fn start(socket_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// This VM's clone identity for the daemon-connection preamble, computed once.
-/// `Some` iff this VMM process was launched from a fork snapshot (the boot
-/// subprocess carries `SMOLVM_SNAPSHOT_DIR` per-process; the golden's process
-/// never has it). The id is stable for this VM's lifetime and distinct across
-/// sibling clones (per-process randomness ⊕ pid), so the daemon can key one
-/// worker per clone and tell a clone's reconnect apart from a fresh clone.
-fn fork_clone_id() -> Option<u64> {
-    static ID: OnceLock<Option<u64>> = OnceLock::new();
-    *ID.get_or_init(|| {
-        std::env::var_os("SMOLVM_SNAPSHOT_DIR")?;
-        let mut b = [0u8; 8];
-        if std::fs::File::open("/dev/urandom")
-            .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut b))
-            .is_err()
-        {
-            b = (std::process::id() as u64)
-                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                .to_le_bytes();
-        }
-        Some(u64::from_le_bytes(b) ^ u64::from(std::process::id()))
+/// Stable identity captured at the VM boot boundary and carried by every CUDA
+/// proxy thread. A typed launch role avoids re-reading mutable process state in
+/// late reconnect threads and accidentally serving a clone as a golden.
+#[derive(Clone, Copy)]
+struct CloneProxyIdentity {
+    id: u64,
+    share_weights: bool,
+}
+
+fn clone_proxy_identity(is_fork_clone: bool) -> Option<CloneProxyIdentity> {
+    if !is_fork_clone {
+        return None;
+    }
+    let mut bytes = [0u8; 8];
+    if std::fs::File::open("/dev/urandom")
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut bytes))
+        .is_err()
+    {
+        bytes = (std::process::id() as u64)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .to_le_bytes();
+    }
+    Some(CloneProxyIdentity {
+        id: u64::from_le_bytes(bytes) ^ u64::from(std::process::id()),
+        share_weights: std::env::var_os("SMOLVM_CUDA_CLONE_SHARE").is_some(),
     })
 }
 
@@ -223,18 +232,24 @@ fn fork_clone_id() -> Option<u64> {
 /// The 17-byte clone-connection preamble (magic + clone id + flags), `None`
 /// on non-clone VMs. Flag bit 0: forked with `--share-weights`; bit 1: warm
 /// dial (spawn the worker eagerly, no Init follows on this connection).
-fn clone_preamble(warm: bool) -> Option<[u8; 17]> {
-    let id = fork_clone_id()?;
+fn clone_preamble(identity: Option<CloneProxyIdentity>, warm: bool) -> Option<[u8; 17]> {
+    let identity = identity?;
     let mut p = [0u8; 17];
     p[..8].copy_from_slice(&smolvm_cuda::proto::CLONE_PREAMBLE_MAGIC);
-    p[8..16].copy_from_slice(&id.to_le_bytes());
+    p[8..16].copy_from_slice(&identity.id.to_le_bytes());
     // bit 0: this fork was requested with --share-weights (the launcher put
     // SMOLVM_CUDA_CLONE_SHARE in this clone VMM's env).
-    if std::env::var_os("SMOLVM_CUDA_CLONE_SHARE").is_some() {
+    if identity.share_weights {
         p[16] |= 1;
     }
     if warm {
         p[16] |= 2;
+    }
+    if std::env::var_os("SMOLVM_CUDA_PROXY_TRACE").is_some() {
+        eprintln!(
+            "[cuda-proxy] clone preamble id={} flags={}",
+            identity.id, p[16]
+        );
     }
     Some(p)
 }
@@ -287,8 +302,12 @@ fn clone_lifetime_advert() -> [u8; 20] {
 /// the daemon routes this connection to the clone's isolating worker — and, by
 /// its absence, serves the GOLDEN's own reconnect in-daemon instead of handing
 /// it a worker's reconstructed COPY of its memory.
-fn proxy_to_daemon(guest: crate::platform::uds::UdsStream, addr: &str) -> std::io::Result<()> {
-    let preamble = || clone_preamble(false);
+fn proxy_to_daemon(
+    guest: crate::platform::uds::UdsStream,
+    addr: &str,
+    clone_identity: Option<CloneProxyIdentity>,
+) -> std::io::Result<()> {
+    let preamble = || clone_preamble(clone_identity, false);
     /// Guest-RAM advertisement for a SHARED daemon: when this VM's RAM is
     /// memfd-backed (forkable machines), tell the daemon how to map the same
     /// pages via `/proc/<pid>/fd/<memfd>` — magic + pid + fd + count +
@@ -520,5 +539,30 @@ fn make_backend() -> Box<dyn Backend> {
             tracing::info!("cuda-host: no GPU driver ({e}) — CPU emulation backend");
             Box::new(CpuBackend::default())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clone_preamble_uses_the_captured_boot_identity() {
+        assert!(clone_preamble(None, false).is_none());
+
+        let identity = CloneProxyIdentity {
+            id: 0x1122_3344_5566_7788,
+            share_weights: true,
+        };
+        let regular = clone_preamble(Some(identity), false).unwrap();
+        assert_eq!(&regular[..8], &smolvm_cuda::proto::CLONE_PREAMBLE_MAGIC);
+        assert_eq!(
+            u64::from_le_bytes(regular[8..16].try_into().unwrap()),
+            identity.id
+        );
+        assert_eq!(regular[16], 1);
+
+        let warm = clone_preamble(Some(identity), true).unwrap();
+        assert_eq!(warm[16], 3);
     }
 }
