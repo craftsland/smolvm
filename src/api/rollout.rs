@@ -83,6 +83,8 @@ pub struct RolloutExecutorInfo {
     pub max_concurrent_requests: u32,
     /// Maximum queued requests.
     pub max_queue_depth: u32,
+    /// Default whole-request deadline.
+    pub request_timeout_secs: u64,
     /// Requests currently executing.
     pub active_requests: u32,
     /// Requests currently waiting for an execution permit.
@@ -614,6 +616,7 @@ impl RolloutExecutor {
             fallback_pool: self.config.fallback_pool.clone(),
             max_concurrent_requests: self.config.max_concurrent,
             max_queue_depth: self.config.max_queue_depth,
+            request_timeout_secs: self.config.request_timeout.as_secs(),
             active_requests: self.active.load(Ordering::Acquire),
             queued_requests: self.queued.load(Ordering::Acquire),
             accepting: self.accepting.load(Ordering::Acquire),
@@ -1707,6 +1710,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(created.name, "fused");
+        assert_eq!(created.request_timeout_secs, 5);
         let executor = registry.get("fused").await.unwrap();
         let published = executor
             .publish_policy(PublishRolloutPolicyRequest {
