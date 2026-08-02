@@ -1126,13 +1126,12 @@ fn make_backend() -> Box<dyn Backend> {
     }
 }
 
-/// Staged golden handle state retained for late-attached channels:
-/// (module images, function metadata, streams, events).
-type SeedHandles = (
-    Vec<(u64, Vec<u8>)>,
-    Vec<smolvm_cuda::host::FuncMeta>,
-    Vec<(u64, u64)>,
-    Vec<(u64, u64)>,
+/// Per-thread state that cannot use the clone worker's process-global fallback.
+/// Module/function images and stream/event maps are installed process-wide by
+/// `set_handle_trans`, so copying them into every attached channel is wasteful.
+type CloneChannelSeed = (
+    Option<std::collections::HashMap<u64, u64>>,
+    Vec<(u64, u64, u64)>,
 );
 
 /// Path 3 (M1): serve one isolating fork-clone connection in THIS separate worker
@@ -1198,11 +1197,9 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
         }
     }
     // Seed state for late-attached guest channels (see the attach listener
-    // below): each attached channel serves on its own thread, and every
-    // translation table is thread-local — new threads must be seeded with
-    // clones of what the main serving thread installed.
+    // below). VMM handle translation is thread-local; module/function and
+    // stream/event translation have process-global fallbacks.
     let mut seed_vmm: Option<std::collections::HashMap<u64, u64>> = None;
-    let mut seed_handles: Option<SeedHandles> = None;
     // M2: reconstruct the golden's memory at its exact VAs from the layout the
     // daemon passed (SMOLVM_CUDA_CLONE_LAYOUT) + the golden's physical exported to
     // fds 4.. — BEFORE serving, so the clone's inherited pointers are valid verbatim.
@@ -1240,14 +1237,9 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
             graphs.len(),
             lib_handles.len(),
         );
-        // Retained for attached-channel threads (module images are the bulk —
-        // tens of MB per worker; the price of correct late channels).
-        seed_handles = Some((
-            mod_images.clone(),
-            func_meta.clone(),
-            streams.clone(),
-            events.clone(),
-        ));
+        // This installs immutable process-global fallbacks as well as the main
+        // thread's fast-path maps. Attached channels use those fallbacks rather
+        // than deep-copying every module image and function record.
         smolvm_cuda::host::set_handle_trans(mod_images, func_meta, streams, events);
         // Re-create the golden's top-level cuBLAS/cuBLASLt/cuDNN handles in
         // THIS process and map the clone's inherited values to them — library
@@ -1287,7 +1279,7 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
         .and_then(|v| v.parse::<std::os::unix::io::RawFd>().ok())
     {
         let seed_alloc = smolvm_cuda::host::worker_alloc_trans_snapshot();
-        let seed = std::sync::Arc::new((seed_vmm, seed_handles, seed_alloc));
+        let seed = std::sync::Arc::new((seed_vmm, seed_alloc));
         Some(spawn_clone_attach_listener(
             ctrl,
             clone_dev,
@@ -1344,11 +1336,7 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
 fn spawn_clone_attach_listener(
     ctrl: std::os::unix::io::RawFd,
     clone_dev: i32,
-    seed: Arc<(
-        Option<std::collections::HashMap<u64, u64>>,
-        Option<SeedHandles>,
-        Vec<(u64, u64, u64)>,
-    )>,
+    seed: Arc<CloneChannelSeed>,
     active_channels: Arc<AtomicUsize>,
     clone_vm_pid: Option<u32>,
 ) -> io::Result<std::thread::JoinHandle<()>> {
@@ -1395,11 +1383,7 @@ fn clone_worker_idle_expired(
 fn spawn_clone_attach_listener_with_timeout(
     ctrl: std::os::unix::io::RawFd,
     clone_dev: i32,
-    seed: Arc<(
-        Option<std::collections::HashMap<u64, u64>>,
-        Option<SeedHandles>,
-        Vec<(u64, u64, u64)>,
-    )>,
+    seed: Arc<CloneChannelSeed>,
     active_channels: Arc<AtomicUsize>,
     clone_vm_pid: Option<u32>,
     idle_timeout: Duration,
@@ -1488,19 +1472,14 @@ fn clone_worker_idle_timeout_from(value: Option<&str>) -> Duration {
 }
 
 /// Serve one late-attached guest channel inside the clone worker. Own backend
-/// handle, same primary context (same UVA space), thread-local translation
-/// tables seeded from the main serving thread's snapshot so golden handles and
-/// translated allocations resolve identically on this channel.
+/// handle, same primary context (same UVA space), and only the thread-local
+/// translations that lack process-global fallbacks.
 #[cfg(unix)]
 #[allow(clippy::type_complexity)]
 fn serve_attached_channel(
     fd: std::os::unix::io::RawFd,
     dev: i32,
-    seed: &(
-        Option<std::collections::HashMap<u64, u64>>,
-        Option<SeedHandles>,
-        Vec<(u64, u64, u64)>,
-    ),
+    seed: &CloneChannelSeed,
     attached_procmem: Option<ProcMemAdvert>,
 ) {
     use std::os::unix::io::FromRawFd;
@@ -1516,12 +1495,9 @@ fn serve_attached_channel(
     // File-ring transport: attached channels serve on their own threads, and
     // the ring dir is per-worker (thread-local install per serve thread).
     smolvm_cuda::host::ring_dir_set(std::env::var("SMOLVM_CUDA_CLONE_RING_DIR").ok());
-    let (vmm, handles, alloc) = seed;
+    let (vmm, alloc) = seed;
     if let Some(v) = vmm {
         smolvm_cuda::host::set_vmm_trans(v.clone());
-    }
-    if let Some((m, f, s, e)) = handles {
-        smolvm_cuda::host::set_handle_trans(m.clone(), f.clone(), s.clone(), e.clone());
     }
     if !alloc.is_empty() {
         smolvm_cuda::host::set_worker_alloc_trans(alloc.clone());
@@ -4508,7 +4484,7 @@ mod mps_tests {
         let listener = spawn_clone_attach_listener_with_timeout(
             sockets[1],
             0,
-            Arc::new((None, None, Vec::new())),
+            Arc::new((None, Vec::new())),
             active.clone(),
             None,
             Duration::ZERO,
