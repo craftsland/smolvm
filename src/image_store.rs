@@ -17,6 +17,62 @@ use sha2::{Digest, Sha256};
 use crate::registry::{registry_client, PullAuth, Reference};
 use crate::{Error, Result};
 
+/// The bits of an OCI image config the launcher needs to boot a cached image:
+/// the process to run, its environment, and working directory. Cached beside the
+/// layers (as `config.json`) so a warm run needs no network at all.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ImageConfig {
+    /// The image's `Entrypoint` (prepended to `cmd` / the run command).
+    pub entrypoint: Vec<String>,
+    /// The image's default `Cmd` (used when the run supplies no command).
+    pub cmd: Vec<String>,
+    /// The image's `Env` (`KEY=VALUE` strings).
+    pub env: Vec<String>,
+    /// The image's `WorkingDir` (empty string if unset).
+    pub workdir: String,
+}
+
+/// A ready-to-boot cache entry: the extracted overlay lowerdirs plus the image's
+/// config (entrypoint/cmd/env/workdir). Returned by [`ImageStore::ensure_image`].
+pub struct CachedImage {
+    /// The `layers/` dir to mount read-only as the overlay lowerdirs.
+    pub layers: PathBuf,
+    /// The image process configuration to boot with.
+    pub config: ImageConfig,
+}
+
+/// The `config` object inside an OCI image config blob. Fields are capitalized in
+/// the OCI spec and each may be absent/null, hence the `Option`s.
+#[derive(serde::Deserialize, Default)]
+struct OciConfigInner {
+    #[serde(rename = "Entrypoint")]
+    entrypoint: Option<Vec<String>>,
+    #[serde(rename = "Cmd")]
+    cmd: Option<Vec<String>>,
+    #[serde(rename = "Env")]
+    env: Option<Vec<String>>,
+    #[serde(rename = "WorkingDir")]
+    working_dir: Option<String>,
+}
+
+/// The top level of an OCI image config blob (only its `config` object matters).
+#[derive(serde::Deserialize, Default)]
+struct OciConfigBlob {
+    #[serde(default)]
+    config: OciConfigInner,
+}
+
+impl From<OciConfigBlob> for ImageConfig {
+    fn from(b: OciConfigBlob) -> Self {
+        ImageConfig {
+            entrypoint: b.config.entrypoint.unwrap_or_default(),
+            cmd: b.config.cmd.unwrap_or_default(),
+            env: b.config.env.unwrap_or_default(),
+            workdir: b.config.working_dir.unwrap_or_default(),
+        }
+    }
+}
+
 /// A content-addressed OCI image store rooted at a shared directory. On a node
 /// this is the same `_shared` tree used by packs, so images and packs dedup in
 /// one place and mount through the identical idmapped-bind path.
@@ -42,7 +98,7 @@ impl ImageStore {
     /// The auth gate (manifest resolution with `auth`) runs on every call, before
     /// the cache is consulted, so a cache hit cannot leak an image the caller is
     /// not authorized to pull.
-    pub async fn ensure_image(&self, reference: &str, auth: &PullAuth) -> Result<PathBuf> {
+    pub async fn ensure_image(&self, reference: &str, auth: &PullAuth) -> Result<CachedImage> {
         // ── AUTH GATE + content address ─────────────────────────────────────
         // Resolve + authorize the manifest with the caller's credentials, across
         // the candidate registries the guest would try. Runs before the cache is
@@ -53,7 +109,10 @@ impl ImageStore {
 
         // ── CACHE HIT (already authorized above) ───────────────────────────
         if is_intact(&entry) {
-            return Ok(layers);
+            return Ok(CachedImage {
+                config: read_config(&entry)?,
+                layers,
+            });
         }
 
         // ── MISS: materialize host-side, verify digests, atomic-stage ──────
@@ -65,7 +124,7 @@ impl ImageStore {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&staging);
-        materialize_layers(&r.client, &r.repo, &manifest, &staging)
+        let config = materialize_entry(&r.client, &r.repo, &manifest, &staging)
             .await
             .inspect_err(|_| {
                 let _ = std::fs::remove_dir_all(&staging);
@@ -88,8 +147,19 @@ impl ImageStore {
                 return Err(Error::config("image-store: publish", e.to_string()));
             }
         }
-        Ok(layers)
+        Ok(CachedImage { layers, config })
     }
+}
+
+/// The cached image config filename inside an entry (sibling of `layers/`).
+const CONFIG_FILE: &str = "config.json";
+
+/// Read the cached [`ImageConfig`] from an intact entry.
+fn read_config(entry: &Path) -> Result<ImageConfig> {
+    let bytes = std::fs::read(entry.join(CONFIG_FILE))
+        .map_err(|e| Error::config("image-store: read config", e.to_string()))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| Error::agent("image-store: parse cached config", e.to_string()))
 }
 
 /// The outcome of the auth gate: the authorized client + repo it succeeded
@@ -174,31 +244,34 @@ fn digest_dir(digest: &str) -> String {
     digest.replace(':', "-")
 }
 
-/// A cache entry is usable only if its `layers/` dir holds the layer-order index
-/// (written last), guarding against a partial extraction being treated as valid.
+/// A cache entry is usable only if its cached `config.json` is present AND its
+/// `layers/` dir holds the layer-order index. The layer-order index is written
+/// last, so its presence means the whole entry (layers + config) is complete —
+/// a crash mid-fill never yields a partial cache hit.
 fn is_intact(entry: &Path) -> bool {
-    entry.join("layers").join("layer-order").is_file()
+    entry.join(CONFIG_FILE).is_file() && entry.join("layers").join("layer-order").is_file()
 }
 
-/// Pull each layer blob, verify it against its digest, and EXTRACT it into
+/// Materialize a full cache entry into `staging`: EXTRACT each layer into
 /// `staging/layers/<digest>/` as an overlayfs-ready lowerdir (decompressed,
-/// untarred, OCI whiteouts translated to overlay char-devices) — the same
-/// `smolvm_oci_layer::extract_oci_layer` the guest agent uses. The stacking
-/// order is recorded last, so the entry only looks intact once every layer is
-/// present. The guest then mounts these dirs read-only as overlay lowerdirs
-/// (via the packed-layers path) and boots with no in-VM pull or flatten.
+/// untarred, OCI whiteouts translated to overlay char-devices — the same
+/// `smolvm_oci_layer::extract_oci_layer` the guest agent uses), cache the image
+/// config as `staging/config.json`, and write the layer-order index LAST so the
+/// entry only looks intact once everything is present. Returns the parsed config.
+/// The guest then mounts the layer dirs read-only as overlay lowerdirs (via the
+/// packed-layers path) and boots the config's command with no in-VM pull/flatten.
 ///
 /// Extraction is Linux+root: whiteout translation needs `mknod`/`setxattr`, and
 /// ownership preservation needs `CAP_CHOWN`. Both hold on the node (root); the
 /// host image-cache path is not used on macOS (which keeps the bake path), so
 /// the non-Linux `extract_oci_layer` stub returning `Unsupported` is never hit
 /// in a real cache-fill.
-async fn materialize_layers(
+async fn materialize_entry(
     client: &smolvm_registry::RegistryClient,
     repo: &str,
     manifest: &smolvm_registry::OciManifest,
     staging: &Path,
-) -> Result<()> {
+) -> Result<ImageConfig> {
     let layers_dir = staging.join("layers");
     std::fs::create_dir_all(&layers_dir)
         .map_err(|e| Error::config("image-store", e.to_string()))?;
@@ -220,11 +293,28 @@ async fn materialize_layers(
             .map_err(|e| Error::agent("image-store: extract layer", e.to_string()))?;
         order.push(digest_dir(&descriptor.digest));
     }
-    // Written last: its presence is the "entry is complete" marker `is_intact`
-    // checks, so a crash mid-pull never yields a cache hit.
+
+    // Fetch + cache the image config (entrypoint/cmd/env/workdir). pull_blob
+    // verifies the blob against the config descriptor digest before we parse it.
+    smolvm_registry::validate_digest(&manifest.config.digest)
+        .map_err(|e| Error::agent("image-store: config digest", e.to_string()))?;
+    let config_bytes = client
+        .pull_blob(repo, &manifest.config.digest)
+        .await
+        .map_err(|e| Error::agent("image-store: pull config", e.to_string()))?;
+    let config: ImageConfig = serde_json::from_slice::<OciConfigBlob>(&config_bytes)
+        .map_err(|e| Error::agent("image-store: parse config", e.to_string()))?
+        .into();
+    let config_json = serde_json::to_vec(&config)
+        .map_err(|e| Error::agent("image-store: encode config", e.to_string()))?;
+    std::fs::write(staging.join(CONFIG_FILE), &config_json)
+        .map_err(|e| Error::config("image-store", e.to_string()))?;
+
+    // Written LAST: its presence is the "entry is complete" marker `is_intact`
+    // checks (config.json is already on disk above), so a crash never hits.
     std::fs::write(layers_dir.join("layer-order"), order.join("\n"))
         .map_err(|e| Error::config("image-store", e.to_string()))?;
-    Ok(())
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -237,13 +327,24 @@ mod tests {
     }
 
     #[test]
-    fn intact_requires_the_order_marker() {
+    fn intact_requires_config_and_order_marker() {
         let tmp = tempfile::tempdir().unwrap();
         let entry = tmp.path().join("sha256-x");
         std::fs::create_dir_all(entry.join("layers").join("sha256-l1")).unwrap();
-        assert!(!is_intact(&entry), "no order marker yet → not a valid hit");
+        assert!(
+            !is_intact(&entry),
+            "no config or order marker → not a valid hit"
+        );
+        // The config alone is not enough — layers may still be materializing.
+        std::fs::write(entry.join(CONFIG_FILE), b"{}").unwrap();
+        assert!(
+            !is_intact(&entry),
+            "config but no order marker → not a valid hit"
+        );
+        // The order marker is written last; with the config already present, its
+        // arrival means the whole entry is complete.
         std::fs::write(entry.join("layers").join("layer-order"), "sha256-l1").unwrap();
-        assert!(is_intact(&entry), "order marker present → valid hit");
+        assert!(is_intact(&entry), "config + order marker → valid hit");
     }
 
     #[test]
@@ -299,23 +400,26 @@ mod tests {
             let digest = format!("sha256:{}", hex::encode(Sha256::digest(&body)));
             let tmp = tempfile::tempdir().unwrap();
             let store = ImageStore::new(tmp.path().to_path_buf());
-            let layers = tmp.path().join(digest_dir(&digest)).join("layers");
+            let entry = tmp.path().join(digest_dir(&digest));
+            let layers = entry.join("layers");
             std::fs::create_dir_all(&layers).unwrap();
             std::fs::write(layers.join("layer-order"), "").unwrap();
-            assert!(is_intact(&tmp.path().join(digest_dir(&digest))));
+            // An intact entry also carries the cached image config.
+            std::fs::write(entry.join(CONFIG_FILE), b"{\"entrypoint\":[\"/bin/true\"],\"cmd\":[],\"env\":[],\"workdir\":\"\"}").unwrap();
+            assert!(is_intact(&entry));
 
             // DENY: unauthorized caller is rejected at the gate despite the hit.
             let denied = store.ensure_image(&reference, &PullAuth::Anonymous).await;
             assert!(denied.is_err(), "cache hit must NOT bypass authorization");
 
-            // ALLOW: authorized caller resolves and is served the cached layers.
+            // ALLOW: authorized caller resolves and is served the cached entry,
+            // including the config parsed back from disk.
             let allowed = store
                 .ensure_image(&reference, &PullAuth::Bearer("good-token".into()))
-                .await;
-            assert_eq!(
-                allowed.expect("authorized caller should be served"),
-                layers
-            );
+                .await
+                .expect("authorized caller should be served");
+            assert_eq!(allowed.layers, layers);
+            assert_eq!(allowed.config.entrypoint, vec!["/bin/true".to_string()]);
         });
     }
 }
