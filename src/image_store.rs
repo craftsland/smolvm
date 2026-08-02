@@ -240,7 +240,14 @@ async fn resolve_authorized(reference: &str, auth: &PullAuth) -> Result<Resolved
                     digest,
                 });
             }
-            Err(e) => last_err = Some(e.to_string()),
+            // Keep the FIRST failure. `registry_pull_hosts` is a DNS allow-list,
+            // not a list of real endpoints — Docker Hub yields
+            // ["docker.io", "docker.com"], and letting the later marketing-host
+            // failure overwrite the real 401/429 from docker.io would surface a
+            // nonsense error to the user.
+            Err(e) => {
+                let _ = last_err.get_or_insert_with(|| e.to_string());
+            }
         }
     }
     Err(Error::agent(

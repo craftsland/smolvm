@@ -618,10 +618,6 @@ fn init_cache_max_bytes() -> u64 {
         .unwrap_or(DEFAULT)
 }
 
-/// Evict least-recently-modified cached layers until the cache is at or below
-/// `max_bytes`, never evicting `keep` (the layer just published). Best-effort:
-/// per-entry errors are skipped. The `.smolmachine` sidecars are zstd-compressed
-/// (dense) files, so apparent length is an accurate size.
 /// Bump a cache entry's modification time to now so the LRU prune treats it as
 /// recently used. Best-effort and cross-platform (`File::set_modified`); a
 /// failure just leaves the old mtime, which at worst evicts a hot entry sooner.
@@ -631,6 +627,10 @@ fn touch_cache_entry(path: &Path) {
     }
 }
 
+/// Evict least-recently-modified cached layers until the cache is at or below
+/// `max_bytes`, never evicting `keep` (the layer just published). Best-effort:
+/// per-entry errors are skipped. The `.smolmachine` sidecars are zstd-compressed
+/// (dense) files, so apparent length is an accurate size.
 fn prune_init_cache(dir: &Path, max_bytes: u64, keep: &Path) {
     let mut layers: Vec<(PathBuf, std::time::SystemTime, u64)> = Vec::new();
     let Ok(rd) = std::fs::read_dir(dir) else {
@@ -694,12 +694,27 @@ fn gc_stale_bake_machines(exe: &Path) {
 /// Content key for an init layer: a hash of the image + init commands + env, so the
 /// cache rebuilds exactly when those inputs change.
 ///
+/// When `digest` is supplied (the `--oci-cache` path resolves it at the auth
+/// gate) it is mixed in, so the key pins the image's CONTENT rather than its
+/// reference string. Without it, `alpine:latest` would hash the same forever and
+/// a cached entry would keep serving the image as it was on the first run — the
+/// tag moving upstream (including for a security fix) would never be picked up.
+///
 /// PROTOTYPE LIMITATION: if `init` runs a script that lives on a mounted volume
 /// (e.g. `bash /project/init.sh`), the script's CONTENTS are not part of the key —
 /// inline the init steps into the Smolfile, or pass `--no-init-cache`.
-fn init_layer_key(image: Option<&str>, init: &[String], env: &[String]) -> String {
+fn init_layer_key(
+    image: Option<&str>,
+    init: &[String],
+    env: &[String],
+    digest: Option<&str>,
+) -> String {
     let mut h = Sha256::new();
     h.update(image.unwrap_or("").as_bytes());
+    h.update([0u8]);
+    if let Some(d) = digest {
+        h.update(d.as_bytes());
+    }
     h.update([0u8]);
     for c in init {
         h.update(c.as_bytes());
@@ -735,12 +750,13 @@ fn ensure_init_layer(
     params: &vm_common::CreateVmParams,
     smolfile: Option<&Path>,
     rebuild: bool,
+    digest: Option<&str>,
 ) -> smolvm::Result<PathBuf> {
     // The bake here only ever receives a registry image: `ensure_init_layer` is
     // gated on `image_bakeable()` (local archives/dirs take the direct path),
     // because the `pack create --from-vm` snapshot below cannot source a local
     // image's layers (they're flattened, with no registry manifest to pull).
-    let key = init_layer_key(params.image.as_deref(), &params.init, &params.env);
+    let key = init_layer_key(params.image.as_deref(), &params.init, &params.env, digest);
     let dir = init_layer_cache_dir();
     std::fs::create_dir_all(&dir)
         .map_err(|e| smolvm::Error::config("init-layer cache", e.to_string()))?;
@@ -1104,24 +1120,51 @@ impl RunCmd {
             && image_bakeable(params.image.as_deref())
             && (!params.init.is_empty() || self.oci_cache)
         {
+            // `--oci-cache` needs an explicit workload for the same reason the
+            // non-cached path does: with no command the baked artifact's own
+            // entrypoint is a `/bin/true` no-op, so the run would exit 0 having
+            // done nothing. Fail with the same guidance instead of pretending.
+            if self.oci_cache
+                && self.command.is_empty()
+                && !self.interactive
+                && self.smolfile.is_none()
+                && params.entrypoint.is_empty()
+                && params.cmd.is_empty()
+            {
+                return Err(Error::config(
+                    "machine run",
+                    "--oci-cache needs a command to run: pass one after `--`, use -it for a \
+                     shell, or supply a Smolfile with an entrypoint/cmd"
+                        .to_string(),
+                ));
+            }
             // Auth gate: resolve + authorize the image on the HOST before baking
             // or serving a cached bake. A private image the caller cannot pull is
             // rejected here — the same registry-authorization gate the cloud path
             // uses, so caching never bypasses pull authorization. `FromConfig`
             // reads the local docker-config credentials (so `docker login`ed
             // private images resolve); anonymous is the fallback for public ones.
+            //
+            // The resolved digest also becomes part of the cache key, so the entry
+            // tracks the image's CONTENT: when a mutable tag moves upstream the key
+            // changes and the new content is baked, instead of serving the first
+            // run's image forever.
+            let mut resolved_digest = None;
             if self.oci_cache {
                 if let Some(image) = params.image.as_deref() {
                     let auth = smolvm::registry::PullAuth::FromConfig;
                     let rt = tokio::runtime::Runtime::new()
                         .map_err(|e| Error::config("oci-cache", e.to_string()))?;
-                    let digest =
-                        rt.block_on(smolvm::image_store::authorized_digest(image, &auth))?;
-                    eprintln!("Authorized {image} → {digest}");
+                    resolved_digest =
+                        Some(rt.block_on(smolvm::image_store::authorized_digest(image, &auth))?);
                 }
             }
-            let cached =
-                ensure_init_layer(&params, self.smolfile.as_deref(), self.rebuild_init_cache)?;
+            let cached = ensure_init_layer(
+                &params,
+                self.smolfile.as_deref(),
+                self.rebuild_init_cache,
+                resolved_digest.as_deref(),
+            )?;
             // The real workload: CLI trailing args win, else the Smolfile's
             // entrypoint+cmd (the baked artifact's own command is a `/bin/true` no-op).
             let command = if !self.command.is_empty() {
@@ -1846,30 +1889,63 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    /// `--oci-cache` resolves the image digest at the auth gate and mixes it into
+    /// the key, so the cache tracks CONTENT. Without this a mutable tag like
+    /// `alpine:latest` hashes identically forever and the first run's image keeps
+    /// being served — upstream updates (security fixes included) never land.
+    #[test]
+    fn init_layer_key_pins_the_resolved_digest() {
+        let init: Vec<String> = vec![];
+        let env: Vec<String> = vec![];
+        let untagged = init_layer_key(Some("alpine:latest"), &init, &env, None);
+        let first = init_layer_key(Some("alpine:latest"), &init, &env, Some("sha256:aaa"));
+        let moved = init_layer_key(Some("alpine:latest"), &init, &env, Some("sha256:bbb"));
+
+        assert_ne!(
+            first, moved,
+            "the same tag at a NEW digest must be a new cache entry"
+        );
+        assert_eq!(
+            first,
+            init_layer_key(Some("alpine:latest"), &init, &env, Some("sha256:aaa")),
+            "the same tag at the same digest still hits"
+        );
+        assert_ne!(
+            untagged, first,
+            "supplying a digest changes the key (no collision with the un-pinned path)"
+        );
+    }
+
     #[test]
     fn init_layer_key_is_stable_and_input_sensitive() {
         let init = vec!["apt-get install -y jq".to_string()];
         let env = vec!["FOO=bar".to_string()];
-        let base = init_layer_key(Some("ubuntu:noble"), &init, &env);
+        let base = init_layer_key(Some("ubuntu:noble"), &init, &env, None);
         // Deterministic for identical inputs.
-        assert_eq!(base, init_layer_key(Some("ubuntu:noble"), &init, &env));
+        assert_eq!(
+            base,
+            init_layer_key(Some("ubuntu:noble"), &init, &env, None)
+        );
         assert_eq!(base.len(), 16);
         // Sensitive to each input: image, init, env.
-        assert_ne!(base, init_layer_key(Some("ubuntu:jammy"), &init, &env));
         assert_ne!(
             base,
-            init_layer_key(Some("ubuntu:noble"), &["other".to_string()], &env)
+            init_layer_key(Some("ubuntu:jammy"), &init, &env, None)
         );
         assert_ne!(
             base,
-            init_layer_key(Some("ubuntu:noble"), &init, &["FOO=baz".to_string()])
+            init_layer_key(Some("ubuntu:noble"), &["other".to_string()], &env, None)
+        );
+        assert_ne!(
+            base,
+            init_layer_key(Some("ubuntu:noble"), &init, &["FOO=baz".to_string()], None)
         );
         // Order of init steps matters (different layer).
         let init_rev = vec!["b".to_string(), "a".to_string()];
         let init_fwd = vec!["a".to_string(), "b".to_string()];
         assert_ne!(
-            init_layer_key(Some("x"), &init_fwd, &[]),
-            init_layer_key(Some("x"), &init_rev, &[])
+            init_layer_key(Some("x"), &init_fwd, &[], None),
+            init_layer_key(Some("x"), &init_rev, &[], None)
         );
     }
 
