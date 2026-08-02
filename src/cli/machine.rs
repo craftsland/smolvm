@@ -622,6 +622,15 @@ fn init_cache_max_bytes() -> u64 {
 /// `max_bytes`, never evicting `keep` (the layer just published). Best-effort:
 /// per-entry errors are skipped. The `.smolmachine` sidecars are zstd-compressed
 /// (dense) files, so apparent length is an accurate size.
+/// Bump a cache entry's modification time to now so the LRU prune treats it as
+/// recently used. Best-effort and cross-platform (`File::set_modified`); a
+/// failure just leaves the old mtime, which at worst evicts a hot entry sooner.
+fn touch_cache_entry(path: &Path) {
+    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
+        let _ = f.set_modified(std::time::SystemTime::now());
+    }
+}
+
 fn prune_init_cache(dir: &Path, max_bytes: u64, keep: &Path) {
     let mut layers: Vec<(PathBuf, std::time::SystemTime, u64)> = Vec::new();
     let Ok(rd) = std::fs::read_dir(dir) else {
@@ -742,6 +751,12 @@ fn ensure_init_layer(
         } else {
             println!("Using cached init layer {key}");
         }
+        // Mark the entry recently used (bump mtime) so the LRU sweep keeps hot
+        // images and evicts cold ones — without this a frequently-run cached image
+        // could be evicted just for having an old bake time. Then bound the cache
+        // on the hit path too, not only after a bake. Both best-effort.
+        touch_cache_entry(&cached);
+        prune_init_cache(&dir, init_cache_max_bytes(), &cached);
         return Ok(cached);
     }
 
@@ -2151,6 +2166,42 @@ mod tests {
         // Absolute and relative paths are always commands
         assert!(!is_likely_image_ref("/bin/sh"));
         assert!(!is_likely_image_ref("./script.sh"));
+    }
+
+    #[test]
+    fn prune_evicts_oldest_and_a_touch_saves_a_hot_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, bytes: usize| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, vec![0u8; bytes]).unwrap();
+            p
+        };
+        // Three 4 KiB entries; cap at 6 KiB forces evicting down to one.
+        let cold = write("cold.smolmachine", 4096);
+        let mid = write("mid.smolmachine", 4096);
+        let hot = write("hot.smolmachine", 4096);
+
+        // Establish an age order: cold < mid < hot, then simulate a cache HIT on
+        // `cold` by touching it so it becomes the most-recently-used.
+        let base = std::time::SystemTime::now() - std::time::Duration::from_secs(300);
+        for (p, age) in [(&cold, 300), (&mid, 200), (&hot, 100)] {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(base + std::time::Duration::from_secs(300 - age))
+                .unwrap();
+        }
+        touch_cache_entry(&cold); // hit → now newest
+
+        // Cap at 8 KiB keeps two of the three 4 KiB entries, evicting exactly one.
+        prune_init_cache(dir.path(), 8192, &hot);
+
+        // `hot` is kept (explicit keep), `cold` survives (just touched), and the
+        // now-oldest `mid` is the one evicted.
+        assert!(hot.exists(), "the just-baked entry is always kept");
+        assert!(cold.exists(), "a touched (recently-used) entry survives");
+        assert!(!mid.exists(), "the least-recently-used entry is evicted");
     }
 }
 
