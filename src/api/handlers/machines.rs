@@ -26,8 +26,11 @@ use axum::{
     extract::{Path, Query, State},
     Json,
 };
+use futures_util::StreamExt;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agent::{vm_data_dir, AgentClient, AgentManager, HostMount, PortMapping};
 use crate::api::error::ApiError;
@@ -1382,17 +1385,20 @@ pub(crate) async fn fork_machine_inner(
 }
 
 /// Prepare several clean held workers from one golden checkpoint and boot them
-/// concurrently. Preparation is all-or-nothing; once booting begins, successful
-/// workers remain usable and each failed worker is reported independently.
+/// through a bounded queue. Preparation is all-or-nothing; once booting begins,
+/// each result is reported as soon as it completes so successful workers can be
+/// leased while the remainder of the batch is still restoring.
 pub(crate) async fn fork_held_machines_inner(
     state: Arc<ApiState>,
     golden: String,
     clones: Vec<String>,
     share_weights: bool,
     ready_timeout: std::time::Duration,
-) -> Result<Vec<(String, Result<MachineInfo, ApiError>)>, ApiError> {
+    max_parallel: usize,
+    result_tx: UnboundedSender<(String, Result<MachineInfo, ApiError>)>,
+) -> Result<(), ApiError> {
     if clones.is_empty() {
-        return Ok(Vec::new());
+        return Ok(());
     }
 
     let golden_for_wait = golden.clone();
@@ -1456,12 +1462,19 @@ pub(crate) async fn fork_held_machines_inner(
             (clone, result)
         }
     });
-    let results = futures_util::future::join_all(boots).await;
+    let any_succeeded = run_bounded_futures(boots, max_parallel, |result| {
+        let succeeded = result.1.is_ok();
+        if result_tx.send(result).is_err() {
+            tracing::warn!("fork pool result receiver closed before provisioning completed");
+        }
+        succeeded
+    })
+    .await;
 
     // If every restore failed, no clone depends on this checkpoint and an
     // initially-running golden can safely resume for a later retry. A partial
     // success must retain the paused golden and shared snapshot.
-    if results.iter().all(|(_, result)| result.is_err()) {
+    if !any_succeeded {
         if let Err(error) = std::fs::remove_dir_all(&snapshot_dir) {
             tracing::warn!(path = %snapshot_dir.display(), %error, "failed to remove unused batch fork snapshot");
         }
@@ -1473,7 +1486,23 @@ pub(crate) async fn fork_held_machines_inner(
     }
 
     drop(guards);
-    Ok(results)
+    Ok(())
+}
+
+async fn run_bounded_futures<F, T>(
+    futures: impl IntoIterator<Item = F>,
+    max_parallel: usize,
+    mut on_complete: impl FnMut(T) -> bool,
+) -> bool
+where
+    F: Future<Output = T>,
+{
+    let mut pending = futures_util::stream::iter(futures).buffer_unordered(max_parallel.max(1));
+    let mut any_succeeded = false;
+    while let Some(result) = pending.next().await {
+        any_succeeded |= on_complete(result);
+    }
+    any_succeeded
 }
 
 async fn boot_prepared_fork_inner(
@@ -2546,7 +2575,71 @@ mod tests {
 
     use super::*;
     use crate::db::SmolvmDb;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn bounded_futures_stream_results_without_exceeding_the_limit() {
+        const TOTAL: usize = 8;
+        const WIDTH: usize = 4;
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let (started_tx, mut started_rx) = tokio::sync::watch::channel(0usize);
+        let jobs = (0..TOTAL)
+            .map(|index| {
+                let active = active.clone();
+                let peak = peak.clone();
+                let gate = gate.clone();
+                let started_tx = started_tx.clone();
+                async move {
+                    let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now_active, Ordering::SeqCst);
+                    started_tx.send_modify(|started| *started += 1);
+                    let permit = gate.acquire().await.expect("test gate closed");
+                    permit.forget();
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    index
+                }
+            })
+            .collect::<Vec<_>>();
+        drop(started_tx);
+
+        let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel();
+        let runner = tokio::spawn(async move {
+            run_bounded_futures(jobs, WIDTH, move |result| {
+                result_tx.send(result).expect("result receiver open");
+                true
+            })
+            .await
+        });
+
+        while *started_rx.borrow() < WIDTH {
+            started_rx.changed().await.expect("workers still pending");
+        }
+        assert_eq!(*started_rx.borrow(), WIDTH);
+        assert_eq!(active.load(Ordering::SeqCst), WIDTH);
+        assert!(!runner.is_finished());
+
+        gate.add_permits(1);
+        let first = result_rx.recv().await.expect("first result");
+        assert!(first < TOTAL);
+        while *started_rx.borrow() < WIDTH + 1 {
+            started_rx.changed().await.expect("workers still pending");
+        }
+        assert_eq!(active.load(Ordering::SeqCst), WIDTH);
+
+        gate.add_permits(TOTAL);
+        let mut received = 1;
+        while received < TOTAL {
+            result_rx.recv().await.expect("remaining result");
+            received += 1;
+        }
+        assert!(runner.await.expect("runner task"));
+        assert_eq!(peak.load(Ordering::SeqCst), WIDTH);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn ssrf_prone_registry_host_flags_loopback_linklocal_and_private() {
