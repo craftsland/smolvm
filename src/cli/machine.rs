@@ -577,6 +577,14 @@ pub struct RunCmd {
     #[arg(long, help_heading = "Resources")]
     pub rebuild_init_cache: bool,
 
+    /// Cache the pulled OCI image on the host so repeat ephemeral runs of the same
+    /// `--image` skip the registry pull. The image is baked once into a reusable
+    /// `.smolmachine` (keyed by image + env) and every later run rehydrates from it
+    /// instead of re-pulling inside the guest. The VM stays throwaway; only the
+    /// image is cached. Registry images only.
+    #[arg(long, help_heading = "Resources")]
+    pub oci_cache: bool,
+
     /// Run the workload as an unprivileged container: restricted capabilities,
     /// read-only cgroup, and no extra tmpfs. By default the workload is "VM-grade"
     /// (the microVM is the isolation boundary, so it gets full privileges and any
@@ -729,20 +737,31 @@ fn ensure_init_layer(
         .map_err(|e| smolvm::Error::config("init-layer cache", e.to_string()))?;
     let cached = dir.join(format!("{key}.smolmachine"));
     if cached.exists() && !rebuild {
-        println!("Using cached init layer {key}");
+        if params.init.is_empty() {
+            println!("Using cached image {key} (host cache hit; no pull)");
+        } else {
+            println!("Using cached init layer {key}");
+        }
         return Ok(cached);
     }
 
-    let smolfile = smolfile.ok_or_else(|| {
-        smolvm::Error::config(
+    // The Smolfile is the source of init commands, so it's required only when there
+    // ARE init steps. A bare `--oci-cache` image (no init) bakes from `--image`
+    // alone and needs no Smolfile.
+    if !params.init.is_empty() && smolfile.is_none() {
+        return Err(smolvm::Error::config(
             "init-layer cache",
             "init caching requires a --smolfile (the init source); pass --no-init-cache otherwise",
-        )
-    })?;
-    println!(
-        "Baking init layer (one-time; reused on later runs) [{key}, {} init step(s)]",
-        params.init.len()
-    );
+        ));
+    }
+    if params.init.is_empty() {
+        println!("Caching image {key} (one-time; reused on later runs)");
+    } else {
+        println!(
+            "Baking init layer (one-time; reused on later runs) [{key}, {} init step(s)]",
+            params.init.len()
+        );
+    }
     let started = std::time::Instant::now();
 
     let exe = std::env::current_exe()
@@ -752,7 +771,6 @@ fn ensure_init_layer(
     gc_stale_bake_machines(&exe);
     let pid = std::process::id();
     let tmp = format!("init-bake-{key}-{pid}");
-    let sf = smolfile.to_string_lossy().to_string();
 
     // Bake into a per-process staging dir, then atomically rename the sidecar into
     // its final cache path. This makes an interrupted bake leave nothing usable (no
@@ -776,10 +794,14 @@ fn ensure_init_layer(
         // `/bin/true` so `start` runs init only. Forward the RESOLVED image and env
         // (CLI overrides included) so the baked rootfs matches the cache key, which
         // is derived from those same resolved params.
-        let mut create: Vec<String> = ["machine", "create", "--name", &tmp, "--smolfile", &sf]
+        let mut create: Vec<String> = ["machine", "create", "--name", &tmp]
             .iter()
             .map(|s| s.to_string())
             .collect();
+        if let Some(sf) = smolfile {
+            create.push("--smolfile".into());
+            create.push(sf.to_string_lossy().to_string());
+        }
         if let Some(image) = &params.image {
             create.push("--image".into());
             create.push(image.clone());
@@ -787,6 +809,24 @@ fn ensure_init_layer(
         for e in &params.env {
             create.push("-e".into());
             create.push(e.clone());
+        }
+        // Forward the run's network config so the bake's one-time in-guest pull can
+        // reach the registry. The cached artifact carries the layers, so later runs
+        // from it need no network to source the image.
+        if params.net {
+            create.push("--net".into());
+        }
+        if let Some(dns) = params.dns {
+            create.push("--dns".into());
+            create.push(dns.to_string());
+        }
+        for c in params.allowed_cidrs.iter().flatten() {
+            create.push("--allow-cidr".into());
+            create.push(c.clone());
+        }
+        for h in params.dns_filter_hosts.iter().flatten() {
+            create.push("--allow-host".into());
+            create.push(h.clone());
         }
         create.push("--".into());
         create.push("/bin/true".into());
@@ -1040,10 +1080,14 @@ impl RunCmd {
         // `--image -` archive can't be re-read by the bake's child subprocess
         // (null stdin) anyway. Local images take the direct path below, which
         // stages the archive once in this process and runs init inline (#459).
+        // The cache normally applies to runs with `init` steps (bake `image + init`
+        // once). `--oci-cache` extends it to a bare `--image` run with no init, so
+        // the OCI image itself is cached on the host and repeat ephemeral runs skip
+        // the pull — the same bake path, just with an empty init layer.
         if !self.no_init_cache
             && !self.detach
             && image_bakeable(params.image.as_deref())
-            && !params.init.is_empty()
+            && (!params.init.is_empty() || self.oci_cache)
         {
             let cached =
                 ensure_init_layer(&params, self.smolfile.as_deref(), self.rebuild_init_cache)?;

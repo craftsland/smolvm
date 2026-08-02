@@ -78,6 +78,7 @@ pub mod dns_filter;
 pub mod dns_filter_listener;
 /// Language-neutral embedded runtime support shared by SDK adapters.
 pub mod embedded;
+pub mod image_store;
 pub mod log_rotation;
 pub mod network;
 /// Shared from-VM pack export used by every `pack create --from-vm` front-end.
