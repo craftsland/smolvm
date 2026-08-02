@@ -314,4 +314,89 @@ mod tests {
         let _ = a.apply(smolvm_registry::RegistryClient::new("http://x".into()));
         let _ = b.apply(smolvm_registry::RegistryClient::new("http://x".into()));
     }
+
+    #[test]
+    fn endpoint_for_maps_registries_correctly() {
+        let bare = Reference::parse("alpine").unwrap();
+        // Docker Hub official image → API endpoint + implicit `library/`.
+        assert_eq!(
+            endpoint_for("docker.io", &bare),
+            (
+                "https://registry-1.docker.io".to_string(),
+                "library/alpine".to_string()
+            )
+        );
+        let ns = Reference::parse("ghcr.io/org/tool:v1").unwrap();
+        assert_eq!(
+            endpoint_for("ghcr.io", &ns),
+            ("https://ghcr.io".to_string(), "org/tool".to_string())
+        );
+    }
+
+    /// THE security property: a cache HIT must not bypass authorization. Even
+    /// with the layers already on disk, an unauthorized caller is rejected at the
+    /// gate; only an authorized caller is served the cached entry.
+    #[test]
+    fn cache_hit_still_requires_authorization() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let server = MockServer::start().await;
+            let body = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":0},"layers":[]}"#.to_vec();
+
+            // Authorized bearer → 200 with the manifest.
+            Mock::given(method("GET"))
+                .and(path("/v2/myrepo/manifests/latest"))
+                .and(header("authorization", "Bearer good-token"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/vnd.oci.image.manifest.v1+json")
+                        .set_body_bytes(body.clone()),
+                )
+                .with_priority(1)
+                .mount(&server)
+                .await;
+            // Anyone else → 401 (no challenge header → the client does not retry).
+            Mock::given(method("GET"))
+                .and(path("/v2/myrepo/manifests/latest"))
+                .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
+                .with_priority(5)
+                .mount(&server)
+                .await;
+
+            let host = server.uri().strip_prefix("http://").unwrap().to_string();
+            let reference = format!("{host}/myrepo:latest");
+
+            // Pre-create a VALID cache entry for the manifest digest — the bytes
+            // are already present on disk.
+            let digest = format!("sha256:{}", hex::encode(Sha256::digest(&body)));
+            let tmp = tempfile::tempdir().unwrap();
+            let store = ImageStore::new(tmp.path().to_path_buf());
+            let layers = tmp.path().join(digest_dir(&digest)).join("layers");
+            std::fs::create_dir_all(&layers).unwrap();
+            std::fs::write(layers.join("layer-order"), "").unwrap();
+            assert!(is_intact(&tmp.path().join(digest_dir(&digest))));
+
+            // DENY: unauthorized caller is rejected at the gate despite the hit.
+            let denied = store.ensure_image(&reference, &PullAuth::anonymous()).await;
+            assert!(denied.is_err(), "cache hit must NOT bypass authorization");
+
+            // ALLOW: authorized caller resolves and is served the cached layers.
+            let allowed = store
+                .ensure_image(
+                    &reference,
+                    &PullAuth {
+                        bearer: Some("good-token".into()),
+                        identity_token: None,
+                    },
+                )
+                .await;
+            assert_eq!(
+                allowed.expect("authorized caller should be served"),
+                layers
+            );
+        });
+    }
 }

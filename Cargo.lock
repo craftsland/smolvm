@@ -3063,6 +3063,7 @@ dependencies = [
  "utoipa-axum",
  "utoipa-swagger-ui",
  "windows-sys 0.60.2",
+ "wiremock",
  "zeroize",
 ]
 
