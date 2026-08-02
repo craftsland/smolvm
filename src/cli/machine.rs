@@ -1089,6 +1089,21 @@ impl RunCmd {
             && image_bakeable(params.image.as_deref())
             && (!params.init.is_empty() || self.oci_cache)
         {
+            // Auth gate: resolve + authorize the image on the HOST before baking
+            // or serving a cached bake. A private image the caller cannot pull is
+            // rejected here — the same registry-authorization gate the cloud path
+            // uses, so caching never bypasses pull authorization. Anonymous auth
+            // covers public images; docker-config credentials are a follow-up.
+            if self.oci_cache {
+                if let Some(image) = params.image.as_deref() {
+                    let auth = smolvm::image_store::PullAuth::anonymous();
+                    let rt = tokio::runtime::Runtime::new()
+                        .map_err(|e| Error::config("oci-cache", e.to_string()))?;
+                    let digest =
+                        rt.block_on(smolvm::image_store::authorized_digest(image, &auth))?;
+                    eprintln!("Authorized {image} → {digest}");
+                }
+            }
             let cached =
                 ensure_init_layer(&params, self.smolfile.as_deref(), self.rebuild_init_cache)?;
             // The real workload: CLI trailing args win, else the Smolfile's

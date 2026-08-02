@@ -85,11 +85,7 @@ impl ImageStore {
             .or_else(|| parsed.tag.clone())
             .unwrap_or_else(|| "latest".to_string());
 
-        let base_url = if smolvm_registry::is_local_registry(&parsed.registry) {
-            format!("http://{}", parsed.registry)
-        } else {
-            format!("https://{}", parsed.registry)
-        };
+        let base_url = api_base_url(&parsed.registry);
         let client = auth.apply(smolvm_registry::RegistryClient::new(base_url));
 
         // ── AUTH GATE ──────────────────────────────────────────────────────
@@ -148,10 +144,48 @@ impl ImageStore {
     }
 }
 
+/// The auth gate on its own: resolve `reference`'s manifest with the caller's
+/// credentials and return the content digest. A caller who cannot pull the repo
+/// is rejected here (401/403). Used by the paths that materialize the image
+/// through the proven pack pipeline but still need the per-caller authorization
+/// and the content address as their cache key — so the security property holds
+/// identically whether the layers come from `ensure_image` or a bake.
+pub async fn authorized_digest(reference: &str, auth: &PullAuth) -> Result<String> {
+    let parsed = Reference::parse(reference)
+        .map_err(|e| Error::config("image-store", format!("bad reference: {}", e.reason)))?;
+    let repo = repo_path(&parsed);
+    let want = parsed
+        .digest
+        .clone()
+        .or_else(|| parsed.tag.clone())
+        .unwrap_or_else(|| "latest".to_string());
+    let base_url = if smolvm_registry::is_local_registry(&parsed.registry) {
+        format!("http://{}", parsed.registry)
+    } else {
+        format!("https://{}", parsed.registry)
+    };
+    let client = auth.apply(smolvm_registry::RegistryClient::new(base_url));
+    let manifest_bytes = client
+        .get_manifest_resolved(&repo, &want)
+        .await
+        .map_err(|e| Error::agent("image-store: authorize", e.to_string()))?;
+    Ok(format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(&manifest_bytes))
+    ))
+}
+
 /// The registry repository path for a reference (`namespace/name` or `name`).
+///
+/// Docker Hub official images (no namespace on `docker.io`) live under the
+/// implicit `library/` namespace, so a bare `alpine` resolves to `library/alpine`
+/// — without this the pull-scope is wrong and the registry answers 401.
 fn repo_path(r: &Reference) -> String {
     match &r.namespace {
         Some(ns) => format!("{}/{}", ns, r.name),
+        None if r.registry == crate::registry::DEFAULT_REGISTRY => {
+            format!("library/{}", r.name)
+        }
         None => r.name.clone(),
     }
 }
@@ -159,6 +193,20 @@ fn repo_path(r: &Reference) -> String {
 /// A filesystem-safe directory name for a digest (`sha256:abc` → `sha256-abc`).
 fn digest_dir(digest: &str) -> String {
     digest.replace(':', "-")
+}
+
+/// The registry API base URL for a hostname. Local registries are plaintext; the
+/// Docker Hub apex (`docker.io`) is a namespace alias whose OCI API is served at
+/// `registry-1.docker.io`, so it is rewritten here (the token service at
+/// `auth.docker.io` is discovered from the `WWW-Authenticate` challenge).
+fn api_base_url(registry: &str) -> String {
+    if smolvm_registry::is_local_registry(registry) {
+        format!("http://{}", registry)
+    } else if registry == crate::registry::DEFAULT_REGISTRY {
+        "https://registry-1.docker.io".to_string()
+    } else {
+        format!("https://{}", registry)
+    }
 }
 
 /// A cache entry is usable only if its `layers/` dir holds the layer-order index
