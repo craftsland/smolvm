@@ -32,8 +32,11 @@ const VHANDLE_TAG: u64 = 1 << 63;
 pub const CUDA_ERROR_NOT_FOUND: i32 = 500;
 pub const CUDA_ERROR_NOT_SUPPORTED: i32 = 801;
 
+#[cfg(unix)]
 const MAX_PUBLISHED_TENSORS: usize = 65_536;
+#[cfg(unix)]
 const MAX_PUBLISHED_MANIFEST: usize = 1 << 20;
+#[cfg(unix)]
 const MAX_PUBLISHED_BYTES: u64 = 16 << 30;
 
 /// One range inside a packed device-resident tensor bundle. Offsets are chosen
