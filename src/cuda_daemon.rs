@@ -4583,6 +4583,25 @@ fn spawn_clone_worker(
         golden_eviction_enabled(eviction_mode.as_deref(), options.fork_pool_size),
         sharing_active,
     );
+    #[cfg(target_os = "linux")]
+    let module_blob_build = if cached_module_blob(token).is_none() {
+        // Capturing module metadata briefly shares the frozen layout lock, but
+        // writing the immutable images is independent of the device-to-host
+        // memory snapshot below. Overlap both first-worker costs; later workers
+        // continue to use the two single-flight caches.
+        match std::thread::Builder::new()
+            .name("cuda-module-handoff".into())
+            .spawn(move || module_blob_for_token(token))
+        {
+            Ok(build) => Some(build),
+            Err(error) => {
+                tracing::warn!(%error, token, "could not parallelize CUDA module handoff");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let (golden_dev, layout, export_fds) = if let Some(cached) = cached_host_snapshot(token) {
         tracing::info!(
             token,
@@ -4854,7 +4873,20 @@ fn spawn_clone_worker(
     // inherit a read-only descriptor for an unnamed file; other Unix hosts keep
     // the legacy unique-path handoff.
     #[cfg(target_os = "linux")]
-    let module_blob = match module_blob_for_token(token) {
+    let module_blob_result = match module_blob_build {
+        Some(build) => match build.join() {
+            Ok(result) => result,
+            Err(_) => {
+                for &fd in &export_fds {
+                    unsafe { libc::close(fd) };
+                }
+                return Err(io::Error::other("CUDA module handoff builder panicked"));
+            }
+        },
+        None => module_blob_for_token(token),
+    };
+    #[cfg(target_os = "linux")]
+    let module_blob = match module_blob_result {
         Ok(blob) => blob,
         Err(error) => {
             for &fd in &export_fds {
