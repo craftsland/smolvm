@@ -110,6 +110,7 @@ class RolloutClient:
         *,
         endpoint: str,
         adapter_root: str | os.PathLike[str],
+        device_adapter_socket: str | os.PathLike[str] | None = None,
         fallback_pool: str | None = None,
         max_concurrent_requests: int = 32,
         max_queue_depth: int = 256,
@@ -128,6 +129,8 @@ class RolloutClient:
         }
         if fallback_pool is not None:
             desired["fallbackPool"] = fallback_pool
+        if device_adapter_socket is not None:
+            desired["deviceAdapterSocket"] = str(Path(device_adapter_socket).resolve())
         try:
             return self._request("POST", "/rollout-executors", desired)
         except RolloutError as error:
@@ -138,6 +141,7 @@ class RolloutClient:
             "backend": current["backend"],
             "endpoint": current["endpoint"],
             "adapterRoot": current["adapterRoot"],
+            "deviceAdapterSocket": current.get("deviceAdapterSocket"),
             "fallbackPool": current.get("fallbackPool"),
             "maxConcurrentRequests": current["maxConcurrentRequests"],
             "maxQueueDepth": current["maxQueueDepth"],
@@ -146,6 +150,7 @@ class RolloutClient:
             "backend": "vllm",
             "endpoint": endpoint,
             "adapterRoot": desired["adapterRoot"],
+            "deviceAdapterSocket": desired.get("deviceAdapterSocket"),
             "fallbackPool": fallback_pool,
             "maxConcurrentRequests": max_concurrent_requests,
             "maxQueueDepth": max_queue_depth,
@@ -191,6 +196,44 @@ class RolloutClient:
                 "retainPrevious": retain_previous,
             },
         )
+
+    def publish_device_policy(
+        self,
+        policy: str,
+        version: str,
+        tensor_bundle_token: bytes | str,
+        *,
+        retain_previous: bool = False,
+    ) -> dict[str, Any]:
+        """Atomically publish a one-use device-resident LoRA allocation."""
+
+        token = (
+            tensor_bundle_token.hex()
+            if isinstance(tensor_bundle_token, bytes)
+            else tensor_bundle_token
+        )
+        if len(token) != 64:
+            raise ValueError("tensor bundle token must contain exactly 32 bytes")
+        try:
+            bytes.fromhex(token)
+        except ValueError as error:
+            raise ValueError("tensor bundle token must be hexadecimal") from error
+        path = f"/rollout-executors/{self.executor}/device-policies"
+        body = {
+            "policy": policy,
+            "version": version,
+            "tensorBundleToken": token,
+            "retainPrevious": retain_previous,
+        }
+        try:
+            return self._request("POST", path, body)
+        except RolloutError as error:
+            if error.status != 0:
+                raise
+            # The token is one-use, but the controller remembers its digest.
+            # Reusing the same token is therefore safe when a lost response
+            # leaves it ambiguous whether the first request was accepted.
+            return self._request("POST", path, body)
 
     def retire_policy(self, policy: str, version: str) -> None:
         """Stop routing and unload a policy version after its requests drain."""

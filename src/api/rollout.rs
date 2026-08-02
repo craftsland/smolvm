@@ -19,6 +19,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, OnceCell, RwLock, Semaphore};
 use utoipa::ToSchema;
 
+#[cfg(unix)]
+use crate::api::device_handoff::DeviceHandoffClient;
+
 const DEFAULT_MAX_CONCURRENT: u32 = 32;
 const MAX_CONCURRENT: u32 = 1024;
 const DEFAULT_MAX_QUEUE_DEPTH: u32 = 256;
@@ -50,6 +53,9 @@ pub struct CreateRolloutExecutorRequest {
     pub endpoint: String,
     /// Host directory beneath which adapter paths must resolve.
     pub adapter_root: String,
+    /// Optional private Unix socket for device-resident LoRA handoff without host staging.
+    #[serde(default)]
+    pub device_adapter_socket: Option<String>,
     /// Optional ordinary fork pool used by framework adapters as a compatibility fallback.
     #[serde(default)]
     pub fallback_pool: Option<String>,
@@ -76,6 +82,9 @@ pub struct RolloutExecutorInfo {
     pub endpoint: String,
     /// Confined adapter root.
     pub adapter_root: String,
+    /// Private device-adapter sidecar socket, when enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_adapter_socket: Option<String>,
     /// Optional isolated-worker fallback pool.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback_pool: Option<String>,
@@ -114,6 +123,21 @@ pub struct PublishRolloutPolicyRequest {
     pub retain_previous: bool,
 }
 
+/// Request to publish one immutable LoRA policy directly from clone GPU memory.
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishDeviceRolloutPolicyRequest {
+    /// Logical policy or experiment identifier.
+    pub policy: String,
+    /// Immutable version identifier, normally the optimizer step.
+    pub version: String,
+    /// Hex-encoded one-use token returned by the clone's CUDA publisher.
+    pub tensor_bundle_token: String,
+    /// Keep the previous current version routable instead of retiring it.
+    #[serde(default)]
+    pub retain_previous: bool,
+}
+
 /// Published policy metadata.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -122,10 +146,12 @@ pub struct RolloutPolicyInfo {
     pub policy: String,
     /// Immutable version identifier.
     pub version: String,
-    /// Verified adapter SHA-256.
+    /// Verified file-adapter digest or controller-derived device-publication digest.
     pub adapter_sha256: String,
     /// Opaque backend model name assigned by smolvm.
     pub backend_model: String,
+    /// Policy transport: `filesystem` or `device`.
+    pub source: String,
     /// Whether this is the default version for the policy.
     pub current: bool,
     /// Requests using this version right now.
@@ -375,10 +401,27 @@ struct PolicyEntry {
     version: String,
     adapter_sha256: String,
     backend_model: String,
+    source: AdapterSource,
+    device_token_fingerprint: Option<[u8; 32]>,
     active: AtomicUsize,
     retiring: AtomicBool,
     drained: Notify,
     retirement: Mutex<()>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AdapterSource {
+    Filesystem,
+    Device,
+}
+
+impl AdapterSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Filesystem => "filesystem",
+            Self::Device => "device",
+        }
+    }
 }
 
 struct PolicyGuard {
@@ -397,6 +440,8 @@ struct ExecutorConfig {
     name: String,
     endpoint: String,
     adapter_root: PathBuf,
+    #[cfg(unix)]
+    device_handoff: Option<DeviceHandoffClient>,
     fallback_pool: Option<String>,
     max_concurrent: u32,
     max_queue_depth: u32,
@@ -547,11 +592,27 @@ impl RolloutExecutor {
             .connect_timeout(Duration::from_secs(5))
             .build()
             .map_err(|error| RolloutError::Backend(format!("build rollout client: {error}")))?;
+        #[cfg(unix)]
+        let device_handoff = request
+            .device_adapter_socket
+            .as_deref()
+            .map(|path| {
+                DeviceHandoffClient::new(Path::new(path), Duration::from_secs(timeout_secs))
+            })
+            .transpose()?;
+        #[cfg(not(unix))]
+        if request.device_adapter_socket.is_some() {
+            return Err(RolloutError::BadRequest(
+                "device-resident rollout handoff requires a Unix host".into(),
+            ));
+        }
         Ok(Self {
             config: ExecutorConfig {
                 name: request.name,
                 endpoint,
                 adapter_root,
+                #[cfg(unix)]
+                device_handoff,
                 fallback_pool: request.fallback_pool,
                 max_concurrent,
                 max_queue_depth,
@@ -589,6 +650,10 @@ impl RolloutExecutor {
                 response.status()
             )));
         }
+        #[cfg(unix)]
+        if let Some(handoff) = &self.config.device_handoff {
+            handoff.health().await?;
+        }
         Ok(())
     }
 
@@ -602,17 +667,43 @@ impl RolloutExecutor {
                 version: entry.version.clone(),
                 adapter_sha256: entry.adapter_sha256.clone(),
                 backend_model: entry.backend_model.clone(),
+                source: entry.source.as_str().into(),
                 current: state.current.get(&entry.policy) == Some(&entry.version),
                 active_requests: entry.active.load(Ordering::Acquire) as u32,
                 retiring: entry.retiring.load(Ordering::Acquire),
             })
             .collect();
         policies.sort_by(|a, b| (&a.policy, &a.version).cmp(&(&b.policy, &b.version)));
+        let mut capabilities = vec![
+            "multi_lora".into(),
+            "text_prompts".into(),
+            "token_id_prompts".into(),
+            "token_id_outputs".into(),
+            "logprobs".into(),
+            "continuous_batching".into(),
+        ];
+        #[cfg(unix)]
+        if self.config.device_handoff.is_some() {
+            capabilities.push("device_lora_handoff".into());
+        }
         RolloutExecutorInfo {
             name: self.config.name.clone(),
             backend: "vllm".into(),
             endpoint: self.config.endpoint.clone(),
             adapter_root: self.config.adapter_root.display().to_string(),
+            device_adapter_socket: {
+                #[cfg(unix)]
+                {
+                    self.config
+                        .device_handoff
+                        .as_ref()
+                        .map(|client| client.path().display().to_string())
+                }
+                #[cfg(not(unix))]
+                {
+                    None
+                }
+            },
             fallback_pool: self.config.fallback_pool.clone(),
             max_concurrent_requests: self.config.max_concurrent,
             max_queue_depth: self.config.max_queue_depth,
@@ -621,14 +712,7 @@ impl RolloutExecutor {
             queued_requests: self.queued.load(Ordering::Acquire),
             accepting: self.accepting.load(Ordering::Acquire),
             policies,
-            capabilities: vec![
-                "multi_lora".into(),
-                "text_prompts".into(),
-                "token_id_prompts".into(),
-                "token_id_outputs".into(),
-                "logprobs".into(),
-                "continuous_batching".into(),
-            ],
+            capabilities,
         }
     }
 
@@ -652,7 +736,9 @@ impl RolloutExecutor {
                 .versions
                 .get(&(request.policy.clone(), request.version.clone()))
             {
-                if existing.adapter_sha256 != request.adapter_sha256 {
+                if existing.source != AdapterSource::Filesystem
+                    || existing.adapter_sha256 != request.adapter_sha256
+                {
                     return Err(RolloutError::Conflict(format!(
                         "policy '{}:{}' already exists with a different digest",
                         request.policy, request.version
@@ -669,6 +755,7 @@ impl RolloutExecutor {
                     version: existing.version.clone(),
                     adapter_sha256: existing.adapter_sha256.clone(),
                     backend_model: existing.backend_model.clone(),
+                    source: existing.source.as_str().into(),
                     current: state.current.get(&existing.policy) == Some(&existing.version),
                     active_requests: existing.active.load(Ordering::Acquire) as u32,
                     retiring: false,
@@ -705,6 +792,8 @@ impl RolloutExecutor {
             version: request.version.clone(),
             adapter_sha256: request.adapter_sha256,
             backend_model: backend_model.clone(),
+            source: AdapterSource::Filesystem,
+            device_token_fingerprint: None,
             active: AtomicUsize::new(0),
             retiring: AtomicBool::new(false),
             drained: Notify::new(),
@@ -747,12 +836,185 @@ impl RolloutExecutor {
                 }
             });
         }
-        metrics::counter!("smolvm_rollout_policy_publications_total", "executor" => self.config.name.clone()).increment(1);
+        metrics::counter!("smolvm_rollout_policy_publications_total", "executor" => self.config.name.clone(), "source" => "filesystem").increment(1);
         Ok(RolloutPolicyInfo {
             policy: entry.policy.clone(),
             version: entry.version.clone(),
             adapter_sha256: entry.adapter_sha256.clone(),
             backend_model,
+            source: AdapterSource::Filesystem.as_str().into(),
+            current: true,
+            active_requests: 0,
+            retiring: false,
+        })
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn publish_device_policy(
+        self: &Arc<Self>,
+        request: PublishDeviceRolloutPolicyRequest,
+    ) -> Result<RolloutPolicyInfo, RolloutError> {
+        validate_name("policy", &request.policy)?;
+        validate_name("version", &request.version)?;
+        let token = hex::decode(&request.tensor_bundle_token).map_err(|_| {
+            RolloutError::BadRequest("tensorBundleToken must be hexadecimal".into())
+        })?;
+        if token.len() != 32 {
+            return Err(RolloutError::BadRequest(
+                "tensorBundleToken must contain exactly 32 bytes".into(),
+            ));
+        }
+        let token_fingerprint: [u8; 32] = Sha256::digest(&token).into();
+        let _publish = self.publish_lock.lock().await;
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(RolloutError::Unavailable(format!(
+                "rollout executor '{}' is draining",
+                self.config.name
+            )));
+        }
+        {
+            let state = self.policy_state.read().await;
+            if let Some(existing) = state
+                .versions
+                .get(&(request.policy.clone(), request.version.clone()))
+            {
+                if existing.source != AdapterSource::Device
+                    || existing.device_token_fingerprint != Some(token_fingerprint)
+                {
+                    return Err(RolloutError::Conflict(format!(
+                        "policy '{}:{}' already exists with a different device publication",
+                        request.policy, request.version
+                    )));
+                }
+                if existing.retiring.load(Ordering::Acquire) {
+                    return Err(RolloutError::Unavailable(format!(
+                        "policy '{}:{}' is retiring",
+                        request.policy, request.version
+                    )));
+                }
+                return Ok(RolloutPolicyInfo {
+                    policy: existing.policy.clone(),
+                    version: existing.version.clone(),
+                    adapter_sha256: existing.adapter_sha256.clone(),
+                    backend_model: existing.backend_model.clone(),
+                    source: existing.source.as_str().into(),
+                    current: state.current.get(&existing.policy) == Some(&existing.version),
+                    active_requests: existing.active.load(Ordering::Acquire) as u32,
+                    retiring: false,
+                });
+            }
+            if state.versions.len() >= MAX_POLICY_VERSIONS {
+                return Err(RolloutError::Unavailable(format!(
+                    "executor reached its {MAX_POLICY_VERSIONS}-policy-version limit"
+                )));
+            }
+        }
+        let handoff = self.config.device_handoff.as_ref().ok_or_else(|| {
+            RolloutError::BadRequest(format!(
+                "rollout executor '{}' has no deviceAdapterSocket",
+                self.config.name
+            ))
+        })?;
+        let redeem_token = token.clone();
+        let bundle = tokio::task::spawn_blocking(move || {
+            crate::cuda_daemon::redeem_tensor_bundle(&redeem_token)
+        })
+        .await
+        .map_err(|error| RolloutError::Backend(format!("tensor redemption task failed: {error}")))?
+        .map_err(|error| {
+            RolloutError::Unavailable(format!("redeem device tensor bundle: {error}"))
+        })?;
+        let mut digest = Sha256::new();
+        digest.update(b"smolvm-device-publication-v1\0");
+        digest.update(&token);
+        digest.update(&bundle.metadata);
+        let publication_sha256 = hex::encode(digest.finalize());
+        let backend_model = backend_model_name(
+            &self.config.name,
+            &request.policy,
+            &request.version,
+            &publication_sha256,
+        );
+        if let Err(error) = handoff.load(&backend_model, bundle).await {
+            if let Err(cleanup) = handoff.unload(&backend_model).await {
+                let handoff = handoff.clone();
+                let executor = self.config.name.clone();
+                let cleanup_model = backend_model.clone();
+                tokio::spawn(async move {
+                    let mut last = cleanup;
+                    for attempt in 1..=3 {
+                        tokio::time::sleep(Duration::from_secs(attempt)).await;
+                        match handoff.unload(&cleanup_model).await {
+                            Ok(()) => return,
+                            Err(error) => last = error,
+                        }
+                    }
+                    tracing::warn!(
+                        %executor,
+                        model = %cleanup_model,
+                        error = %last.message(),
+                        "failed to clean up an uncertain device-adapter load"
+                    );
+                });
+            }
+            return Err(error);
+        }
+        let entry = Arc::new(PolicyEntry {
+            policy: request.policy.clone(),
+            version: request.version.clone(),
+            adapter_sha256: publication_sha256,
+            backend_model: backend_model.clone(),
+            source: AdapterSource::Device,
+            device_token_fingerprint: Some(token_fingerprint),
+            active: AtomicUsize::new(0),
+            retiring: AtomicBool::new(false),
+            drained: Notify::new(),
+            retirement: Mutex::new(()),
+        });
+        let previous = {
+            let mut state = self.policy_state.write().await;
+            let previous_version = state
+                .current
+                .insert(request.policy.clone(), request.version.clone());
+            state.versions.insert(
+                (request.policy.clone(), request.version.clone()),
+                entry.clone(),
+            );
+            if request.retain_previous {
+                None
+            } else {
+                previous_version.and_then(|version| {
+                    if version == request.version {
+                        None
+                    } else {
+                        state
+                            .versions
+                            .get(&(request.policy.clone(), version))
+                            .cloned()
+                            .inspect(|entry| entry.retiring.store(true, Ordering::Release))
+                    }
+                })
+            }
+        };
+        if let Some(previous) = previous {
+            let executor = self.clone();
+            tokio::spawn(async move {
+                if let Err(error) = executor.retire_tracked_entry(previous).await {
+                    tracing::warn!(
+                        executor = %executor.config.name,
+                        error = %error.message(),
+                        "failed to retire previous rollout policy version"
+                    );
+                }
+            });
+        }
+        metrics::counter!("smolvm_rollout_policy_publications_total", "executor" => self.config.name.clone(), "source" => "device").increment(1);
+        Ok(RolloutPolicyInfo {
+            policy: entry.policy.clone(),
+            version: entry.version.clone(),
+            adapter_sha256: entry.adapter_sha256.clone(),
+            backend_model,
+            source: AdapterSource::Device.as_str().into(),
             current: true,
             active_requests: 0,
             retiring: false,
@@ -807,7 +1069,26 @@ impl RolloutExecutor {
             }
             notified.await;
         }
-        self.unload_adapter(&entry.backend_model).await?;
+        match entry.source {
+            AdapterSource::Filesystem => self.unload_adapter(&entry.backend_model).await?,
+            AdapterSource::Device => {
+                #[cfg(unix)]
+                self.config
+                    .device_handoff
+                    .as_ref()
+                    .ok_or_else(|| {
+                        RolloutError::Unavailable(
+                            "device adapter sidecar is no longer configured".into(),
+                        )
+                    })?
+                    .unload(&entry.backend_model)
+                    .await?;
+                #[cfg(not(unix))]
+                return Err(RolloutError::Unavailable(
+                    "device-resident rollout handoff requires a Unix host".into(),
+                ));
+            }
+        }
         let mut state = self.policy_state.write().await;
         let key = (entry.policy.clone(), entry.version.clone());
         if state
@@ -1664,6 +1945,7 @@ mod tests {
                 backend: "vllm".into(),
                 endpoint: format!("http://{address}"),
                 adapter_root: root.path().display().to_string(),
+                device_adapter_socket: None,
                 fallback_pool: None,
                 max_concurrent_requests: Some(2),
                 max_queue_depth: Some(2),
@@ -1702,6 +1984,7 @@ mod tests {
                 backend: "vllm".into(),
                 endpoint: format!("http://{address}"),
                 adapter_root: root.path().display().to_string(),
+                device_adapter_socket: None,
                 fallback_pool: None,
                 max_concurrent_requests: Some(2),
                 max_queue_depth: Some(2),
@@ -1829,6 +2112,7 @@ mod tests {
                 backend: "vllm".into(),
                 endpoint: format!("http://{address}"),
                 adapter_root: root.path().display().to_string(),
+                device_adapter_socket: None,
                 fallback_pool: None,
                 max_concurrent_requests: Some(2),
                 max_queue_depth: Some(2),
@@ -1927,6 +2211,7 @@ mod tests {
             backend: "vllm".into(),
             endpoint: "http://127.0.0.1:1".into(),
             adapter_root: root.path().display().to_string(),
+            device_adapter_socket: None,
             fallback_pool: None,
             max_concurrent_requests: Some(1),
             max_queue_depth: Some(0),

@@ -10,9 +10,9 @@ use std::sync::Arc;
 
 use crate::api::error::ApiError;
 use crate::api::rollout::{
-    CreateRolloutExecutorRequest, PublishRolloutPolicyRequest, RolloutBatchItemResponse,
-    RolloutBatchRequest, RolloutBatchResponse, RolloutExecutorInfo, RolloutGenerateRequest,
-    RolloutGenerateResponse, RolloutPolicyInfo,
+    CreateRolloutExecutorRequest, PublishDeviceRolloutPolicyRequest, PublishRolloutPolicyRequest,
+    RolloutBatchItemResponse, RolloutBatchRequest, RolloutBatchResponse, RolloutExecutorInfo,
+    RolloutGenerateRequest, RolloutGenerateResponse, RolloutPolicyInfo,
 };
 use crate::api::state::ApiState;
 
@@ -138,6 +138,44 @@ pub async fn publish_policy(
         .await
         .map_err(ApiError::from)?;
     Ok((StatusCode::CREATED, Json(policy)))
+}
+
+/// Validate, redeem, and atomically publish a device-resident policy version.
+#[utoipa::path(
+    post,
+    path = "/api/v1/rollout-executors/{name}/device-policies",
+    params(("name" = String, Path, description = "Executor name")),
+    request_body = PublishDeviceRolloutPolicyRequest,
+    responses(
+        (status = 201, description = "Device policy published", body = RolloutPolicyInfo),
+        (status = 400, description = "Invalid token or tensor manifest"),
+        (status = 404, description = "Executor not found"),
+        (status = 409, description = "Version conflict"),
+        (status = 503, description = "Device sidecar unavailable")
+    ),
+    tag = "Rollouts"
+)]
+pub async fn publish_device_policy(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+    Json(request): Json<PublishDeviceRolloutPolicyRequest>,
+) -> Result<(StatusCode, Json<RolloutPolicyInfo>), ApiError> {
+    #[cfg(unix)]
+    {
+        let executor = state.rollout().get(&name).await.map_err(ApiError::from)?;
+        let policy = executor
+            .publish_device_policy(request)
+            .await
+            .map_err(ApiError::from)?;
+        Ok((StatusCode::CREATED, Json(policy)))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (state, name, request);
+        Err(ApiError::BadRequest(
+            "device-resident rollout handoff requires a Unix host".into(),
+        ))
+    }
 }
 
 /// Stop routing one policy version and unload it after active requests drain.

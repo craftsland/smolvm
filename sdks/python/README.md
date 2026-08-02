@@ -31,3 +31,27 @@ result = client.generate(
     logprobs=1,
 )
 ```
+
+For colocated CUDA trainers, `publish_device_adapter` replaces the checkpoint
+write with an immutable device allocation. Register a mode-0600 sidecar socket,
+then publish the returned one-use token:
+
+```python
+from peft import get_peft_model_state_dict
+from smolvm_rollout import publish_device_adapter
+
+state = get_peft_model_state_dict(model)
+token = publish_device_adapter(state, model.peft_config[model.active_adapter].to_dict())
+client.publish_device_policy("experiment-a", "step-41", token)
+```
+
+PyTorch synchronization is automatic. Other CUDA frameworks pass their own
+stream barrier with `synchronize=` before smolvm packs the immutable allocation.
+Publish at an optimizer-step boundary while the framework has stopped mutating
+the selected adapter tensors.
+
+The rollout process runs `DeviceAdapterServer` with framework load/unload
+callbacks. `import_torch_device_adapter` provides named PyTorch views over the
+received CUDA allocation; the server retains them until smolvm drains active
+requests and the unload callback succeeds. Filesystem publication remains the
+fallback when a framework has no device-adapter callback.

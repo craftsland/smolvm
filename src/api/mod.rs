@@ -19,6 +19,8 @@
 //! ```
 
 pub mod admission;
+#[cfg(unix)]
+pub(crate) mod device_handoff;
 #[path = "errors.rs"]
 pub mod error;
 pub mod handlers;
@@ -112,6 +114,7 @@ use state::ApiState;
         handlers::rollouts::get_executor,
         handlers::rollouts::delete_executor,
         handlers::rollouts::publish_policy,
+        handlers::rollouts::publish_device_policy,
         handlers::rollouts::retire_policy,
         handlers::rollouts::generate,
         handlers::rollouts::generate_batch,
@@ -141,6 +144,7 @@ use state::ApiState;
         types::ResizeForkPoolRequest,
         rollout::CreateRolloutExecutorRequest,
         rollout::PublishRolloutPolicyRequest,
+        rollout::PublishDeviceRolloutPolicyRequest,
         rollout::RolloutPrompt,
         rollout::RolloutSamplingParams,
         rollout::RolloutGenerateRequest,
@@ -324,6 +328,10 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route("/{name}", get(handlers::rollouts::get_executor))
         .route("/{name}", delete(handlers::rollouts::delete_executor))
         .route("/{name}/policies", post(handlers::rollouts::publish_policy))
+        .route(
+            "/{name}/device-policies",
+            post(handlers::rollouts::publish_device_policy),
+        )
         .route(
             "/{name}/policies/{policy}/{version}",
             delete(handlers::rollouts::retire_policy),
