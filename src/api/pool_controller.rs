@@ -247,17 +247,8 @@ impl ForkPoolController {
             None
         };
         let host_cpu = if sample { self.host_cpu.sample() } else { None };
-        let names = pools
-            .iter()
-            .map(|pool| pool.name.clone())
-            .collect::<std::collections::HashSet<_>>();
-        self.state.admission().retain_pools(&names);
-
+        let mut observations = Vec::with_capacity(pools.len());
         for pool in pools.iter().filter(|pool| !pool.deleting) {
-            if !pool.auto_admission {
-                self.state.admission().ensure(pool, 0);
-                continue;
-            }
             let db = self.state.db().clone();
             let pool_name = pool.name.clone();
             let (active, completed) =
@@ -265,19 +256,30 @@ impl ForkPoolController {
                     .await
                     .map_err(|error| error.to_string())?
                     .map_err(|error| error.to_string())?;
-            if sample {
-                self.state
-                    .admission()
-                    .observe(pool, active, completed, gpu, host_cpu);
-            } else {
-                // Mutations and fill completions need an immediate capacity
-                // pass, but admission's eight-second telemetry windows remain
-                // tied to the periodic cadence rather than event frequency.
-                self.state.admission().ensure(pool, completed);
-            }
+            observations.push((pool.clone(), active, completed));
+        }
+        if sample {
+            self.state
+                .admission()
+                .observe_pools(&observations, gpu.as_ref(), host_cpu);
+        } else {
+            // Mutations and fill completions need an immediate capacity pass,
+            // but admission's telemetry windows retain their periodic cadence.
+            self.state.admission().ensure_pools(&observations);
+        }
+
+        for pool in pools
+            .iter()
+            .filter(|pool| !pool.deleting && pool.auto_admission)
+        {
             if let Some(snapshot) = self.state.admission().snapshot(pool) {
                 metrics::gauge!("smolvm_pool_admission_limit", "pool" => pool.name.clone())
                     .set(f64::from(snapshot.effective_limit));
+                metrics::gauge!(
+                    "smolvm_cuda_device_admission_limit",
+                    "device" => snapshot.device_ordinal.to_string()
+                )
+                .set(f64::from(snapshot.device_limit));
                 if let Some(utilization) = snapshot.gpu_utilization_percent {
                     metrics::gauge!("smolvm_pool_gpu_utilization_percent", "pool" => pool.name.clone())
                         .set(utilization);

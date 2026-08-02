@@ -23,6 +23,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Stable host-device enumeration shared with device-scoped admission.
+const CUDA_DEVICE_ORDER: &str = "PCI_BUS_ID";
+
 /// Control-socket path for the shared daemon, under the smolvm data dir (so the
 /// daemon and every boot subprocess agree on one location).
 pub fn socket_path() -> PathBuf {
@@ -1186,6 +1189,10 @@ pub(crate) fn install_crash_handler(role: &'static str) {
 
 /// Serve the shared CUDA daemon on `sock` (spawned as `smolvm _cuda-daemon`).
 pub fn run(sock: &Path) -> io::Result<()> {
+    // Admission maps logical CUDA ordinals to NVML devices without loading
+    // libcuda in the control plane. Pinning the daemon to PCI order makes that
+    // mapping deterministic while still honoring CUDA_VISIBLE_DEVICES order.
+    std::env::set_var("CUDA_DEVICE_ORDER", CUDA_DEVICE_ORDER);
     // Become our own process-group leader so a clean-shutdown signal can take the
     // whole group (this daemon + its clone workers) down together without ever
     // touching the shell/ssh session that launched us. The `ensure_running` spawn
@@ -5742,6 +5749,7 @@ pub fn ensure_running() -> io::Result<PathBuf> {
     };
     Command::new(exe)
         .args(["_cuda-daemon", &sock.to_string_lossy()])
+        .env("CUDA_DEVICE_ORDER", CUDA_DEVICE_ORDER)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(stderr)
