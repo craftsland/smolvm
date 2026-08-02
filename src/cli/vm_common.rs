@@ -649,6 +649,10 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     record.published_sockets = params.published_sockets.clone();
     record.source_smolmachine = params.source_smolmachine.clone();
 
+    // A registry image with no network can never be pulled (the guest runs the
+    // pull), so refuse here rather than deferring to a `start` that must fail.
+    record.validate_image_fetchable()?;
+
     Ok(record)
 }
 

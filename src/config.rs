@@ -772,6 +772,58 @@ impl VmRecord {
             .collect()
     }
 
+    /// Reject a machine whose image can never be fetched: a REGISTRY reference
+    /// with no network.
+    ///
+    /// The pull runs inside the guest (the agent shells out to `crane`), so a VM
+    /// with no network device cannot fetch its own image and every `start` dies
+    /// with a raw Go DNS error naming the fallback resolver — a failure deferred
+    /// from `create`, where the config is already known to be unbootable. This is
+    /// the same up-front rejection `create` already applies to resources, ports,
+    /// CIDRs and mounts.
+    ///
+    /// Deliberately narrow: only a registry reference needs the network. A local
+    /// archive (`--image ./img.tar`, `--image -`) or an already-unpacked
+    /// directory is resolved from bytes the host already has, and a
+    /// `.smolmachine` artifact has its layers extracted at create — all three are
+    /// legitimately network-free and must keep working.
+    pub fn validate_image_fetchable(&self) -> crate::Result<()> {
+        let Some(image) = self.image.as_deref() else {
+            return Ok(());
+        };
+        // An ALREADY-RESOLVED local source persists as `local:<hash>` /
+        // `local-dir:<path>`, and `classify` would read those as registry refs
+        // (no `/`, `./` or archive suffix). Check the resolved form first, or
+        // this rejects the very offline workflow the error below recommends.
+        if crate::data::image_source::is_local_ref(image) {
+            return Ok(());
+        }
+        if !matches!(
+            crate::data::image_source::classify(image),
+            crate::data::image_source::ImageSource::Registry(_)
+        ) {
+            return Ok(());
+        }
+        let plan = crate::network::plan_launch_network(
+            &self.vm_resources(),
+            self.dns_filter_hosts.as_deref(),
+            self.ports.len(),
+        );
+        if plan.has_network() {
+            return Ok(());
+        }
+        Err(crate::Error::config(
+            "create machine",
+            format!(
+                "image '{image}' must be pulled from a registry, but this machine has no \
+                 network, so the pull can never succeed. Add --net (or publish a port with \
+                 -p, or set an egress policy with --allow-cidr/--allow-host). To keep the \
+                 machine network-isolated, supply the image locally instead: \
+                 `docker save {image} | smolvm machine create --image - ...`"
+            ),
+        ))
+    }
+
     /// Convert record fields to VmResources.
     pub fn vm_resources(&self) -> crate::agent::VmResources {
         crate::agent::VmResources {
@@ -794,6 +846,82 @@ impl VmRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A machine with `image`, and whatever networking the args describe.
+    fn rec_with_image(image: &str, network: bool, ports: Vec<(u16, u16)>) -> VmRecord {
+        let mut r = VmRecord::new("m".to_string(), 1, 512, vec![], ports, network);
+        r.image = Some(image.to_string());
+        r
+    }
+
+    // The bug: `create` accepted this and every `start` died with a raw Go DNS
+    // error, because the pull runs inside a guest that has no network.
+    #[test]
+    fn a_registry_image_with_no_network_is_rejected_at_create() {
+        let err = rec_with_image("alpine", false, vec![])
+            .validate_image_fetchable()
+            .expect_err("must reject");
+        let msg = err.to_string();
+        assert!(msg.contains("alpine"), "names the image: {msg}");
+        assert!(msg.contains("--net"), "says how to fix it: {msg}");
+    }
+
+    #[test]
+    fn granting_network_any_way_makes_it_fetchable() {
+        // Explicit --net.
+        assert!(rec_with_image("alpine", true, vec![])
+            .validate_image_fetchable()
+            .is_ok());
+        // A published port implicitly enables networking, which is why an
+        // otherwise-identical `-p` machine already started fine.
+        assert!(rec_with_image("alpine", false, vec![(8080, 80)])
+            .validate_image_fetchable()
+            .is_ok());
+        // An egress policy also forces a network backend.
+        let mut cidr = rec_with_image("alpine", false, vec![]);
+        cidr.allowed_cidrs = Some(vec!["10.0.0.0/8".to_string()]);
+        assert!(cidr.validate_image_fetchable().is_ok());
+        let mut dns = rec_with_image("alpine", false, vec![]);
+        dns.dns_filter_hosts = Some(vec!["example.com".to_string()]);
+        assert!(dns.validate_image_fetchable().is_ok());
+    }
+
+    // These resolve from bytes the host already has, so they are legitimately
+    // network-free and must NOT be caught by the new check.
+    #[test]
+    fn locally_sourced_images_stay_allowed_without_network() {
+        for local in [
+            // As the user typed them.
+            "-",
+            "./img.tar",
+            "/tmp/img.tar.gz",
+            "img.tgz",
+            // As they are PERSISTED after `resolve` rewrites them. These carry no
+            // path prefix or archive suffix, so `classify` calls them registry
+            // refs; missing this rejects offline local-image machines outright —
+            // the exact workflow the rejection message recommends.
+            "local:9f2b1c",
+            "local-dir:/srv/rootfs",
+        ] {
+            assert!(
+                rec_with_image(local, false, vec![])
+                    .validate_image_fetchable()
+                    .is_ok(),
+                "{local} needs no registry and must be allowed with no network"
+            );
+        }
+    }
+
+    #[test]
+    fn a_machine_with_no_image_is_unaffected() {
+        // Bare VMs (and `.smolmachine` artifacts, whose layers are extracted on
+        // the host at create) carry no pullable image reference.
+        assert!(
+            VmRecord::new("m".to_string(), 1, 512, vec![], vec![], false)
+                .validate_image_fetchable()
+                .is_ok()
+        );
+    }
 
     #[test]
     fn test_vm_record_serialization() {
