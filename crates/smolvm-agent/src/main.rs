@@ -84,6 +84,7 @@ mod dns_proxy;
 mod docker_bridge;
 mod forkpoint;
 mod network;
+mod nsfile;
 mod oci;
 mod paths;
 mod pod;
@@ -201,6 +202,12 @@ fn maybe_set_clock_from_host() {
 fn main() {
     if forkpoint::helper_requested() {
         std::process::exit(forkpoint::run_helper());
+    }
+
+    // Namespace file helper. Dispatched here, before the async runtime starts,
+    // because `setns(CLONE_NEWMNT)` is refused for a multithreaded process.
+    if nsfile::helper_requested() {
+        std::process::exit(nsfile::run_helper());
     }
 
     // Quick --version check (used by init script to detect rootfs updates)
@@ -2576,8 +2583,27 @@ fn install_file_atomic(path: &str, data: &[u8], mode: Option<u32>) -> AgentRespo
     AgentResponse::Ok { data: None }
 }
 
-/// Write a file inside the VM filesystem (single-shot path).
+/// Write a file where the workload will see it (single-shot path).
+///
+/// Routes into the workload container when one is running, so an upload lands in
+/// the filesystem the workload actually reads. Writing in the agent's own
+/// namespace puts the file in the overlay's *upper* layer, beneath a live
+/// overlayfs, where the merged view never picks it up — the upload reported
+/// success and `exec` could not see the file (BUG-240).
+///
+/// With no running workload the local write is correct and is kept: overlayfs
+/// reads `upper` at mount time, so seeding it before the container starts is
+/// exactly how the file becomes visible once it does.
 fn handle_file_write(path: &str, data: &[u8], mode: Option<u32>) -> AgentResponse {
+    if let Some(result) = nsfile::write_to_container(path, data, mode) {
+        return match result {
+            Ok(()) => AgentResponse::Ok { data: None },
+            Err(e) => AgentResponse::error(
+                format!("failed to write {} in the workload container: {}", path, e),
+                error_codes::FILE_IO_FAILED,
+            ),
+        };
+    }
     install_file_atomic(path, data, mode)
 }
 
@@ -2871,6 +2897,35 @@ fn handle_streaming_file_read(
     stream: &mut impl ReadWrite,
     path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Read from the workload container when one is running, mirroring the write
+    // side. Reading here — in the agent's namespace — sees the overlay's upper
+    // layer, so a file the container itself created came back 404 (BUG-240).
+    // Both directions must move together: fixing only writes would break the
+    // upload-then-download round trip, which is self-consistent today.
+    if let Some(opened) = nsfile::open_in_container(path) {
+        match opened {
+            Ok(mut cf) => {
+                info!(path = %path, size = cf.size, "streaming file read (container)");
+                return send_data_chunks(
+                    stream,
+                    &mut cf.reader,
+                    smolvm_protocol::LAYER_CHUNK_SIZE,
+                    "failed to read file",
+                    error_codes::FILE_IO_FAILED,
+                );
+            }
+            Err(e) => {
+                send_response(
+                    stream,
+                    &AgentResponse::error(
+                        format!("failed to read {} in the workload container: {}", path, e),
+                        error_codes::FILE_IO_FAILED,
+                    ),
+                )?;
+                return Ok(());
+            }
+        }
+    }
     let resolved = match resolve_guest_io_path(path, FilePathAccess::Read) {
         Ok(p) => p,
         Err(resp) => {
@@ -3520,43 +3575,49 @@ fn handle_run_detached(
 /// so callers fall through to starting a fresh container.
 #[cfg(target_os = "linux")]
 pub fn is_container_running(container_id: &str) -> bool {
-    let output = match crun::CrunCommand::state(container_id)
+    crun_container_pid(container_id).is_some()
+}
+
+/// Init PID of a container that is registered, `running`, and whose process is
+/// genuinely alive — `None` otherwise.
+///
+/// Carries the liveness check [`is_container_running`] is now defined in terms
+/// of, and hands the pid back so a caller that must reach into the container
+/// (e.g. [`crate::nsfile`], entering its mount namespace) does not have to ask
+/// crun a second time and race the answer.
+#[cfg(target_os = "linux")]
+pub fn crun_container_pid(container_id: &str) -> Option<u32> {
+    let output = crun::CrunCommand::state(container_id)
         .capture_output()
         .output()
-    {
-        Ok(o) => o,
-        Err(_) => return false,
-    };
+        .ok()?;
     if !output.status.success() {
-        return false;
+        return None;
     }
-    let stdout = match std::str::from_utf8(&output.stdout) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    let v: serde_json::Value = match serde_json::from_str(stdout) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
+    let v: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
 
-    let is_running = v
-        .get("status")
-        .and_then(|s| s.as_str())
-        .map(|s| s == "running")
-        .unwrap_or(false);
-    if !is_running {
-        return false;
+    if v.get("status").and_then(|s| s.as_str()) != Some("running") {
+        return None;
     }
 
     let pid = v.get("pid").and_then(|p| p.as_i64()).unwrap_or(0);
     if pid <= 0 {
-        return false;
+        return None;
     }
 
     // kill(pid, 0) checks process existence without sending a signal.
     // Handles stale "running" state left after SIGKILL of a container.
     // SAFETY: signal 0 never terminates a process; checks existence only.
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+        return None;
+    }
+    u32::try_from(pid).ok()
+}
+
+/// Non-Linux stub.
+#[cfg(not(target_os = "linux"))]
+pub fn crun_container_pid(_container_id: &str) -> Option<u32> {
+    None
 }
 
 /// Non-Linux stub.
