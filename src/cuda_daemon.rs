@@ -4127,7 +4127,7 @@ fn cached_module_blob(token: u64) -> Option<Arc<CachedModuleBlob>> {
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn prepare_module_blob(
     token: u64,
     revision: u64,
@@ -4140,11 +4140,43 @@ fn prepare_module_blob(
     std::fs::create_dir_all(&directory)?;
     let mut writable = tempfile::tempfile_in(&directory)?;
     writable.write_all(bytes)?;
+    finish_module_blob(token, revision, writable, bytes.len() as u64)
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_streamed_module_blob(
+    token: u64,
+    revision: u64,
+    snapshot: &CapturedModuleHandoff,
+    oplogs: &CapturedGraphOplogs,
+) -> io::Result<Arc<CachedModuleBlob>> {
+    if let Some(blob) = cached_module_blob(token) {
+        return Ok(blob);
+    }
+    let directory = std::env::temp_dir().join("smolvm");
+    std::fs::create_dir_all(&directory)?;
+    let mut writable = tempfile::tempfile_in(&directory)?;
+    let bytes = {
+        let mut output = std::io::BufWriter::with_capacity(1 << 20, &mut writable);
+        let bytes = write_module_handoff(&mut output, snapshot, oplogs)?;
+        output.flush()?;
+        bytes
+    };
+    finish_module_blob(token, revision, writable, bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn finish_module_blob(
+    token: u64,
+    revision: u64,
+    writable: std::fs::File,
+    bytes: u64,
+) -> io::Result<Arc<CachedModuleBlob>> {
     let read_path = format!("/proc/self/fd/{}", writable.as_raw_fd());
     let file = std::fs::OpenOptions::new().read(true).open(read_path)?;
     let blob = Arc::new(CachedModuleBlob {
         file,
-        bytes: bytes.len() as u64,
+        bytes,
         revision,
     });
     drop(writable);
@@ -4203,10 +4235,10 @@ fn module_blob_for_token(token: u64) -> io::Result<Option<Arc<CachedModuleBlob>>
         return Ok(Some(blob));
     }
     for _ in 0..3 {
-        let Some((revision, bytes)) = serialize_module_handoff(token)? else {
+        let Some((revision, snapshot, oplogs)) = capture_module_handoff(token)? else {
             return Ok(None);
         };
-        let blob = prepare_module_blob(token, revision, &bytes)?;
+        let blob = prepare_streamed_module_blob(token, revision, &snapshot, &oplogs)?;
         if smolvm_cuda::host::module_handoff_revision(token) == Some(revision) {
             tracing::info!(
                 token,
@@ -4359,7 +4391,22 @@ fn module_handoff_len(value: usize) -> io::Result<[u8; 4]> {
 }
 
 #[cfg(unix)]
-fn serialize_module_handoff(token: u64) -> io::Result<Option<(u64, Vec<u8>)>> {
+type CapturedModuleHandoff = (
+    Vec<(u64, Arc<[u8]>)>,
+    Vec<smolvm_cuda::host::FuncMeta>,
+    Vec<(u64, u32)>,
+    Vec<(u64, u32)>,
+    Vec<(u64, u64, smolvm_cuda::host::GraphSer)>,
+    Vec<(u8, u16, u64, Vec<u8>)>,
+);
+
+#[cfg(unix)]
+type CapturedGraphOplogs = Vec<(u64, u64, Vec<Vec<u8>>)>;
+
+#[cfg(unix)]
+fn capture_module_handoff(
+    token: u64,
+) -> io::Result<Option<(u64, CapturedModuleHandoff, CapturedGraphOplogs)>> {
     let (revision, snapshot, oplogs) = {
         let mut attempts = 0;
         loop {
@@ -4392,90 +4439,124 @@ fn serialize_module_handoff(token: u64) -> io::Result<Option<(u64, Vec<u8>)>> {
         lib_handles = lib_handles.len(),
         "M3a: gathered golden modules/functions/streams/events"
     );
-    let mut blob = Vec::new();
-    blob.extend_from_slice(&module_handoff_len(modules.len())?);
-    for (handle, image) in &modules {
-        blob.extend_from_slice(&handle.to_le_bytes());
-        blob.extend_from_slice(&module_handoff_len(image.len())?);
-        blob.extend_from_slice(image);
+    Ok(Some((
+        revision,
+        (modules, funcs, streams, events, graphs, lib_handles),
+        oplogs,
+    )))
+}
+
+#[cfg(unix)]
+fn write_module_handoff(
+    mut output: impl Write,
+    snapshot: &CapturedModuleHandoff,
+    oplogs: &CapturedGraphOplogs,
+) -> io::Result<u64> {
+    let (modules, funcs, streams, events, graphs, lib_handles) = snapshot;
+    let mut written = 0_u64;
+    macro_rules! put {
+        ($bytes:expr) => {{
+            let bytes: &[u8] = $bytes;
+            written = written
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| io::Error::other("CUDA module handoff size overflow"))?;
+            if written > MAX_MODULE_HANDOFF_BLOB_BYTES {
+                return Err(io::Error::other("CUDA module handoff exceeds cache limit"));
+            }
+            output.write_all(bytes)?;
+        }};
     }
-    blob.extend_from_slice(&module_handoff_len(funcs.len())?);
-    for (handle, module, name, attrs) in &funcs {
-        blob.extend_from_slice(&handle.to_le_bytes());
-        blob.extend_from_slice(&module.to_le_bytes());
-        blob.extend_from_slice(&module_handoff_len(name.len())?);
-        blob.extend_from_slice(name.as_bytes());
+
+    put!(&module_handoff_len(modules.len())?);
+    for (handle, image) in modules {
+        put!(&handle.to_le_bytes());
+        put!(&module_handoff_len(image.len())?);
+        put!(image);
+    }
+    put!(&module_handoff_len(funcs.len())?);
+    for (handle, module, name, attrs) in funcs {
+        put!(&handle.to_le_bytes());
+        put!(&module.to_le_bytes());
+        put!(&module_handoff_len(name.len())?);
+        put!(name.as_bytes());
         // Per-function attribute replays ([i32 attr][i32 value] each) —
         // e.g. FlashAttention's MaxDynamicSharedMemorySize opt-in.
-        blob.extend_from_slice(&module_handoff_len(attrs.len())?);
+        put!(&module_handoff_len(attrs.len())?);
         for &(attribute, value) in attrs {
-            blob.extend_from_slice(&attribute.to_le_bytes());
-            blob.extend_from_slice(&value.to_le_bytes());
+            put!(&attribute.to_le_bytes());
+            put!(&value.to_le_bytes());
         }
     }
     // Streams + events: [u64 golden handle][u32 create flags] each.
-    blob.extend_from_slice(&module_handoff_len(streams.len())?);
-    for (handle, flags) in &streams {
-        blob.extend_from_slice(&handle.to_le_bytes());
-        blob.extend_from_slice(&flags.to_le_bytes());
+    put!(&module_handoff_len(streams.len())?);
+    for (handle, flags) in streams {
+        put!(&handle.to_le_bytes());
+        put!(&flags.to_le_bytes());
     }
-    blob.extend_from_slice(&module_handoff_len(events.len())?);
-    for (handle, flags) in &events {
-        blob.extend_from_slice(&handle.to_le_bytes());
-        blob.extend_from_slice(&flags.to_le_bytes());
+    put!(&module_handoff_len(events.len())?);
+    for (handle, flags) in events {
+        put!(&handle.to_le_bytes());
+        put!(&flags.to_le_bytes());
     }
     // M3b: captured graphs. Per graph: [u64 graph_vh][u64 exec_vh]
     //   [u32 nnodes]([u64 func][u32*3 grid][u32*3 block][u32 shmem]
     //                [u32 nparams]([u32 len][bytes])* )*
     //   [u32 nedges]([u32 from][u32 to])*
-    blob.extend_from_slice(&module_handoff_len(graphs.len())?);
-    for (graph_vh, exec_vh, graph) in &graphs {
-        blob.extend_from_slice(&graph_vh.to_le_bytes());
-        blob.extend_from_slice(&exec_vh.to_le_bytes());
-        blob.extend_from_slice(&module_handoff_len(graph.nodes.len())?);
+    put!(&module_handoff_len(graphs.len())?);
+    for (graph_vh, exec_vh, graph) in graphs {
+        put!(&graph_vh.to_le_bytes());
+        put!(&exec_vh.to_le_bytes());
+        put!(&module_handoff_len(graph.nodes.len())?);
         for node in &graph.nodes {
-            blob.extend_from_slice(&node.func.to_le_bytes());
+            put!(&node.func.to_le_bytes());
             for value in node.grid.iter().chain(node.block.iter()) {
-                blob.extend_from_slice(&value.to_le_bytes());
+                put!(&value.to_le_bytes());
             }
-            blob.extend_from_slice(&node.shared_mem.to_le_bytes());
-            blob.extend_from_slice(&module_handoff_len(node.params.len())?);
+            put!(&node.shared_mem.to_le_bytes());
+            put!(&module_handoff_len(node.params.len())?);
             for param in &node.params {
-                blob.extend_from_slice(&module_handoff_len(param.len())?);
-                blob.extend_from_slice(param);
+                put!(&module_handoff_len(param.len())?);
+                put!(param);
             }
         }
-        blob.extend_from_slice(&module_handoff_len(graph.edges.len())?);
+        put!(&module_handoff_len(graph.edges.len())?);
         for &(from, to) in &graph.edges {
-            blob.extend_from_slice(&from.to_le_bytes());
-            blob.extend_from_slice(&to.to_le_bytes());
+            put!(&from.to_le_bytes());
+            put!(&to.to_le_bytes());
         }
     }
     // Library-handle creates for the worker to replay:
     //   [u32 n]([u8 lib][u16 func][u64 handle][u32 len][args])*
-    blob.extend_from_slice(&module_handoff_len(lib_handles.len())?);
-    for (library, function, handle, args) in &lib_handles {
-        blob.push(*library);
-        blob.extend_from_slice(&function.to_le_bytes());
-        blob.extend_from_slice(&handle.to_le_bytes());
-        blob.extend_from_slice(&module_handoff_len(args.len())?);
-        blob.extend_from_slice(args);
+    put!(&module_handoff_len(lib_handles.len())?);
+    for (library, function, handle, args) in lib_handles {
+        put!(std::slice::from_ref(library));
+        put!(&function.to_le_bytes());
+        put!(&handle.to_le_bytes());
+        put!(&module_handoff_len(args.len())?);
+        put!(args);
     }
     // P3b: capture-replay op-logs. Per graph:
     //   [u64 graph_vh][u64 exec_vh][u32 nops]([u32 len][op bytes])*
-    blob.extend_from_slice(&module_handoff_len(oplogs.len())?);
-    for (graph_vh, exec_vh, ops) in &oplogs {
-        blob.extend_from_slice(&graph_vh.to_le_bytes());
-        blob.extend_from_slice(&exec_vh.to_le_bytes());
-        blob.extend_from_slice(&module_handoff_len(ops.len())?);
+    put!(&module_handoff_len(oplogs.len())?);
+    for (graph_vh, exec_vh, ops) in oplogs {
+        put!(&graph_vh.to_le_bytes());
+        put!(&exec_vh.to_le_bytes());
+        put!(&module_handoff_len(ops.len())?);
         for op in ops {
-            blob.extend_from_slice(&module_handoff_len(op.len())?);
-            blob.extend_from_slice(op);
+            put!(&module_handoff_len(op.len())?);
+            put!(op);
         }
     }
-    if blob.len() as u64 > MAX_MODULE_HANDOFF_BLOB_BYTES {
-        return Err(io::Error::other("CUDA module handoff exceeds cache limit"));
-    }
+    Ok(written)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn serialize_module_handoff(token: u64) -> io::Result<Option<(u64, Vec<u8>)>> {
+    let Some((revision, snapshot, oplogs)) = capture_module_handoff(token)? else {
+        return Ok(None);
+    };
+    let mut blob = Vec::new();
+    write_module_handoff(&mut blob, &snapshot, &oplogs)?;
     Ok(Some((revision, blob)))
 }
 
@@ -5148,11 +5229,12 @@ mod mps_tests {
         encode_attach_procmem, fork_snapshot_enabled, golden_eviction_enabled, host_snapshot_fits,
         host_snapshot_reconstructable, lift_owned_fds, live_host_snapshot_count,
         map_module_blob_fd, mps_enabled, ordinary_regions_are_reserved, prepare_module_blob,
-        range_is_reserved, read_host_snapshot, reconstruct_golden_modules, recv_fd,
-        redeem_tensor_bundle_from_stream, seal_host_snapshot, select_golden_owner, send_fd,
-        send_tensor_bundle_to_parent, serve_tensor_bundle_consumer,
+        prepare_streamed_module_blob, range_is_reserved, read_host_snapshot,
+        reconstruct_golden_modules, recv_fd, redeem_tensor_bundle_from_stream, seal_host_snapshot,
+        select_golden_owner, send_fd, send_tensor_bundle_to_parent, serve_tensor_bundle_consumer,
         spawn_clone_attach_listener_with_timeout, spawn_tensor_bundle_receiver,
-        unique_live_clone_worker, validate_tensor_bundle_metadata, TENSOR_CONSUME_MAGIC,
+        unique_live_clone_worker, validate_tensor_bundle_metadata, write_module_handoff,
+        TENSOR_CONSUME_MAGIC,
     };
     use std::collections::HashMap;
     use std::io::{self, Write};
@@ -5264,6 +5346,112 @@ mod mps_tests {
         let token = u64::MAX - 91;
         let blob = prepare_module_blob(token, 0, b"short-lived module state").unwrap();
         assert_eq!(blob.bytes, 24);
+        assert!(super::cached_module_blob(token).is_none());
+    }
+
+    #[test]
+    fn streamed_module_handoff_preserves_the_wire_format() {
+        use smolvm_cuda::host::{GraphKernelNode, GraphSer};
+
+        let snapshot = (
+            vec![(0x10, Arc::<[u8]>::from(&b"module-image"[..]))],
+            vec![(0x20, 0x10, "kernel".to_owned(), vec![(8, 49_152), (-1, -2)])],
+            vec![(0x30, 1)],
+            vec![(0x40, 2)],
+            vec![(
+                0x50,
+                0x51,
+                GraphSer {
+                    nodes: vec![GraphKernelNode {
+                        func: 0x20,
+                        grid: [2, 3, 4],
+                        block: [5, 6, 7],
+                        shared_mem: 8,
+                        params: vec![vec![1, 2], vec![3, 4, 5]],
+                    }],
+                    edges: vec![(0, 0)],
+                },
+            )],
+            vec![(3, 0x1234, 0x60, vec![9, 8])],
+        );
+        let oplogs = vec![(0x50, 0x51, vec![vec![7, 6, 5]])];
+
+        let mut actual = Vec::new();
+        let written = write_module_handoff(&mut actual, &snapshot, &oplogs).unwrap();
+
+        fn u16_field(output: &mut Vec<u8>, value: u16) {
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        fn u32_field(output: &mut Vec<u8>, value: u32) {
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        fn i32_field(output: &mut Vec<u8>, value: i32) {
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        fn u64_field(output: &mut Vec<u8>, value: u64) {
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        fn bytes_field(output: &mut Vec<u8>, value: &[u8]) {
+            u32_field(output, value.len() as u32);
+            output.extend_from_slice(value);
+        }
+
+        let mut expected = Vec::new();
+        u32_field(&mut expected, 1); // modules
+        u64_field(&mut expected, 0x10);
+        bytes_field(&mut expected, b"module-image");
+        u32_field(&mut expected, 1); // functions
+        u64_field(&mut expected, 0x20);
+        u64_field(&mut expected, 0x10);
+        bytes_field(&mut expected, b"kernel");
+        u32_field(&mut expected, 2); // attributes
+        i32_field(&mut expected, 8);
+        i32_field(&mut expected, 49_152);
+        i32_field(&mut expected, -1);
+        i32_field(&mut expected, -2);
+        u32_field(&mut expected, 1); // streams
+        u64_field(&mut expected, 0x30);
+        u32_field(&mut expected, 1);
+        u32_field(&mut expected, 1); // events
+        u64_field(&mut expected, 0x40);
+        u32_field(&mut expected, 2);
+        u32_field(&mut expected, 1); // graphs
+        u64_field(&mut expected, 0x50);
+        u64_field(&mut expected, 0x51);
+        u32_field(&mut expected, 1); // nodes
+        u64_field(&mut expected, 0x20);
+        for value in [2, 3, 4, 5, 6, 7, 8] {
+            u32_field(&mut expected, value);
+        }
+        u32_field(&mut expected, 2); // parameters
+        bytes_field(&mut expected, &[1, 2]);
+        bytes_field(&mut expected, &[3, 4, 5]);
+        u32_field(&mut expected, 1); // edges
+        u32_field(&mut expected, 0);
+        u32_field(&mut expected, 0);
+        u32_field(&mut expected, 1); // library handles
+        expected.push(3);
+        u16_field(&mut expected, 0x1234);
+        u64_field(&mut expected, 0x60);
+        bytes_field(&mut expected, &[9, 8]);
+        u32_field(&mut expected, 1); // op-log graphs
+        u64_field(&mut expected, 0x50);
+        u64_field(&mut expected, 0x51);
+        u32_field(&mut expected, 1);
+        bytes_field(&mut expected, &[7, 6, 5]);
+
+        assert_eq!(written, expected.len() as u64);
+        assert_eq!(actual, expected);
+
+        let token = u64::MAX - 92;
+        let blob = prepare_streamed_module_blob(token, 0, &snapshot, &oplogs).unwrap();
+        assert_eq!(blob.bytes, expected.len() as u64);
+        assert_eq!(blob.file.metadata().unwrap().len(), expected.len() as u64);
+        let mapped = unsafe {
+            smolvm_cuda::host::ModuleHandoffBytes::map_read_only(&blob.file, expected.len())
+        }
+        .unwrap();
+        assert_eq!(mapped.as_slice(), expected);
         assert!(super::cached_module_blob(token).is_none());
     }
 

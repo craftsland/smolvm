@@ -898,8 +898,10 @@ struct GoldenLayout {
     /// LayerNorm activations packed into partial chunks). A kernel write
     /// changes content → CRC mismatch → the chunk degrades to private.
     maps: HashMap<u64, ChunkCover>,
-    /// M3a: golden module handle → module image bytes (to reload in the worker).
-    modules: HashMap<u64, Vec<u8>>,
+    /// M3a: golden module handle → immutable module image (to reload in the
+    /// worker). Shared with the process-wide content cache and handoff snapshots
+    /// so preparing a clone never deep-copies multi-gigabyte module state.
+    modules: HashMap<u64, std::sync::Arc<[u8]>>,
     /// M3a: golden function handle → (module handle, name) — the worker re-resolves
     /// it in its reloaded module and remaps the inherited raw CUfunction handle.
     functions: HashMap<u64, (u64, String)>,
@@ -1236,7 +1238,7 @@ pub fn layout_set_share_verdict(token: u64, va: u64, ok: bool) {
 pub fn module_handoff_snapshot(
     token: u64,
 ) -> Option<(
-    Vec<(u64, Vec<u8>)>,
+    Vec<(u64, std::sync::Arc<[u8]>)>,
     Vec<FuncMeta>,
     Vec<(u64, u32)>,
     Vec<(u64, u32)>,
@@ -2158,10 +2160,9 @@ struct ModuleCacheKey {
     tail: [u8; 8],
 }
 
-fn module_cache() -> &'static std::sync::Mutex<HashMap<ModuleCacheKey, std::sync::Arc<Vec<u8>>>> {
-    static C: std::sync::OnceLock<
-        std::sync::Mutex<HashMap<ModuleCacheKey, std::sync::Arc<Vec<u8>>>>,
-    > = std::sync::OnceLock::new();
+fn module_cache() -> &'static std::sync::Mutex<HashMap<ModuleCacheKey, std::sync::Arc<[u8]>>> {
+    static C: std::sync::OnceLock<std::sync::Mutex<HashMap<ModuleCacheKey, std::sync::Arc<[u8]>>>> =
+        std::sync::OnceLock::new();
     C.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
@@ -2177,7 +2178,7 @@ fn module_cache_budget() -> u64 {
     })
 }
 
-fn module_cache_put(image: &[u8]) {
+fn module_cache_put(image: std::sync::Arc<[u8]>) {
     if image.len() < 64 {
         return;
     }
@@ -2187,16 +2188,15 @@ fn module_cache_put(image: &[u8]) {
         return; // over budget: first-come wins; the big early fatbins matter most
     }
     let key = ModuleCacheKey {
-        fnv: fnv64(image),
+        fnv: fnv64(&image),
         len: image.len() as u64,
         head: image[..8].try_into().unwrap(),
         tail: image[image.len() - 8..].try_into().unwrap(),
     };
-    c.entry(key)
-        .or_insert_with(|| std::sync::Arc::new(image.to_vec()));
+    c.entry(key).or_insert(image);
 }
 
-fn module_cache_get(key: &ModuleCacheKey) -> Option<std::sync::Arc<Vec<u8>>> {
+fn module_cache_get(key: &ModuleCacheKey) -> Option<std::sync::Arc<[u8]>> {
     module_cache().lock().unwrap().get(key).cloned()
 }
 
@@ -4047,14 +4047,15 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             let raw = b.module_load_data(&image)?;
             worker_module_register(raw);
             sess.owned_modules.insert(raw);
+            let image: std::sync::Arc<[u8]> = image.into();
             // Feed the process-wide image cache so later replicas can load by
             // hash without re-shipping the bytes (LibCall 6/1).
-            module_cache_put(&image);
+            module_cache_put(image.clone());
             // M3a: keep the image so a Path-3 clone worker can reload the module in
             // its own context and remap this inherited handle.
             if path3_enabled() {
                 let mut layout = sess.golden_layout.lock().unwrap();
-                layout.modules.insert(raw, image.clone());
+                layout.modules.insert(raw, image);
                 layout.handoff_revision = layout.handoff_revision.wrapping_add(1);
             }
             Ok(Response::Handle(raw))
@@ -4648,7 +4649,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                     sess.owned_modules.insert(raw);
                     if path3_enabled() {
                         let mut layout = sess.golden_layout.lock().unwrap();
-                        layout.modules.insert(raw, image.to_vec());
+                        layout.modules.insert(raw, image.clone());
                         layout.handoff_revision = layout.handoff_revision.wrapping_add(1);
                     }
                     return Ok(Response::LibResult(0, raw.to_le_bytes().to_vec()));
@@ -6116,9 +6117,10 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         let layout: Arc<LayoutCell> = Arc::new(Mutex::new(GoldenLayout::default()));
+        let image: Arc<[u8]> = vec![1, 2, 3, 4].into();
         {
             let mut state = layout.lock().unwrap();
-            state.modules.insert(0xCAFE, vec![1, 2, 3, 4]);
+            state.modules.insert(0xCAFE, image.clone());
             state.handoff_revision = 7;
         }
         let primary = 0xA3A3_0000_0000_0001;
@@ -6135,7 +6137,10 @@ mod tests {
 
         for token in [primary, alias] {
             let (modules, ..) = module_handoff_snapshot(token).unwrap();
-            assert_eq!(modules, vec![(0xCAFE, vec![1, 2, 3, 4])]);
+            assert_eq!(modules.len(), 1);
+            assert_eq!(modules[0].0, 0xCAFE);
+            assert_eq!(modules[0].1.as_ref(), &[1, 2, 3, 4]);
+            assert!(Arc::ptr_eq(&modules[0].1, &image));
             assert!(layout_handoff_snapshot(token).unwrap().1.is_empty());
         }
         assert!(layout_handoff_same_process(primary, alias));
@@ -6171,7 +6176,7 @@ mod tests {
             .lock()
             .unwrap()
             .modules
-            .insert(0xBEEF, vec![4, 3, 2, 1]);
+            .insert(0xBEEF, vec![4, 3, 2, 1].into());
         let token = 0xA5A5_0000_0000_0001;
         layout_handoff_register(&layout, token);
 
@@ -6183,7 +6188,9 @@ mod tests {
             vec![(0x4000, 0x2000)]
         );
         let (modules, ..) = module_handoff_snapshot(token).unwrap();
-        assert_eq!(modules, vec![(0xBEEF, vec![4, 3, 2, 1])]);
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].0, 0xBEEF);
+        assert_eq!(modules[0].1.as_ref(), &[4, 3, 2, 1]);
         assert!(release_metadata_only_layout(token));
         assert!(layout_handoff_snapshot(token).is_none());
     }
