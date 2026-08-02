@@ -42,7 +42,15 @@ pub fn set_guest_ram_provider(f: GuestRamProvider) {
 ///
 /// The caller passes the same path to `LaunchConfig::cuda_socket`. Returns once
 /// the listener is bound; serving continues until the process exits.
-pub fn start(socket_path: &Path, is_fork_clone: bool) -> std::io::Result<()> {
+pub fn start(socket_path: &Path) -> std::io::Result<()> {
+    start_with_clone_mode(socket_path, false)
+}
+
+/// Start the CUDA host server and identify whether it serves a restored clone.
+///
+/// Restored clones use their stable proxy identity to attach new CUDA channels
+/// to the daemon-side worker that owns their reconstructed device state.
+pub fn start_with_clone_mode(socket_path: &Path, is_fork_clone: bool) -> std::io::Result<()> {
     // Clean up any stale socket from a previous run.
     let _ = std::fs::remove_file(socket_path);
 

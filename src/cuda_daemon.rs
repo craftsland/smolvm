@@ -201,7 +201,7 @@ fn recv_fd_header(stream: &mut UnixStream) -> io::Result<Option<(OwnedFd, [u8; 1
             || msg.msg_flags & libc::MSG_CTRUNC != 0
             || (*cmsg).cmsg_level != libc::SOL_SOCKET
             || (*cmsg).cmsg_type != libc::SCM_RIGHTS
-            || (*cmsg).cmsg_len != libc::CMSG_LEN(4) as usize
+            || (*cmsg).cmsg_len as usize != libc::CMSG_LEN(4) as usize
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

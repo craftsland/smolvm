@@ -564,7 +564,10 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
             .parent()
             .unwrap_or_else(|| std::path::Path::new("/tmp"))
             .join("cuda.sock");
-        match smolvm::cuda_host::start(&path, std::env::var_os("SMOLVM_SNAPSHOT_DIR").is_some()) {
+        match smolvm::cuda_host::start_with_clone_mode(
+            &path,
+            std::env::var_os("SMOLVM_SNAPSHOT_DIR").is_some(),
+        ) {
             Ok(()) => {
                 tracing::info!(path = %path.display(), "CUDA host server started");
                 Some(path)

@@ -652,7 +652,7 @@ impl PackRunCmd {
         // serving well before the guest workload dials in.
         #[cfg(unix)]
         if cuda_enabled {
-            match smolvm::cuda_host::start(&cuda_sock, false) {
+            match smolvm::cuda_host::start(&cuda_sock) {
                 Ok(()) => {
                     if self.debug {
                         eprintln!("debug: CUDA host serving {}", cuda_sock.display());
