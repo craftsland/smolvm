@@ -825,6 +825,17 @@ impl SmolvmDb {
             if pool.deleting {
                 return Ok(0);
             }
+            let activating: u32 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM fork_pool_slots
+                     WHERE pool_name = ?1 AND state = 'activating'",
+                    params![pool_name],
+                    |row| row.get(0),
+                )
+                .db_err("count activating fork pool slots")?;
+            if activating > 0 {
+                return Ok(0);
+            }
             let available: u32 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM fork_pool_slots
@@ -890,6 +901,19 @@ impl SmolvmDb {
             if pool.deleting {
                 tx.commit()
                     .db_err("commit deleting fork pool reservation")?;
+                return Ok(false);
+            }
+            let activating: u32 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM fork_pool_slots
+                     WHERE pool_name = ?1 AND state = 'activating'",
+                    params![pool_name],
+                    |row| row.get(0),
+                )
+                .db_err("count activating fork pool slots")?;
+            if activating > 0 {
+                tx.commit()
+                    .db_err("commit deferred fork pool reservation")?;
                 return Ok(false);
             }
             let available: u32 = tx
@@ -2171,6 +2195,40 @@ mod tests {
             })
             .unwrap();
         assert_eq!(second_request, ClaimForkPoolSlot::NoReadySlot);
+    }
+
+    #[test]
+    fn fork_pool_refill_waits_for_guest_activation() {
+        let (_dir, db) = temp_db();
+        db.insert_fork_pool_if_not_exists(&test_pool("rollouts", 2))
+            .unwrap();
+        insert_ready_pool_slot(&db, "rollouts", "slot-1");
+        insert_ready_pool_slot(&db, "rollouts", "slot-2");
+
+        let claim = db
+            .claim_fork_pool_slot(ForkPoolSlotClaim {
+                pool_name: "rollouts",
+                lease_id: "lease-a",
+                idempotency_key: "request-a",
+                assignment: &[],
+                payload_sha256: None,
+                require_private_workspace: false,
+                admission_limit: None,
+                ttl_secs: 60,
+                now: 200,
+            })
+            .unwrap();
+        assert!(matches!(claim, ClaimForkPoolSlot::Claimed(_)));
+        assert_eq!(db.fork_pool_ready_deficit("rollouts").unwrap(), 0);
+        assert!(!db
+            .reserve_fork_pool_slot("rollouts", "replacement", 201)
+            .unwrap());
+
+        db.mark_fork_lease_active("lease-a", 202).unwrap();
+        assert_eq!(db.fork_pool_ready_deficit("rollouts").unwrap(), 1);
+        assert!(db
+            .reserve_fork_pool_slot("rollouts", "replacement", 203)
+            .unwrap());
     }
 
     #[test]

@@ -626,11 +626,6 @@ pub async fn acquire_lease(
         }
         ClaimForkPoolSlot::Claimed(lease) => lease,
     };
-    // The durable claim removed one ready slot. Start its replacement while
-    // payload staging and guest activation proceed instead of waiting for the
-    // next periodic controller pass.
-    state.notify_pool_reconcile();
-
     // Reflect the durable claim in the in-memory fast path before publishing
     // the guest release marker. The authoritative held bit is already false in
     // SQLite, so a restart cannot resurrect this worker as ready.
@@ -649,6 +644,10 @@ pub async fn acquire_lease(
     .await
     .map_err(|e| ApiError::internal(format!("pool activation task failed: {e}")))?
     .map_err(ApiError::Internal)?;
+    // The durable claim removed one ready slot. Refill it only after payload
+    // staging and guest release complete: starting replacement VMs earlier can
+    // starve the held workers' control channels during a concurrent lease wave.
+    state.notify_pool_reconcile();
     Ok(Json(lease_info(active)))
 }
 
