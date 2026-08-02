@@ -201,9 +201,37 @@ pub fn image_store_enabled() -> bool {
 /// `mknod`/`setxattr`), which is where the node and the `--oci-cache` Linux path
 /// run; on other hosts the caller keeps its existing behavior.
 pub fn ensure_image_blocking(reference: &str, auth: &PullAuth) -> Result<CachedImage> {
+    if !can_extract() {
+        return Err(Error::config(
+            "image-store",
+            format!(
+                "{IMAGE_STORE_ENV} needs root: extracting image layers preserves each file's \
+                 owner and translates OCI whiteouts into device nodes, which require CAP_CHOWN \
+                 and CAP_MKNOD. Run as root (the node's `smolvm serve` already does), or unset \
+                 {IMAGE_STORE_ENV} to keep the default in-guest pull."
+            ),
+        ));
+    }
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| Error::config("image-store: runtime", e.to_string()))?;
     rt.block_on(ImageStore::shared().ensure_image(reference, auth))
+}
+
+/// Whether this process can materialize a store entry.
+///
+/// Extraction preserves the archive's uid/gid and turns `.wh.` markers into
+/// `mknod` character devices, so it needs root. Rather than silently degrade —
+/// which would either corrupt ownership or half-apply deletions — the store
+/// refuses up front and the caller keeps the default in-guest pull.
+#[cfg(unix)]
+fn can_extract() -> bool {
+    // SAFETY: geteuid is always safe and cannot fail.
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[cfg(not(unix))]
+fn can_extract() -> bool {
+    false
 }
 
 /// The cached image config filename inside an entry (sibling of `layers/`).
