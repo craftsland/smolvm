@@ -372,6 +372,12 @@ pub(crate) fn prepare_forks_reusing(
     let reusable = retained.filter(|snapshot| {
         retained_snapshot_is_reusable(&golden_rec, golden_was_paused, &snapshot_root, snapshot)
     });
+    if golden_was_paused && reusable.is_none() {
+        return Err(Error::agent(
+            "fork",
+            format!("golden '{golden}' is already paused; a valid retained checkpoint is required"),
+        ));
+    }
     let (snapshot_dir, snapshot_reused) = if let Some(snapshot) = reusable {
         tracing::info!(
             golden,

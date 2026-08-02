@@ -411,6 +411,12 @@ impl ForkPoolController {
         pool: ForkPoolRecord,
         retained_snapshots: RetainedSnapshotMap,
     ) {
+        // A golden can produce only one RAM checkpoint at a time. Keep the
+        // lifecycle lock through snapshot publication so another pool sharing
+        // this golden reads the proven retained checkpoint instead of issuing
+        // a second FORK command after the first caller has paused the VM.
+        let _golden_guard = state.lifecycle_lock(&pool.golden).lock_owned().await;
+
         // Bound each pool's work so a large cold fill cannot starve expiry and
         // cleanup for every other pool. Reserve the bounded deficit first so all
         // workers in this tick can share one golden checkpoint.
