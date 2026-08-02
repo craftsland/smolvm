@@ -1641,6 +1641,7 @@ async fn boot_prepared_fork_inner(
         // agent and per-clone setup are complete, so another VM can safely
         // boot while this clone finishes rebuilding its isolated GPU state.
         drop(boot_permit.take());
+        #[cfg(unix)]
         if record.cuda
             && cuda_worker_ready_timeout.is_some()
             && std::env::var_os("SMOLVM_CUDA_DAEMON").is_none()
@@ -1662,6 +1663,8 @@ async fn boot_prepared_fork_inner(
                 return Err(format!("CUDA clone worker readiness failed: {error}"));
             }
         }
+        #[cfg(not(unix))]
+        let _ = cuda_worker_ready_timeout;
         if wait_ready && !hold {
             crate::agent::fork::fail_closed_on_rejuvenation(
                 crate::agent::fork::release_forkpoint(&clone_b),
