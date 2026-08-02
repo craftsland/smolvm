@@ -16,7 +16,9 @@ const OBSERVATION_WINDOW: Duration = Duration::from_secs(8);
 const MIN_STABLE_SAMPLES: u32 = 5;
 const PRESSURE_TTL: Duration = Duration::from_secs(30);
 const REPROBE_INTERVAL: Duration = Duration::from_secs(15 * 60);
+#[cfg(any(target_os = "linux", test))]
 const MIN_VRAM_RESERVE_MIB: u64 = 8 * 1024;
+#[cfg(any(target_os = "linux", test))]
 const VRAM_RESERVE_PERCENT: u64 = 10;
 const CPU_SATURATION_PERCENT: f64 = 90.0;
 const MARGINAL_GAIN_PERCENT: f64 = 2.0;
@@ -39,6 +41,7 @@ pub struct GpuSample {
 }
 
 impl GpuSample {
+    #[cfg(any(target_os = "linux", test))]
     fn from_devices(devices: impl IntoIterator<Item = GpuDeviceSample>) -> Option<Self> {
         let mut count = 0_u32;
         let mut total_memory_mib = 0_u64;
@@ -74,6 +77,7 @@ impl GpuSample {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone, Copy)]
 struct GpuDeviceSample {
     utilization_percent: f64,
@@ -82,6 +86,7 @@ struct GpuDeviceSample {
     total_memory_mib: u64,
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn device_reserve_mib(total_memory_mib: u64) -> u64 {
     MIN_VRAM_RESERVE_MIB.max(total_memory_mib.saturating_mul(VRAM_RESERVE_PERCENT) / 100)
 }
