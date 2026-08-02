@@ -3080,6 +3080,7 @@ dependencies = [
  "ruzstd",
  "serde",
  "serde_json",
+ "smolvm-oci-layer",
  "smolvm-protocol",
  "tar",
  "tempfile",
