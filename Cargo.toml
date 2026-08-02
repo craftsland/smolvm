@@ -9,6 +9,7 @@ members = [
     "crates/smolvm-cudart-shim",
     "crates/smolvm-nvml-shim",
     "crates/smolvm-network",
+    "crates/smolvm-oci-layer",
     "crates/smolvm-pack",
     "crates/smolvm-protocol",
     "crates/smolvm-registry",

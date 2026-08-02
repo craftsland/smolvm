@@ -3147,6 +3147,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "smolvm-oci-layer"
+version = "1.7.2"
+dependencies = [
+ "flate2",
+ "libc",
+ "ruzstd",
+ "tar",
+ "tempfile",
+ "tracing",
+ "zstd",
+]
+
+[[package]]
 name = "smolvm-pack"
 version = "1.7.2"
 dependencies = [

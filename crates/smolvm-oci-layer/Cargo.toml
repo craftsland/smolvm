@@ -1,0 +1,31 @@
+[package]
+name = "smolvm-oci-layer"
+version = "1.7.2"
+edition = "2021"
+description = "Pure-Rust OCI image-layer extraction: decompress a layer blob and unpack it into an overlayfs lowerdir, translating OCI whiteouts"
+license = "Apache-2.0"
+repository = "https://github.com/smol-machines/smolvm"
+
+[lib]
+name = "smolvm_oci_layer"
+path = "src/lib.rs"
+
+# Kept intentionally dependency-light and free of any C-linked crate so the musl
+# guest agent can depend on it (the C-backed `zstd` crate can't link static
+# musl — see crates/smolvm-agent/Cargo.toml). Decompression is pure-Rust:
+# gzip via flate2's miniz_oxide backend, zstd via ruzstd.
+[dependencies]
+tar = "0.4"
+flate2 = "1"
+ruzstd = "0.7"
+tracing = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# mknod (whiteout char device) + setxattr (opaque dir) — the overlayfs on-disk
+# representation OCI whiteout markers translate into. Linux-only.
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+# C-backed zstd is fine in tests (host-only, no musl link) for encoding fixtures.
+zstd = "0.13"
