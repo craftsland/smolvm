@@ -54,14 +54,36 @@ pub fn classify_layer_entry(file_name: &str) -> LayerEntry<'_> {
 }
 
 /// Join `rel` under `base`, returning `None` if any component would escape the
-/// base (`..`, an absolute path, or a Windows-style prefix). Mirrors the
-/// containment guard tar extractors use to prevent path-traversal.
+/// base — lexically (`..`, an absolute path, a Windows-style prefix) **or**
+/// through a symlink already on disk.
+///
+/// The symlink check is the load-bearing half. This path feeds the whiteout
+/// branch, which performs *destructive* operations (`remove_file`,
+/// `remove_dir_all`, `mknod`, `setxattr`) as root on the host when filling the
+/// image cache. A purely lexical guard would let a hostile layer ship
+/// `evil -> /` followed by `evil/etc/.wh.passwd` and delete host paths outside
+/// the layer dir: `..` never appears, so the lexical check passes, and the
+/// destructive call lands wherever the symlink points. Refusing to *traverse*
+/// any symlinked component closes that, and matches what `tar::Entry::unpack_in`
+/// already enforces for ordinary entries.
+///
+/// Each component is checked as the path is built, so a symlink planted earlier
+/// in the very same layer is caught before anything is written through it.
 pub fn jailed_join(base: &Path, rel: &Path) -> Option<PathBuf> {
     use std::path::Component;
     let mut out = base.to_path_buf();
     for component in rel.components() {
         match component {
-            Component::Normal(part) => out.push(part),
+            Component::Normal(part) => {
+                out.push(part);
+                // symlink_metadata does NOT follow the final component, so this
+                // sees the link itself rather than its target.
+                if let Ok(md) = std::fs::symlink_metadata(&out) {
+                    if md.file_type().is_symlink() {
+                        return None;
+                    }
+                }
+            }
             Component::CurDir => {}
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
         }
@@ -161,7 +183,11 @@ pub fn decompress_layer_reader<'a>(
     }
     let stream = std::io::Cursor::new(magic[..n].to_vec()).chain(inner);
     if n >= 2 && magic[0] == 0x1f && magic[1] == 0x8b {
-        Ok(Box::new(flate2::read::GzDecoder::new(stream)))
+        // MultiGzDecoder, not GzDecoder: gzip streams may carry several members
+        // concatenated (pigz and some registry re-compressors emit them), and the
+        // single-member decoder stops at the first boundary — silently truncating
+        // the layer so tar then fails mid-entry.
+        Ok(Box::new(flate2::read::MultiGzDecoder::new(stream)))
     } else if n >= 4 && magic[..4] == [0x28, 0xb5, 0x2f, 0xfd] {
         // Pure-Rust zstd decoder — the C `zstd` crate can't link against musl.
         let dec = ruzstd::StreamingDecoder::new(stream)
@@ -326,14 +352,52 @@ mod tests {
     }
 
     #[test]
-    fn jailed_join_blocks_escapes() {
-        let base = Path::new("/tmp/layer");
+    fn jailed_join_blocks_lexical_escapes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
         assert_eq!(
             jailed_join(base, Path::new("etc/hosts")),
-            Some(PathBuf::from("/tmp/layer/etc/hosts"))
+            Some(base.join("etc/hosts"))
         );
         assert_eq!(jailed_join(base, Path::new("../escape")), None);
         assert_eq!(jailed_join(base, Path::new("/abs")), None);
+    }
+
+    /// A hostile layer must not be able to reach outside the layer dir through a
+    /// symlink it planted itself. This is the guard protecting the whiteout
+    /// branch's destructive ops (`remove_dir_all`/`mknod`) when the host fills
+    /// the image cache as root — a lexical-only check would pass `evil/etc/passwd`
+    /// straight through to the symlink target.
+    #[cfg(unix)]
+    #[test]
+    fn jailed_join_refuses_to_traverse_a_planted_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = tmp.path().join("layer");
+        let victim = tmp.path().join("victim");
+        std::fs::create_dir_all(&layer).unwrap();
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("precious"), b"do not delete").unwrap();
+
+        // The layer ships `evil -> <victim>` (tar-rs creates symlinks with
+        // unrestricted targets), then an entry underneath it.
+        std::os::unix::fs::symlink(&victim, layer.join("evil")).unwrap();
+
+        assert_eq!(
+            jailed_join(&layer, Path::new("evil/precious")),
+            None,
+            "must refuse to resolve THROUGH a symlinked component"
+        );
+        assert_eq!(
+            jailed_join(&layer, Path::new("evil")),
+            None,
+            "the symlink itself is not a safe destination either"
+        );
+        // A sibling that never crosses the symlink still resolves.
+        assert_eq!(
+            jailed_join(&layer, Path::new("safe/file")),
+            Some(layer.join("safe/file"))
+        );
+        assert!(victim.join("precious").exists(), "victim untouched");
     }
 
     /// The layer-specific piece is the magic-sniffing decompressor: confirm gzip,
@@ -364,7 +428,26 @@ mod tests {
         };
         let zstd = zstd::stream::encode_all(&tar_bytes[..], 1).unwrap();
 
-        for (label, blob) in [("plain", tar_bytes.clone()), ("gzip", gzip), ("zstd", zstd)] {
+        // Two gzip members concatenated — what pigz/some registries emit. The
+        // single-member decoder would stop after the first and truncate the layer.
+        let gzip_multi = {
+            let mid = tar_bytes.len() / 2;
+            let mut out = Vec::new();
+            for part in [&tar_bytes[..mid], &tar_bytes[mid..]] {
+                let mut e =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                e.write_all(part).unwrap();
+                out.extend_from_slice(&e.finish().unwrap());
+            }
+            out
+        };
+
+        for (label, blob) in [
+            ("plain", tar_bytes.clone()),
+            ("gzip", gzip),
+            ("gzip-multimember", gzip_multi),
+            ("zstd", zstd),
+        ] {
             let mut out = Vec::new();
             decompress_layer_reader(&blob[..])
                 .unwrap_or_else(|e| panic!("{label} decompress init failed: {e}"))
