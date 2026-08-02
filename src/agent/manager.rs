@@ -427,6 +427,21 @@ fn ready_marker_unwritable(_marker: &Path) -> bool {
     false
 }
 
+/// Bind a non-blocking AF_UNIX listener for the readiness doorbell. libkrun
+/// connects to this socket (the `AGENT_READY` port is `listen=false`) the instant
+/// the guest dials it at end-of-init, so `accept()` returning is the readiness
+/// signal. socket2's `Domain::UNIX` works on unix AND Windows (Win10+), unlike
+/// std's unix-only `UnixListener`, so this builds on every host. Returns None on
+/// any error — readiness then falls back to the marker/ping.
+fn bind_ready_listener(path: &Path) -> Option<socket2::Socket> {
+    let _ = std::fs::remove_file(path);
+    let sock = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).ok()?;
+    sock.bind(&socket2::SockAddr::unix(path).ok()?).ok()?;
+    sock.listen(16).ok()?;
+    sock.set_nonblocking(true).ok()?;
+    Some(sock)
+}
+
 /// Path-injectable core of [`prune_orphaned_ready_markers`] (unit-testable).
 fn prune_orphaned_ready_markers_in(rootfs: &Path, vm_cache_root: &Path) {
     let prefix = format!("{}.", AGENT_READY_MARKER);
@@ -2514,6 +2529,13 @@ impl AgentManager {
         }
 
         let ready_marker = self.ready_marker_path();
+        // PRIMARY readiness signal: the doorbell. libkrun connects to this socket
+        // the instant the guest dials AGENT_READY at end-of-init, so `accept()`
+        // returning IS readiness — event-driven, and needing no writable marker
+        // location it works even where the marker can't be written (root-owned
+        // packaged installs). The marker (fast-path file) and the control-channel
+        // ping remain below as fallbacks; readiness is whichever fires first.
+        let ready_doorbell = bind_ready_listener(&self.vsock_socket.with_extension("ready"));
         // Socket probing cadence. The marker is a 1ms stat; a connect+ping is
         // heavier, so pace it — 20ms is what the fork-clone path above already
         // uses, and it costs at most ~20ms of the ~320ms boot.
@@ -2539,7 +2561,19 @@ impl AgentManager {
                 }
             }
 
-            // Ready when the marker is present AND non-empty. The guest writes
+            // Primary: the readiness doorbell. Non-blocking accept polled at the
+            // loop cadence; a connection means the guest reached end-of-init.
+            if let Some(listener) = &ready_doorbell {
+                if listener.accept().is_ok() {
+                    tracing::debug!(
+                        elapsed_ms = start.elapsed().as_millis(),
+                        "agent ready (doorbell)"
+                    );
+                    return Ok(());
+                }
+            }
+
+            // Fallback: ready when the marker is present AND non-empty. The guest writes
             // its uptime (always non-empty) into it. Under SMOLVM_LANDLOCK the
             // confined VMM pre-creates this file empty so Landlock can grant
             // write on just this one file (see internal_boot.rs) — so existence

@@ -1208,6 +1208,21 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             ));
         }
 
+        // Readiness doorbell (listen=false → the guest connects OUT and the host
+        // accepts). A vsock PORT on the existing vsock device, not a new device, so
+        // it costs nothing against the virtio device budget. Best-effort: if it
+        // can't be added the boot still readies via the marker/ping fallbacks.
+        {
+            let ready_path = vsock_socket.with_extension("ready");
+            if let Ok(ready_c) = path_to_cstring(&ready_path) {
+                if krun_add_vsock_port2(ctx, ports::AGENT_READY, ready_c.as_ptr(), false) < 0 {
+                    tracing::warn!(
+                        "readiness-doorbell vsock port failed to add; using marker/ping"
+                    );
+                }
+            }
+        }
+
         // Guest↔host vsock services (SSH agent, DNS filter, CUDA, …). The set
         // and its wiring live in `vsock_service`; here we just register the
         // port for each one enabled for this launch. Adding a capability needs
