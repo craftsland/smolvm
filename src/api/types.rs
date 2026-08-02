@@ -505,6 +505,10 @@ pub struct CreateMachineRequest {
     /// Enable CUDA remoting (host NVIDIA GPU via the bundled shims).
     #[serde(default)]
     pub cuda: bool,
+    /// Ask compatible CUDA frameworks to graph safe compiled regions.
+    /// Implies CUDA; arbitrary eager CUDA calls are not captured.
+    #[serde(default)]
+    pub auto_graph: bool,
     /// Workload entrypoint. With `cmd`, overrides the image's (or the
     /// `.smolmachine` artifact's) own entrypoint+cmd, matching the CLI's
     /// `machine create -- <command>` precedence. Empty = use the image's.
@@ -627,6 +631,15 @@ pub struct MachineInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 2)]
     pub overlay_gb: Option<u64>,
+    /// Planned runnable CUDA clone count used for automatic capacity budgeting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cuda_fork_pool_size: Option<u32>,
+    /// Explicit logical CUDA memory limit per golden/clone session, in MiB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cuda_vram_limit_mib: Option<u64>,
+    /// True while this clone is an already-booted clean slot parked at the
+    /// workload forkpoint and available for one assignment.
+    pub forkpoint_held: bool,
     /// Cumulative guest-outbound (egress) bytes since boot, for billing. Present
     /// only for virtio-net machines that have reported a value; omitted for TSI
     /// or machines that haven't flushed yet. Surfaced the same way `storage_gb`
@@ -723,6 +736,14 @@ pub struct StartMachineQuery {
     /// with `POST /machines/{name}/fork`. The golden freezes after its first fork.
     #[serde(default)]
     pub forkable: bool,
+    /// Number of runnable CUDA fork clones planned for this golden. Supplying
+    /// it enables forkable launch and transparent pre-initialization VRAM
+    /// budgeting for cache-sizing frameworks.
+    #[serde(default, rename = "forkPoolSize")]
+    pub fork_pool_size: Option<u32>,
+    /// Explicit logical VRAM limit per golden/clone session, in MiB.
+    #[serde(default, rename = "cudaVramLimitMib")]
+    pub cuda_vram_limit_mib: Option<u64>,
 }
 
 /// Credentials for the registry a machine's image lives in.
@@ -796,8 +817,21 @@ pub struct ForkRequest {
     /// the base stays frozen (LoRA/QLoRA fine-tuning, inference).
     #[serde(default)]
     pub share_weights: bool,
+    /// Wait for the workload's standard forkpoint before snapshotting, then
+    /// release the clone only after identity and fork parameters are installed.
+    #[serde(default)]
+    pub wait_ready: bool,
+    /// Keep the clone parked at the inherited forkpoint as an already-booted
+    /// pool slot. Implies `waitReady`; release it exactly once through the
+    /// fork-release endpoint after assigning job-specific parameters.
+    #[serde(default)]
+    pub hold: bool,
+    /// Maximum seconds to wait for the golden workload's forkpoint. Defaults
+    /// to 240 when `waitReady` or `hold` is enabled.
+    #[serde(default)]
+    pub ready_timeout_secs: Option<u64>,
     /// Per-fork parameters as KEY=VALUE strings. Delivered to the clone at
-    /// `/run/smolvm/fork-env` (dotenv format) for the already-running workload
+    /// `/etc/smolvm/fork-env` (dotenv format) for the already-running workload
     /// to read, and merged into the clone's env for later exec sessions.
     #[serde(default)]
     pub env: Vec<String>,
@@ -810,6 +844,196 @@ pub struct ForkRequest {
     #[serde(default)]
     #[schema(value_type = Object)]
     pub secrets: RequestSecretRefs,
+}
+
+/// Assignment for one already-booted held fork slot.
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkReleaseRequest {
+    /// Job-specific KEY=VALUE parameters. A value replaces a same-named value
+    /// installed while provisioning the slot.
+    #[serde(default)]
+    pub env: Vec<String>,
+}
+
+// ============================================================================
+// Automatic fork-pool types
+// ============================================================================
+
+/// Request to create an automatically replenished pool of held fork workers.
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateForkPoolRequest {
+    /// Stable pool name.
+    #[schema(example = "grpo-rollouts")]
+    pub name: String,
+    /// Existing running forkable machine whose workload is at the forkpoint.
+    #[schema(example = "policy-golden")]
+    pub golden: String,
+    /// Number of clean workers kept booted and ready.
+    #[schema(example = 8)]
+    pub desired_ready: u32,
+    /// Optional maximum number of simultaneously active leases.
+    #[serde(default)]
+    pub max_active: Option<u32>,
+    /// Automatically calibrate resident CUDA leases. Defaults on for shared
+    /// CUDA pools when omitted; set false for full residency.
+    #[serde(default)]
+    pub auto_admission: Option<bool>,
+    /// Share immutable CUDA allocations with the golden and sibling workers.
+    #[serde(default)]
+    pub share_weights: bool,
+    /// Maximum seconds to wait for the golden workload forkpoint.
+    #[serde(default)]
+    pub ready_timeout_secs: Option<u64>,
+    /// Default seconds an acquired worker may run without a heartbeat.
+    #[serde(default)]
+    pub lease_ttl_secs: Option<u64>,
+}
+
+/// Query parameters for deleting a fork pool.
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
+pub struct DeleteForkPoolQuery {
+    /// Cancel active leases and delete their workers as well.
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// Request to change a pool's clean-worker target.
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ResizeForkPoolRequest {
+    /// New number of clean workers to keep booted and ready.
+    pub desired_ready: u32,
+}
+
+/// Current size and lifecycle state of an automatic fork pool.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkPoolInfo {
+    /// Stable pool name.
+    pub name: String,
+    /// Forkable source machine.
+    pub golden: String,
+    /// Configured clean-worker target.
+    pub desired_ready: u32,
+    /// Optional simultaneous active-lease limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_active: Option<u32>,
+    /// Whether lease residency is calibrated automatically.
+    pub auto_admission: bool,
+    /// Current dynamic resident limit when automatic admission is enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_active_limit: Option<u32>,
+    /// Human-readable reason for the current automatic limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admission_reason: Option<String>,
+    /// True while the controller is comparing resident levels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admission_calibrating: Option<bool>,
+    /// Latest node-wide GPU utilization used by admission.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_utilization_percent: Option<f64>,
+    /// Latest aggregate GPU memory use in MiB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_memory_used_mib: Option<u64>,
+    /// Latest aggregate GPU memory capacity in MiB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_memory_total_mib: Option<u64>,
+    /// Latest host CPU busy percentage used by admission.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_cpu_percent: Option<f64>,
+    /// Whether immutable CUDA allocations are shared.
+    pub share_weights: bool,
+    /// Default lease heartbeat duration.
+    pub lease_ttl_secs: u64,
+    /// Workers still being forked and booted.
+    pub provisioning: u32,
+    /// Clean held workers immediately available for acquisition.
+    pub ready: u32,
+    /// Workers durably claimed while guest release is in progress.
+    pub activating: u32,
+    /// Workers currently owned by active leases.
+    pub active: u32,
+    /// Workers being destroyed before replacement or pool deletion.
+    pub retiring: u32,
+    /// True after asynchronous deletion has begun.
+    pub deleting: bool,
+    /// Unix timestamp when the pool was created.
+    pub created_at: u64,
+}
+
+/// List response for automatic fork pools.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ListForkPoolsResponse {
+    /// All pools on this node.
+    pub pools: Vec<ForkPoolInfo>,
+}
+
+/// Request to acquire one clean worker from a fork pool.
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AcquireForkLeaseRequest {
+    /// Retry key unique within the pool. Repeating it returns the same lease.
+    #[schema(example = "rollout-batch-42-worker-3")]
+    pub idempotency_key: String,
+    /// Job-specific KEY=VALUE parameters installed before the workload runs.
+    #[serde(default)]
+    pub env: Vec<String>,
+    /// Small files written atomically under `/workspace` before the workload is
+    /// released. The entire worker is discarded if any file cannot be staged.
+    #[serde(default)]
+    pub files: Vec<ForkLeasePayloadFile>,
+    /// Optional lease duration override for this worker.
+    #[serde(default)]
+    pub ttl_secs: Option<u64>,
+}
+
+/// One file staged into a held worker before lease activation.
+#[derive(Clone, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkLeasePayloadFile {
+    /// Relative path below `/workspace`, such as `jobs/episode.json`.
+    #[schema(example = "jobs/episode.json")]
+    pub path: String,
+    /// Standard base64-encoded file contents.
+    #[schema(example = "eyJlcGlzb2RlIjo0Mn0K")]
+    pub data_base64: String,
+    /// Optional Unix permission bits in decimal; defaults to 420 (`0644`).
+    #[serde(default)]
+    #[schema(example = 420)]
+    pub mode: Option<u32>,
+}
+
+impl std::fmt::Debug for ForkLeasePayloadFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ForkLeasePayloadFile")
+            .field("path", &self.path)
+            .field("data_base64", &"<redacted>")
+            .field("mode", &self.mode)
+            .finish()
+    }
+}
+
+/// Public state of one one-shot fork worker lease.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkLeaseInfo {
+    /// Opaque lease identifier used for heartbeat and completion.
+    pub id: String,
+    /// Pool that supplied the worker.
+    pub pool: String,
+    /// Machine name usable with existing exec, file, and log APIs.
+    pub machine: String,
+    /// Lease state: activating, active, completed, expired, failed, or cancelled.
+    pub state: String,
+    /// Unix timestamp when the lease was acquired.
+    pub created_at: u64,
+    /// Unix timestamp after which a missing heartbeat retires the worker.
+    pub expires_at: u64,
+    /// Activation failure, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[cfg(test)]
@@ -875,5 +1099,16 @@ mod registry_auth_tests {
         .into();
         assert_eq!(a.username, "oauth2accesstoken");
         assert_eq!(a.password, "p:with:colons");
+    }
+
+    #[test]
+    fn legacy_fork_request_preserves_uncoordinated_behavior() {
+        let request: ForkRequest = serde_json::from_value(serde_json::json!({
+            "name": "clone-1"
+        }))
+        .unwrap();
+        assert!(!request.wait_ready);
+        assert!(!request.hold);
+        assert_eq!(request.ready_timeout_secs, None);
     }
 }

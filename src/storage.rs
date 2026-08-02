@@ -465,37 +465,20 @@ impl<K: DiskType> VmDisk<K> {
 
     /// Find a pre-formatted disk template.
     ///
-    /// Searches in order:
-    /// 1. `~/.smolvm/{filename}` (installed location)
-    /// 2. Next to the current executable (development)
+    /// Searches `~/.smolvm/` then the executable's directory, accepting either
+    /// the plain file or a `.zst` archive that is expanded to a sparse file on
+    /// first use — releases ship the compressed form. Shared with the pack
+    /// crate so both paths agree on where templates live and how they expand.
     fn template_path() -> Option<PathBuf> {
-        if let Some(home) = dirs::home_dir() {
-            let installed_path = home.join(".smolvm").join(K::TEMPLATE_FILENAME);
-            if installed_path.exists() {
-                tracing::debug!(
-                    path = %installed_path.display(),
-                    disk_type = K::NAME,
-                    "found disk template"
-                );
-                return Some(installed_path);
-            }
+        let found = smolvm_pack::assets::find_existing_template(K::TEMPLATE_FILENAME);
+        if let Some(path) = &found {
+            tracing::debug!(
+                path = %path.display(),
+                disk_type = K::NAME,
+                "found disk template"
+            );
         }
-
-        if let Ok(exe_path) = std::env::current_exe() {
-            if let Some(exe_dir) = exe_path.parent() {
-                let dev_path = exe_dir.join(K::TEMPLATE_FILENAME);
-                if dev_path.exists() {
-                    tracing::debug!(
-                        path = %dev_path.display(),
-                        disk_type = K::NAME,
-                        "found disk template (dev)"
-                    );
-                    return Some(dev_path);
-                }
-            }
-        }
-
-        None
+        found
     }
 
     /// Get the path to the format marker file for a disk.

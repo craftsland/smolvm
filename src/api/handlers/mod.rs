@@ -7,7 +7,9 @@ pub mod images;
 pub mod machines;
 pub mod node;
 pub mod p2p;
+pub mod pools;
 pub mod prewarm;
+pub mod rollouts;
 pub mod volumes;
 
 use crate::api::error::ApiError;

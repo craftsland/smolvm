@@ -11,7 +11,7 @@
 //! Adding a new vsock-backed capability is one `impl VsockService` plus one line
 //! in [`registry`] — no new control flow in the launcher.
 
-use smolvm_protocol::ports;
+use smolvm_protocol::{guest_env, ports};
 use std::path::Path;
 
 /// The optional, host-derived socket paths a service resolves itself from.
@@ -102,7 +102,7 @@ impl VsockService for CudaService {
             // only uses it when it can read `/proc/self/pagemap` (guest is root)
             // and the host published the mapping; otherwise it falls back to the
             // byte-shipping path transparently.
-            guest_env: &[("SMOLVM_CUDA_ZEROCOPY", "1")],
+            guest_env: &[(guest_env::CUDA_ZEROCOPY, guest_env::VALUE_ON)],
         })
     }
 }

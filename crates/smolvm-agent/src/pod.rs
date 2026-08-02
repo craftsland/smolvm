@@ -964,6 +964,7 @@ fn write_pod_bundle(
     // Same injections as Run's bundle build (write_oci_bundle).
     crate::ssh_agent::inject_into_container(&mut spec);
     crate::rosetta::inject_into_container(&mut spec);
+    crate::forkpoint::inject_into_container(&mut spec);
     crate::cuda::inject_into_container(&mut spec, &pod.rootfs);
 
     // Graft the container's securityContext from the host OCI spec so the

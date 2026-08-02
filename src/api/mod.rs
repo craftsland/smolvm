@@ -18,9 +18,12 @@
 //!   -d '{"name": "test"}'
 //! ```
 
+pub mod admission;
 #[path = "errors.rs"]
 pub mod error;
 pub mod handlers;
+pub mod pool_controller;
+pub mod rollout;
 pub mod state;
 pub mod supervisor;
 pub mod types;
@@ -59,6 +62,8 @@ use state::ApiState;
         (name = "Health", description = "Health check endpoints"),
         (name = "Node", description = "Node capacity introspection"),
         (name = "Machines", description = "Machine lifecycle management"),
+        (name = "Pools", description = "Automatic held-fork worker pools"),
+        (name = "Rollouts", description = "Framework-aware fused multi-policy rollout executors"),
         (name = "Execution", description = "Command execution in machines"),
         (name = "Logs", description = "Log streaming"),
         (name = "Images", description = "OCI image management"),
@@ -86,10 +91,30 @@ use state::ApiState;
         handlers::machines::get_machine,
         handlers::machines::start_machine,
         handlers::machines::fork_machine,
+        handlers::machines::release_held_fork,
         handlers::machines::stop_machine,
         handlers::machines::delete_machine,
         handlers::machines::resize_machine,
         handlers::machines::export_machine,
+        // Pools
+        handlers::pools::create_pool,
+        handlers::pools::list_pools,
+        handlers::pools::get_pool,
+        handlers::pools::resize_pool,
+        handlers::pools::delete_pool,
+        handlers::pools::acquire_lease,
+        handlers::pools::get_lease,
+        handlers::pools::heartbeat_lease,
+        handlers::pools::complete_lease,
+        // Fused rollouts
+        handlers::rollouts::create_executor,
+        handlers::rollouts::list_executors,
+        handlers::rollouts::get_executor,
+        handlers::rollouts::delete_executor,
+        handlers::rollouts::publish_policy,
+        handlers::rollouts::retire_policy,
+        handlers::rollouts::generate,
+        handlers::rollouts::generate_batch,
     ),
     components(schemas(
         // Request types
@@ -106,8 +131,20 @@ use state::ApiState;
         types::LogsQuery,
         types::ResizeMachineRequest,
         types::ForkRequest,
+        types::ForkReleaseRequest,
         types::ExportRequest,
         types::StartMachineQuery,
+        types::CreateForkPoolRequest,
+        types::DeleteForkPoolQuery,
+        types::AcquireForkLeaseRequest,
+        types::ForkLeasePayloadFile,
+        types::ResizeForkPoolRequest,
+        rollout::CreateRolloutExecutorRequest,
+        rollout::PublishRolloutPolicyRequest,
+        rollout::RolloutPrompt,
+        rollout::RolloutSamplingParams,
+        rollout::RolloutGenerateRequest,
+        rollout::RolloutBatchRequest,
         // Response types
         types::HealthResponse,
         types::CapacityResponse,
@@ -123,6 +160,16 @@ use state::ApiState;
         types::StopResponse,
         types::DeleteResponse,
         types::ApiErrorResponse,
+        types::ForkPoolInfo,
+        types::ListForkPoolsResponse,
+        types::ForkLeaseInfo,
+        rollout::RolloutExecutorInfo,
+        rollout::RolloutPolicyInfo,
+        rollout::RolloutCompletion,
+        rollout::RolloutUsage,
+        rollout::RolloutGenerateResponse,
+        rollout::RolloutBatchItemResponse,
+        rollout::RolloutBatchResponse,
     ))
 )]
 pub struct ApiDoc;
@@ -137,6 +184,8 @@ const API_REQUEST_TIMEOUT_SECS: u64 = 300;
 /// uploads before the handler runs; the control plane permits 100 MiB, so match
 /// it here. The agent streams the write and enforces the true ceiling.
 const MAX_FILE_UPLOAD_BYTES: usize = 100 * 1024 * 1024;
+/// Bounded but large enough for cohorts of pre-tokenized RL prompts.
+const MAX_ROLLOUT_REQUEST_BYTES: usize = 20 * 1024 * 1024;
 
 /// Validate that an API command payload is not empty.
 pub fn validate_command(cmd: &[String]) -> Result<(), ApiError> {
@@ -198,6 +247,10 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route("/{id}", get(handlers::machines::get_machine))
         .route("/{id}/start", post(handlers::machines::start_machine))
         .route("/{id}/fork", post(handlers::machines::fork_machine))
+        .route(
+            "/{id}/fork-release",
+            post(handlers::machines::release_held_fork),
+        )
         .route("/{id}/stop", post(handlers::machines::stop_machine))
         .route("/{id}/resize", post(handlers::machines::resize_machine))
         .route("/{id}/export", post(handlers::machines::export_machine))
@@ -232,6 +285,30 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .merge(logs_route)
         .merge(machine_routes_with_timeout);
 
+    // Automatic pool operations are bounded by the same request timeout as
+    // machine lifecycle calls. Pool fill and worker replacement happen in the
+    // background controller, so create/delete themselves stay quick.
+    let pool_routes = Router::new()
+        .route("/", post(handlers::pools::create_pool))
+        .route("/", get(handlers::pools::list_pools))
+        .route("/{name}", get(handlers::pools::get_pool))
+        .route("/{name}", delete(handlers::pools::delete_pool))
+        .route("/{name}/size", put(handlers::pools::resize_pool))
+        .route("/{name}/leases", post(handlers::pools::acquire_lease))
+        .route("/{name}/leases/{lease}", get(handlers::pools::get_lease))
+        .route(
+            "/{name}/leases/{lease}/heartbeat",
+            post(handlers::pools::heartbeat_lease),
+        )
+        .route(
+            "/{name}/leases/{lease}/complete",
+            post(handlers::pools::complete_lease),
+        )
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(API_REQUEST_TIMEOUT_SECS),
+        ));
+
     // Volume provisioning (node-side storage for the control plane): create the
     // backing storage on THIS worker and return its host path. See
     // handlers::volumes.
@@ -239,12 +316,53 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route("/", post(handlers::volumes::provision_volume))
         .route("/{id}", delete(handlers::volumes::deprovision_volume));
 
+    // Fused rollout handlers own their deadlines so cancelled clients abort the
+    // backend HTTP request instead of inheriting the generic lifecycle timeout.
+    let rollout_routes = Router::new()
+        .route("/", post(handlers::rollouts::create_executor))
+        .route("/", get(handlers::rollouts::list_executors))
+        .route("/{name}", get(handlers::rollouts::get_executor))
+        .route("/{name}", delete(handlers::rollouts::delete_executor))
+        .route("/{name}/policies", post(handlers::rollouts::publish_policy))
+        .route(
+            "/{name}/policies/{policy}/{version}",
+            delete(handlers::rollouts::retire_policy),
+        )
+        .route("/{name}/generate", post(handlers::rollouts::generate))
+        .route("/{name}/batches", post(handlers::rollouts::generate_batch))
+        .layer(DefaultBodyLimit::max(MAX_ROLLOUT_REQUEST_BYTES));
+
     // API v1 routes
     let api_v1 = Router::new()
         .nest("/machines", machine_routes)
+        .nest("/pools", pool_routes)
+        .nest("/rollout-executors", rollout_routes)
         .nest("/volumes", volume_routes);
 
-    // CORS: Use configured origins, or default to localhost for security.
+    let cors = build_cors(cors_origins);
+
+    // Prometheus metrics
+    let metrics_route = Router::new().route("/metrics", get(serve_metrics));
+
+    // Combine all routes
+    Router::new()
+        .merge(health_route)
+        .merge(capacity_route)
+        .merge(drain_route)
+        .merge(p2p_route)
+        .merge(warm_route)
+        .merge(metrics_route)
+        .nest("/api/v1", api_v1)
+        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
+        .layer(middleware::from_fn(trace_id_middleware))
+        .layer(TraceLayer::new_for_http())
+        .layer(cors)
+        .with_state(state)
+}
+
+/// Build the shared CORS layer from the configured origins (falling back to the
+/// localhost defaults). Shared by [`create_router`] and [`create_local_router`].
+fn build_cors(cors_origins: Vec<String>) -> CorsLayer {
     let default_origins = || {
         vec![
             "http://localhost:8080"
@@ -280,33 +398,108 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
             valid
         }
     };
-
-    let cors = CorsLayer::new()
+    CorsLayer::new()
         .allow_origin(AllowOrigin::list(origins))
         .allow_methods([
             axum::http::Method::GET,
             axum::http::Method::POST,
+            axum::http::Method::PUT,
             axum::http::Method::DELETE,
         ])
-        .allow_headers([axum::http::header::CONTENT_TYPE]);
+        .allow_headers([axum::http::header::CONTENT_TYPE])
+}
 
-    // Prometheus metrics
-    let metrics_route = Router::new().route("/metrics", get(serve_metrics));
-
-    // Combine all routes
+/// The router served on the plain-HTTP LOOPBACK door (fleet mode), as distinct
+/// from the full [`create_router`] served on the mTLS network port.
+///
+/// The loopback door is unauthenticated by construction — anything that can
+/// reach `127.0.0.1` on the node gets in. Serving the full router there exposed
+/// the machine/file/exec API (`/api/v1/*`) to any local caller, and a crafted
+/// registry reference (`127.0.0.1:<port>/...`) makes the node's OWN in-process
+/// registry-pull client such a caller: it turns an attacker-supplied image ref
+/// into unauthenticated reads/writes against `download_file` / `upload_file`.
+///
+/// The door's only legitimate job is liveness — a fleet node-agent polling
+/// `/capacity` (plus `/health`/`/readyz`, and read-only `/metrics`). Restricting
+/// it to exactly those routes closes the SSRF pivot without touching the mTLS
+/// control path, which keeps the full API. Everything else 404s on loopback.
+pub fn create_local_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router {
+    let cors = build_cors(cors_origins);
     Router::new()
-        .merge(health_route)
-        .merge(capacity_route)
-        .merge(drain_route)
-        .merge(p2p_route)
-        .merge(warm_route)
-        .merge(metrics_route)
-        .nest("/api/v1", api_v1)
-        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
+        .route("/health", get(handlers::health::health))
+        .route("/readyz", get(handlers::health::readyz))
+        .route("/capacity", get(handlers::node::capacity))
+        .route("/metrics", get(serve_metrics))
         .layer(middleware::from_fn(trace_id_middleware))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state)
+}
+
+#[cfg(test)]
+mod loopback_router_test {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    async fn status(router: axum::Router, method: &str, path: &str) -> StatusCode {
+        router
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    // The loopback door must NOT expose the machine/file/exec API — that is the
+    // SSRF pivot this router closes. Liveness routes must still answer.
+    #[tokio::test]
+    async fn loopback_router_excludes_machine_file_exec_api() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = crate::db::SmolvmDb::open_at(&dir.path().join("t.db")).unwrap();
+        let state = std::sync::Arc::new(crate::api::state::ApiState::with_db(db));
+        let local = create_local_router(state.clone(), vec![]);
+
+        // The attack surface — every one must be 404 (route absent) on loopback:
+        for (m, p) in [
+            ("GET", "/api/v1/machines"),
+            ("GET", "/api/v1/machines/x/files/etc/passwd"),
+            ("PUT", "/api/v1/machines/x/files/etc/cron.d/x"),
+            ("POST", "/api/v1/machines/x/exec"),
+            ("POST", "/api/v1/machines"),
+        ] {
+            assert_eq!(
+                status(local.clone(), m, p).await,
+                StatusCode::NOT_FOUND,
+                "loopback door must NOT expose {m} {p}"
+            );
+        }
+        // Liveness must still work (not 404) so the node-agent poll survives:
+        assert_ne!(
+            status(local.clone(), "GET", "/capacity").await,
+            StatusCode::NOT_FOUND,
+            "loopback /capacity must remain served"
+        );
+        assert_ne!(
+            status(local.clone(), "GET", "/health").await,
+            StatusCode::NOT_FOUND,
+            "loopback /health must remain served"
+        );
+
+        // Sanity: the FULL router (mTLS port) still DOES expose the API.
+        let full = create_router(state, vec![]);
+        assert_ne!(
+            status(full, "GET", "/api/v1/machines").await,
+            StatusCode::NOT_FOUND,
+            "full router must still expose the machine API on the mTLS port"
+        );
+    }
 }
 
 /// Install the global Prometheus metrics recorder.
@@ -344,12 +537,22 @@ fn machine_id_from_path(path: &str) -> Option<&str> {
 
 fn normalize_metrics_path(path: &str) -> String {
     let parts: Vec<&str> = path.split('/').collect();
-    if parts.len() >= 4 && parts[1] == "api" && parts[3] == "machines" {
+    if parts.len() >= 4
+        && parts[1] == "api"
+        && matches!(parts[3], "machines" | "pools" | "rollout-executors")
+    {
         if let Some(id_pos) = parts.get(4) {
             if !id_pos.is_empty() {
                 let mut normalized = parts[..4].to_vec();
                 normalized.push(":id");
                 normalized.extend_from_slice(&parts[5..]);
+                if parts[3] == "rollout-executors"
+                    && normalized.get(5) == Some(&"policies")
+                    && normalized.len() >= 8
+                {
+                    normalized[6] = ":policy";
+                    normalized[7] = ":version";
+                }
                 return normalized.join("/");
             }
         }
@@ -396,7 +599,7 @@ async fn trace_id_middleware(mut req: Request, next: Next) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{machine_id_from_path, validate_command};
+    use super::{machine_id_from_path, normalize_metrics_path, validate_command};
 
     #[test]
     fn machine_id_is_extracted_from_machine_routes() {
@@ -419,6 +622,22 @@ mod tests {
         assert_eq!(machine_id_from_path("/health"), None);
         assert_eq!(machine_id_from_path("/api/v1/machines"), None);
         assert_eq!(machine_id_from_path("/api/v1/machines/"), None);
+    }
+
+    #[test]
+    fn metrics_paths_hide_rollout_and_pool_identifiers() {
+        assert_eq!(
+            normalize_metrics_path("/api/v1/pools/team-a/leases"),
+            "/api/v1/pools/:id/leases"
+        );
+        assert_eq!(
+            normalize_metrics_path("/api/v1/rollout-executors/qwen/policies/experiment-1/step-400"),
+            "/api/v1/rollout-executors/:id/policies/:policy/:version"
+        );
+        assert_eq!(
+            normalize_metrics_path("/api/v1/rollout-executors/qwen/generate"),
+            "/api/v1/rollout-executors/:id/generate"
+        );
     }
 
     #[test]

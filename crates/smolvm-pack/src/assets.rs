@@ -50,22 +50,150 @@ pub const ZSTD_LEVEL: i32 = 3;
 /// Searches in order:
 /// 1. `~/.smolvm/{filename}` (installed location)
 /// 2. Next to the current executable (development)
-fn find_existing_template(filename: &str) -> Option<PathBuf> {
+///
+/// Each location is checked for the plain file first and then for a `.zst`
+/// sibling, which is expanded on demand by [`materialize_template`]. Releases
+/// ship only the compressed form; the plain file is still honored so existing
+/// installs and development trees keep working untouched.
+pub fn find_existing_template(filename: &str) -> Option<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
     if let Some(home) = dirs::home_dir() {
-        let path = home.join(".smolvm").join(filename);
-        if path.exists() {
-            return Some(path);
-        }
+        roots.push(home.join(".smolvm"));
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let path = dir.join(filename);
-            if path.exists() {
-                return Some(path);
+            roots.push(dir.to_path_buf());
+        }
+    }
+
+    for root in &roots {
+        let plain = root.join(filename);
+        if plain.exists() {
+            return Some(plain);
+        }
+    }
+    for root in &roots {
+        let compressed = root.join(format!("{filename}.zst"));
+        if compressed.exists() {
+            match expand_template(&compressed, filename) {
+                Ok(path) => return Some(path),
+                Err(e) => {
+                    // Falling through would report the template as simply
+                    // missing, which hides the real cause (usually no space or
+                    // no writable location).
+                    eprintln!("warning: could not expand {}: {e}", compressed.display());
+                }
             }
         }
     }
     None
+}
+
+/// Expand `compressed` into a sparse file and return the expanded path.
+///
+/// Written next to the archive when that directory is writable, otherwise into
+/// the user cache — the read-only case is the normal one for Nix and any other
+/// immutable store. The result is reused on later runs: the plain-file lookup
+/// above finds it first, so expansion happens once per install.
+fn expand_template(compressed: &Path, filename: &str) -> std::io::Result<PathBuf> {
+    let beside = compressed.parent().map(|d| d.join(filename));
+    let cached = dirs::cache_dir().map(|c| c.join("smolvm").join(filename));
+
+    let mut last_err = None;
+    for dest in [beside, cached].into_iter().flatten() {
+        if dest.exists() {
+            return Ok(dest);
+        }
+        if let Some(parent) = dest.parent() {
+            if fs::create_dir_all(parent).is_err() {
+                continue;
+            }
+        }
+        match materialize_template(compressed, &dest) {
+            Ok(()) => return Ok(dest),
+            Err(e) => {
+                // A partial file would be mistaken for a good template by the
+                // plain-file lookup, so remove it before trying the next root.
+                let _ = fs::remove_file(&dest);
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::other("no writable location to expand the disk template")
+    }))
+}
+
+/// Decompress `src` into `dest`, writing only the non-zero regions.
+///
+/// The template is ~20 GiB logical and a few MiB of real data. Expanding it
+/// with a plain copy would write every zero, so the zero runs are skipped and
+/// left as holes — the same shape the file has when built. Decompression goes
+/// to a temporary file that is renamed into place only on success, so a crash
+/// or a full disk cannot leave a truncated template behind for the next run to
+/// treat as valid.
+fn materialize_template(src: &Path, dest: &Path) -> std::io::Result<()> {
+    let tmp = dest.with_extension("partial");
+    let _ = fs::remove_file(&tmp);
+    let result = decompress_sparse(src, &tmp);
+    if result.is_ok() {
+        if let Err(e) = fs::rename(&tmp, dest) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+        return Ok(());
+    }
+    // Leave nothing behind on failure: a stray scratch file wastes space, and a
+    // renamed partial would be picked up as a valid template by the next run.
+    let _ = fs::remove_file(&tmp);
+    result
+}
+
+/// Stream `src` into `dest`, skipping the zero runs so they stay holes.
+fn decompress_sparse(src: &Path, dest: &Path) -> std::io::Result<()> {
+    use std::io::Read as _;
+
+    let file = File::create(dest)?;
+    // On Windows/NTFS, File::create makes a non-sparse file: seeking past the
+    // zero runs and set_len-ing to the full 20 GiB would allocate and zero-fill
+    // the whole gap, ballooning the template to its full logical size on disk.
+    // Mark it sparse first so only the written extents consume space — matching
+    // the implicit sparse behavior the seek/set_len path already gets on ext4
+    // and APFS.
+    #[cfg(windows)]
+    crate::extract::mark_file_sparse(&file)?;
+    let mut out = std::io::BufWriter::new(file);
+
+    let mut decoder = zstd::Decoder::new(File::open(src)?)?;
+    let mut buf = vec![0u8; 512 * 1024];
+    let mut offset: u64 = 0;
+    loop {
+        let mut filled = 0;
+        // Fill the whole buffer so the zero test sees full chunks rather than
+        // whatever short reads the decoder happens to produce.
+        while filled < buf.len() {
+            match decoder.read(&mut buf[filled..])? {
+                0 => break,
+                n => filled += n,
+            }
+        }
+        if filled == 0 {
+            break;
+        }
+        let chunk = &buf[..filled];
+        if chunk.iter().any(|&b| b != 0) {
+            out.seek(SeekFrom::Start(offset))?;
+            out.write_all(chunk)?;
+        }
+        offset += filled as u64;
+    }
+    out.flush()?;
+    let file = out.into_inner().map_err(|e| e.into_error())?;
+    // Trailing zeros are never written, so set the length explicitly to give the
+    // file its full logical size with the tail left as a hole.
+    file.set_len(offset)?;
+    file.sync_all()?;
+    Ok(())
 }
 
 /// Asset collector for gathering runtime components.
@@ -926,5 +1054,172 @@ mod tests {
         let restored = output.join("test.txt");
         assert!(restored.exists());
         assert_eq!(fs::read_to_string(&restored).unwrap(), "hello world");
+    }
+}
+
+/// Expanding a compressed disk template back into a sparse file.
+#[cfg(test)]
+mod template_expand_tests {
+    use super::*;
+
+    /// Build a template-shaped file: a little real data, a large hole, a tail.
+    /// Sized at 64 MiB: APFS does not report holes for files much smaller than
+    /// this regardless of how they are written, so a smaller fixture would fail
+    /// the sparseness assertion even for a correct implementation.
+    fn template_bytes() -> Vec<u8> {
+        let mut v = vec![0u8; 64 * 1024 * 1024];
+        v[..4096].copy_from_slice(&[0xABu8; 4096]);
+        let tail = v.len() - 16;
+        v[tail..].copy_from_slice(&[0xCDu8; 16]);
+        v
+    }
+
+    fn compress_to(path: &Path, data: &[u8]) {
+        let out = File::create(path).expect("create zst");
+        let mut enc = zstd::Encoder::new(out, 3).expect("encoder");
+        enc.write_all(data).expect("write");
+        enc.finish().expect("finish");
+    }
+
+    #[test]
+    fn expansion_reproduces_the_original_bytes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("t.ext4.zst");
+        let dest = tmp.path().join("t.ext4");
+        let data = template_bytes();
+        compress_to(&src, &data);
+
+        materialize_template(&src, &dest).expect("materialize");
+
+        assert_eq!(fs::read(&dest).expect("read"), data);
+    }
+
+    /// The point of the exercise: the hole must not be written out.
+    #[cfg(unix)]
+    #[test]
+    fn the_hole_is_left_unallocated() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("t.ext4.zst");
+        let dest = tmp.path().join("t.ext4");
+        let data = template_bytes();
+        compress_to(&src, &data);
+
+        materialize_template(&src, &dest).expect("materialize");
+
+        let meta = fs::metadata(&dest).expect("stat");
+        assert_eq!(meta.len(), data.len() as u64, "logical size must match");
+        let dense = data.len() as u64 / 512;
+        assert!(
+            meta.blocks() < dense / 4,
+            "expected a sparse file, got {} blocks vs {dense} if dense",
+            meta.blocks()
+        );
+    }
+
+    /// The same guarantee on Windows/NTFS, where holes exist only after the file
+    /// is explicitly marked sparse — the plain seek/set_len path leaves it dense.
+    /// `GetCompressedFileSizeW` reports the bytes actually allocated on disk, so a
+    /// sparse expansion reads far below the logical size while a dense one matches
+    /// it. Cross-compilation cannot exercise this; it needs a native Windows run.
+    #[cfg(windows)]
+    #[test]
+    fn the_hole_is_left_unallocated() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::GetCompressedFileSizeW;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("t.ext4.zst");
+        let dest = tmp.path().join("t.ext4");
+        let data = template_bytes();
+        compress_to(&src, &data);
+
+        materialize_template(&src, &dest).expect("materialize");
+
+        assert_eq!(
+            fs::metadata(&dest).expect("stat").len(),
+            data.len() as u64,
+            "logical size must match"
+        );
+
+        let wide: Vec<u16> = dest.as_os_str().encode_wide().chain([0]).collect();
+        let mut high: u32 = 0;
+        // SAFETY: `wide` is a valid NUL-terminated path; `high` is a valid out ptr.
+        let low = unsafe { GetCompressedFileSizeW(wide.as_ptr(), &mut high) };
+        assert_ne!(low, u32::MAX, "GetCompressedFileSizeW failed");
+        let on_disk = ((high as u64) << 32) | low as u64;
+        assert!(
+            on_disk < data.len() as u64 / 4,
+            "expected a sparse file, got {on_disk} bytes on disk vs {} logical",
+            data.len()
+        );
+    }
+
+    /// A file that is entirely zeros still has to come back at full length.
+    #[test]
+    fn an_all_zero_template_keeps_its_length() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("z.ext4.zst");
+        let dest = tmp.path().join("z.ext4");
+        let data = vec![0u8; 4 * 1024 * 1024];
+        compress_to(&src, &data);
+
+        materialize_template(&src, &dest).expect("materialize");
+
+        assert_eq!(fs::metadata(&dest).expect("stat").len(), data.len() as u64);
+        assert!(fs::read(&dest).expect("read").iter().all(|&b| b == 0));
+    }
+
+    /// End-to-end discovery: a `.zst` beside the executable is found and
+    /// expanded, exercising the same `current_exe()` branch a real install uses.
+    /// The filename is unique so parallel tests cannot collide, and both the
+    /// archive and its expansion are removed afterwards.
+    #[test]
+    fn a_zst_beside_the_executable_is_discovered_and_expanded() {
+        let exe = std::env::current_exe().expect("current_exe");
+        let dir = exe.parent().expect("exe dir");
+        let name = format!("discovery-probe-{}.ext4", std::process::id());
+        let zst = dir.join(format!("{name}.zst"));
+        let expanded = dir.join(&name);
+        let _ = fs::remove_file(&zst);
+        let _ = fs::remove_file(&expanded);
+
+        let data = template_bytes();
+        compress_to(&zst, &data);
+
+        let found = find_existing_template(&name);
+
+        let cleanup = || {
+            let _ = fs::remove_file(&zst);
+            let _ = fs::remove_file(&expanded);
+        };
+        let Some(path) = found else {
+            cleanup();
+            panic!("compressed template beside the executable was not found");
+        };
+        let got = fs::read(&path).expect("read expanded");
+        cleanup();
+        assert_eq!(got, data, "expanded template must match the original");
+    }
+
+    /// A truncated archive must not leave a half-written file behind, or the
+    /// plain-file lookup would treat the debris as a valid template.
+    #[test]
+    fn a_corrupt_archive_leaves_no_partial_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("bad.ext4.zst");
+        let dest = tmp.path().join("bad.ext4");
+        let data = template_bytes();
+        compress_to(&src, &data);
+        // Lop off the end so decompression fails partway.
+        let whole = fs::read(&src).expect("read zst");
+        fs::write(&src, &whole[..whole.len() / 2]).expect("truncate");
+
+        assert!(materialize_template(&src, &dest).is_err());
+        assert!(!dest.exists(), "no template should be left behind");
+        assert!(
+            !dest.with_extension("partial").exists(),
+            "no scratch file should be left behind"
+        );
     }
 }

@@ -8,6 +8,12 @@ pub use smolvm_protocol::retry::{
     is_transient_io_error, is_transient_network_error, retry_with_backoff, RetryConfig,
 };
 
+/// Workload marker set when smolvm's best-effort CUDA graph policy is enabled.
+pub const CUDA_AUTO_GRAPH_ENV: &str = "SMOLVM_CUDA_AUTO_GRAPH";
+
+/// PyTorch Inductor switch for CUDA graphs in compatible compiled regions.
+pub const TORCHINDUCTOR_CUDAGRAPHS_ENV: &str = "TORCHINDUCTOR_CUDAGRAPHS";
+
 /// Generate a short random ID for auto-naming machines.
 ///
 /// Produces an 8-character hex string (e.g., "a1b2c3d4") from 4 bytes
@@ -99,6 +105,26 @@ pub fn parse_env_list(env_args: &[String]) -> Vec<(String, String)> {
     env_args.iter().filter_map(|e| parse_env_spec(e)).collect()
 }
 
+/// Enable best-effort CUDA graphs in a parsed workload environment.
+///
+/// Existing values are replaced so an explicit auto-graph request has one
+/// canonical result. Frameworks remain responsible for deciding which regions
+/// are safe to capture.
+pub fn enable_cuda_auto_graph_env(env: &mut Vec<(String, String)>) {
+    for name in [CUDA_AUTO_GRAPH_ENV, TORCHINDUCTOR_CUDAGRAPHS_ENV] {
+        env.retain(|(existing, _)| existing != name);
+        env.push((name.to_string(), "1".to_string()));
+    }
+}
+
+/// Enable best-effort CUDA graphs in `KEY=VALUE` workload specifications.
+pub fn enable_cuda_auto_graph_env_specs(env: &mut Vec<String>) {
+    for name in [CUDA_AUTO_GRAPH_ENV, TORCHINDUCTOR_CUDAGRAPHS_ENV] {
+        env.retain(|spec| spec.split_once('=').map_or(spec.as_str(), |(key, _)| key) != name);
+        env.push(format!("{name}=1"));
+    }
+}
+
 /// Parse a byte size like `16GiB`, `16G`, `512M`, or a plain byte count
 /// (`17179869184`). Suffixes are binary (1K = 1024); `K/M/G/T`, optionally with
 /// a trailing `i` and/or `B`, are accepted case-insensitively.
@@ -152,6 +178,46 @@ mod tests {
         // Empty key is rejected.
         assert_eq!(parse_env_spec("=bar"), None);
         assert_eq!(parse_env_spec(""), None);
+    }
+
+    #[test]
+    fn auto_graph_env_replaces_conflicting_values() {
+        let mut env = vec![
+            ("KEEP".to_string(), "yes".to_string()),
+            (TORCHINDUCTOR_CUDAGRAPHS_ENV.to_string(), "0".to_string()),
+            (CUDA_AUTO_GRAPH_ENV.to_string(), "old".to_string()),
+        ];
+
+        enable_cuda_auto_graph_env(&mut env);
+
+        assert_eq!(
+            env,
+            vec![
+                ("KEEP".to_string(), "yes".to_string()),
+                (CUDA_AUTO_GRAPH_ENV.to_string(), "1".to_string()),
+                (TORCHINDUCTOR_CUDAGRAPHS_ENV.to_string(), "1".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn auto_graph_env_specs_replaces_conflicting_values() {
+        let mut env = vec![
+            "KEEP=yes".to_string(),
+            "TORCHINDUCTOR_CUDAGRAPHS=0".to_string(),
+            "SMOLVM_CUDA_AUTO_GRAPH".to_string(),
+        ];
+
+        enable_cuda_auto_graph_env_specs(&mut env);
+
+        assert_eq!(
+            env,
+            vec![
+                "KEEP=yes".to_string(),
+                "SMOLVM_CUDA_AUTO_GRAPH=1".to_string(),
+                "TORCHINDUCTOR_CUDAGRAPHS=1".to_string(),
+            ]
+        );
     }
 
     #[test]

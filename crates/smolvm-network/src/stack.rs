@@ -213,7 +213,7 @@ fn run_network_stack(
     // Static remaps need every TCP/53 SYN intercepted so the guest's own resolver doesn't win.
     let intercept_dns_tcp = egress.has_static_dns();
     let relay_wake = Arc::new(queues.relay_wake.clone());
-    let mut relays = TcpRelayTable::new(None, egress.clone());
+    let mut relays = TcpRelayTable::new(None, egress.clone(), gateway_addrs.to_vec());
     let mut udp_sockets = udp_relay::UdpSocketTable::new();
     let udp_channels = {
         let shutdown_queues = queues.clone();

@@ -23,6 +23,7 @@
 //! | `memory` | int | No | Memory in MiB (default: 256). |
 //! | `net` | bool | No | Enable outbound networking via NAT. |
 //! | `cuda` | bool | No | Enable CUDA-over-vsock (host NVIDIA GPU). |
+//! | `auto_graph` | bool | No | Best-effort framework CUDA graphs; implies `cuda`. |
 //! | `storage` | int | No | Storage disk size in GiB. |
 //! | `overlay` | int | No | Overlay disk size in GiB. |
 //! | `ports` | string[] | No | Port mappings (`"host:guest"`). Prefer `[dev] ports`. |
@@ -244,6 +245,9 @@ pub struct Smolfile {
     /// Enable CUDA-over-vsock: remote guest CUDA Driver-API calls to the
     /// host NVIDIA GPU. Linux-only; requires a host NVIDIA driver.
     pub cuda: Option<bool>,
+    /// Ask compatible CUDA frameworks to graph safe compiled regions.
+    /// Implies `cuda`; arbitrary eager CUDA calls are not captured.
+    pub auto_graph: Option<bool>,
     /// Expose the guest's Docker daemon socket to the host as a Unix socket
     /// (`DOCKER_HOST=unix://…`). Requires dockerd running inside the VM.
     pub docker_socket: Option<bool>,
@@ -561,6 +565,18 @@ protocol = "http"
 
         let sf = parse("").unwrap();
         assert_eq!(sf.cuda, None);
+    }
+
+    #[test]
+    fn parse_auto_graph_field() {
+        let sf = parse("auto_graph = true").unwrap();
+        assert_eq!(sf.auto_graph, Some(true));
+
+        let sf = parse("auto_graph = false").unwrap();
+        assert_eq!(sf.auto_graph, Some(false));
+
+        let sf = parse("").unwrap();
+        assert_eq!(sf.auto_graph, None);
     }
 
     #[test]

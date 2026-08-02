@@ -34,7 +34,7 @@ use smoltcp::socket::tcp;
 use smoltcp::wire::IpListenEndpoint;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
@@ -64,6 +64,11 @@ pub struct TcpRelayTable {
     /// Outbound allow-list applied before opening a host connection for a
     /// guest-initiated flow. Inbound published-port connections bypass it.
     egress: EgressPolicy,
+    /// The guest-visible gateway addresses (IPv4/IPv6/link-local). A guest flow
+    /// destined to one of these is dialing "the host" via its default gateway,
+    /// so the host-side relay connects to loopback instead of the gateway's own
+    /// (non-routable) userspace address. See `host_connect_addr`.
+    gateway_ips: Vec<IpAddr>,
 }
 
 /// Newly established guest connection ready for a host relay thread.
@@ -184,7 +189,11 @@ impl RelayExitState {
 
 impl TcpRelayTable {
     /// Create a new relay table.
-    pub fn new(max_connections: Option<usize>, egress: EgressPolicy) -> Self {
+    pub fn new(
+        max_connections: Option<usize>,
+        egress: EgressPolicy,
+        gateway_ips: Vec<IpAddr>,
+    ) -> Self {
         Self {
             connections: HashMap::new(),
             connection_keys: HashSet::new(),
@@ -192,7 +201,33 @@ impl TcpRelayTable {
             next_published_port: PUBLISHED_PORT_START,
             max_connections: max_connections.unwrap_or(MAX_CONNECTIONS),
             egress,
+            gateway_ips,
         }
+    }
+
+    /// The host-side address the relay should dial for a guest flow.
+    ///
+    /// The guest's default gateway IP is its stand-in for "the host" (the slirp /
+    /// `host.docker.internal` convention): a guest reaches host-local services by
+    /// connecting to its gateway. But that gateway IP is THIS userspace stack's
+    /// own address, not a routable host interface — a literal relay to it
+    /// blackholes (the guest completes the smoltcp handshake, then never receives
+    /// reply bytes). Map a gateway-IP destination to loopback so it actually
+    /// reaches the host; every other destination is dialed as-is. Egress already
+    /// gated the ORIGINAL destination in `create_tcp_socket`, so under the
+    /// multi-tenant `Strict` floor the gateway/CGNAT range is refused before it
+    /// reaches here — this redirect only applies where reaching the host is the
+    /// intended, local-default behavior.
+    fn host_connect_addr(&self, destination: SocketAddr) -> SocketAddr {
+        if self.gateway_ips.contains(&destination.ip()) {
+            let loopback = if destination.is_ipv4() {
+                IpAddr::V4(Ipv4Addr::LOCALHOST)
+            } else {
+                IpAddr::V6(Ipv6Addr::LOCALHOST)
+            };
+            return SocketAddr::new(loopback, destination.port());
+        }
+        destination
     }
 
     /// Whether a relay socket already exists for the same guest source and destination.
@@ -242,11 +277,15 @@ impl TcpRelayTable {
         }
 
         // Sentinel → host loopback; guest-facing smoltcp socket keeps the sentinel.
+        // Two disjoint host remaps compose here: the opt-in egress host sentinel
+        // (192.0.2.1 → 127.0.0.1), and the gateway-IP → loopback mapping for the
+        // gateway's own services. host_forward handles the former; anything it
+        // leaves alone falls through to host_connect_addr for the latter.
         let connect_to = self
             .egress
             .host_forward(destination.ip())
             .map(|ip| SocketAddr::new(ip, destination.port()))
-            .unwrap_or(destination);
+            .unwrap_or_else(|| self.host_connect_addr(destination));
 
         let rx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_RX_BUFFER_BYTES]);
         let tx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_TX_BUFFER_BYTES]);
@@ -835,5 +874,32 @@ mod tests {
 
         assert!(connection.buffered_guest_data.is_none());
         assert_eq!(from_smoltcp.recv().unwrap(), vec![2]);
+    }
+
+    #[test]
+    fn gateway_ip_destination_dials_the_host_over_loopback() {
+        let gw4: IpAddr = "100.96.0.1".parse().unwrap();
+        let gw6: IpAddr = "fd00::1".parse().unwrap();
+        let table = TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![gw4, gw6]);
+
+        // A guest reaching "the host" via its gateway IP must dial loopback, not
+        // the gateway's own (non-routable) userspace address — the bug that made
+        // the handshake succeed but blackholed the reply. Port is preserved.
+        assert_eq!(
+            table.host_connect_addr(SocketAddr::new(gw4, 19997)),
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 19997),
+        );
+        assert_eq!(
+            table.host_connect_addr(SocketAddr::new(gw6, 6379)),
+            SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 6379),
+        );
+
+        // A non-gateway destination (external host / the host's LAN IP) is dialed
+        // unchanged.
+        let lan: IpAddr = "192.168.1.5".parse().unwrap();
+        assert_eq!(
+            table.host_connect_addr(SocketAddr::new(lan, 3306)),
+            SocketAddr::new(lan, 3306),
+        );
     }
 }

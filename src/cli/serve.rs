@@ -287,8 +287,23 @@ impl ServeStartCmd {
             supervisor.run().await;
         });
 
+        // Automatic fork-pool reconciliation has its own task so slow worker
+        // creation or deletion never delays the machine health supervisor.
+        let pool_state = state.clone();
+        let pool_shutdown = shutdown_rx.clone();
+        let pool_controller_handle = tokio::spawn(async move {
+            let controller =
+                smolvm::api::pool_controller::ForkPoolController::new(pool_state, pool_shutdown);
+            controller.run().await;
+        });
+
         // Create router
         let drain_state = state.clone();
+        // The loopback plain-HTTP door (fleet mode) serves a RESTRICTED router —
+        // liveness/capacity/metrics only — so the unauthenticated local surface
+        // cannot reach the machine/file/exec API. The full API stays on the mTLS
+        // network port (`app`). See `create_local_router`.
+        let local_app = smolvm::api::create_local_router(state.clone(), self.cors_origins.clone());
         let app = smolvm::api::create_router(state, self.cors_origins.clone());
 
         // Resolve the serve API's TLS posture before binding. In fleet mode this
@@ -301,12 +316,39 @@ impl ServeStartCmd {
 
         // Listen server on TCP or Unix socket
         match listen_target {
-            ListenTarget::Tcp(addr) => self.serve_tcp(addr, app, tls).await?,
+            ListenTarget::Tcp(addr) => self.serve_tcp(addr, app, local_app, tls).await?,
             #[cfg(unix)]
             ListenTarget::Unix(path) => self.serve_unix(path, app).await?,
         }
 
         // The HTTP server has stopped accepting (graceful shutdown on SIGTERM).
+        // Stop reconcilers before detaching or draining machine managers. In
+        // particular, a pool fill must not register a newly booted worker after
+        // `detach_all` has already walked the registry.
+        let _ = shutdown_tx.send(true);
+        let mut pool_controller_handle = pool_controller_handle;
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            &mut pool_controller_handle,
+        )
+        .await
+        {
+            Ok(_) => tracing::debug!("fork pool controller shut down cleanly"),
+            Err(_) => {
+                tracing::warn!("fork pool controller did not shut down within 5 seconds");
+                pool_controller_handle.abort();
+            }
+        }
+        let mut supervisor_handle = supervisor_handle;
+        match tokio::time::timeout(std::time::Duration::from_secs(5), &mut supervisor_handle).await
+        {
+            Ok(_) => tracing::debug!("supervisor shut down cleanly"),
+            Err(_) => {
+                tracing::warn!("supervisor did not shut down within 5 seconds");
+                supervisor_handle.abort();
+            }
+        }
+
         // VMs survive a normal `serve` restart (reconnect on next start), so this
         // is opt-in: on a host teardown (autoscaler scale-in) set
         // SMOLVM_DRAIN_ON_SHUTDOWN to stop running VMs cleanly — flushing disk
@@ -325,15 +367,6 @@ impl ServeStartCmd {
             drain_state.detach_all();
         }
 
-        // Signal all background tasks to stop
-        let _ = shutdown_tx.send(true);
-
-        // Wait for supervisor to finish (with timeout)
-        match tokio::time::timeout(std::time::Duration::from_secs(5), supervisor_handle).await {
-            Ok(_) => tracing::debug!("supervisor shut down cleanly"),
-            Err(_) => tracing::warn!("supervisor did not shut down within 5 seconds"),
-        }
-
         Ok(())
     }
 
@@ -341,10 +374,11 @@ impl ServeStartCmd {
         &self,
         addr: SocketAddr,
         app: Router,
+        local_app: Router,
         tls: Option<std::sync::Arc<rustls::ServerConfig>>,
     ) -> Result<()> {
         if let Some(tls_config) = tls {
-            return Self::serve_tcp_tls(addr, app, tls_config).await;
+            return Self::serve_tcp_tls(addr, app, local_app, tls_config).await;
         }
 
         let listener = tokio::net::TcpListener::bind(addr)
@@ -372,6 +406,7 @@ impl ServeStartCmd {
     async fn serve_tcp_tls(
         addr: SocketAddr,
         app: Router,
+        local_app: Router,
         tls_config: std::sync::Arc<rustls::ServerConfig>,
     ) -> Result<()> {
         // Loopback plain-HTTP door for the local node-agent.
@@ -396,7 +431,8 @@ impl ServeStartCmd {
             std_listener
                 .set_nonblocking(true)
                 .map_err(smolvm::error::Error::Io)?;
-            let local_app = app.clone();
+            // `local_app` (restricted: liveness/capacity/metrics) is moved in here;
+            // it deliberately does NOT carry the /api/v1 machine/file/exec routes.
             tracing::info!(address = %local_addr, "starting loopback HTTP door (local node-agent, isolated runtime)");
             println!(
                 "smolvm local API (loopback, plain) on http://{}",

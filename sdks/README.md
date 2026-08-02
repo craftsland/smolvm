@@ -1,15 +1,17 @@
-# SmolVM Embedded SDKs
+# SmolVM SDKs
 
 ## Overview
 
-This directory holds language bindings that embed `smolvm` directly into the
-host process instead of talking to the API server.
+This directory holds language bindings for smolvm's embedded runtime and stable
+service APIs.
 
 Layout convention:
 
 - `sdks/scripts/` contains shared helpers used by all embedded SDKs.
 - `sdks/node/` contains the Node.js embedded SDK and its internal platform
   packages.
+- `sdks/python/` contains the dependency-free fused rollout API client used by
+  training frameworks.
 - Future embedded SDKs should live in sibling directories such as `sdks/go/`, and `sdks/c/`.
 
 Bundled native library rule:

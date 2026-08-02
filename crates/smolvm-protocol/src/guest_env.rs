@@ -23,6 +23,30 @@ pub const VALUE_ON: &str = "1";
 /// This is a boolean sentinel — the value is [`VALUE_ON`] when set.
 pub const GPU: &str = "SMOLVM_GPU";
 
+/// Env var the host sets on guest init when CUDA-over-vsock is available.
+///
+/// The guest agent uses it to stage the bundled CUDA shims into workload
+/// containers and the runtime shim uses it to enable guest-RAM zero-copy.
+pub const CUDA_ZEROCOPY: &str = "SMOLVM_CUDA_ZEROCOPY";
+
+/// The VM was started as a live-fork golden.
+///
+/// The guest agent uses this to expose the workload-facing forkpoint helper.
+/// Fork clones inherit the already-running helper from the golden snapshot.
+pub const FORKABLE: &str = "SMOLVM_FORKABLE";
+
+/// Planned CUDA fork-pool size passed to the guest agent.
+///
+/// The agent uses this to select fork-friendly workload defaults only when a
+/// pool was explicitly declared; ordinary CUDA machines are unaffected.
+pub const CUDA_FORK_POOL_SIZE: &str = "SMOLVM_CUDA_FORK_POOL_SIZE";
+
+/// Workload override for automatic PyTorch expandable segments.
+///
+/// A declared CUDA fork pool enables the policy by default. Setting this to
+/// `0`, `false`, `off`, or `no` in the workload environment disables it.
+pub const CUDA_EXPANDABLE_SEGMENTS: &str = "SMOLVM_CUDA_EXPANDABLE_SEGMENTS";
+
 /// Env var the host sets on guest init to signal Rosetta 2 x86_64 translation
 /// was requested (and is available on the host).
 ///

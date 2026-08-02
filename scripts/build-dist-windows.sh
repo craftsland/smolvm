@@ -101,7 +101,8 @@ echo "Agent rootfs tarball: $(du -h "$DIST_DIR/agent-rootfs.tar.gz" | cut -f1)"
 # per-machine copy to the requested virtual size itself (copy_disk_from_template
 # marks the copy sparse and set_lens it; the guest grows the ext4 with resize2fs
 # at boot), so nothing on Windows needs a pre-extended template. The Linux/macOS
-# tarballs keep full-size templates via GNU tar --sparse (see build-dist.sh).
+# tarballs keep full-size templates, shipped zstd-compressed and expanded back
+# to a sparse file on first use (see build-dist.sh).
 if command -v mkfs.ext4 >/dev/null 2>&1; then
     echo "Creating disk templates..."
     make_template() { # $1=path $2=label
