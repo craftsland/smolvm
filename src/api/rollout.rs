@@ -87,6 +87,8 @@ pub struct RolloutExecutorInfo {
     pub active_requests: u32,
     /// Requests currently waiting for an execution permit.
     pub queued_requests: u32,
+    /// Whether the executor accepts new publication and generation work.
+    pub accepting: bool,
     /// Published policy versions currently routable.
     pub policies: Vec<RolloutPolicyInfo>,
     /// Backend capabilities understood by the stable API.
@@ -126,6 +128,8 @@ pub struct RolloutPolicyInfo {
     pub current: bool,
     /// Requests using this version right now.
     pub active_requests: u32,
+    /// Whether this version is draining before backend unload.
+    pub retiring: bool,
 }
 
 /// One text or pre-tokenized prompt.
@@ -370,7 +374,9 @@ struct PolicyEntry {
     adapter_sha256: String,
     backend_model: String,
     active: AtomicUsize,
+    retiring: AtomicBool,
     drained: Notify,
+    retirement: Mutex<()>,
 }
 
 struct PolicyGuard {
@@ -462,11 +468,25 @@ impl RolloutRegistry {
 
     /// Remove an executor and retire its loaded adapters.
     pub(crate) async fn delete(&self, name: &str) -> Result<(), RolloutError> {
-        let executor = self.executors.write().await.remove(name).ok_or_else(|| {
-            RolloutError::NotFound(format!("rollout executor '{name}' not found"))
-        })?;
+        let executor = self
+            .executors
+            .read()
+            .await
+            .get(name)
+            .cloned()
+            .ok_or_else(|| {
+                RolloutError::NotFound(format!("rollout executor '{name}' not found"))
+            })?;
         executor.accepting.store(false, Ordering::Release);
-        executor.shutdown().await
+        executor.shutdown().await?;
+        let mut executors = self.executors.write().await;
+        if executors
+            .get(name)
+            .is_some_and(|current| Arc::ptr_eq(current, &executor))
+        {
+            executors.remove(name);
+        }
+        Ok(())
     }
 }
 
@@ -582,6 +602,7 @@ impl RolloutExecutor {
                 backend_model: entry.backend_model.clone(),
                 current: state.current.get(&entry.policy) == Some(&entry.version),
                 active_requests: entry.active.load(Ordering::Acquire) as u32,
+                retiring: entry.retiring.load(Ordering::Acquire),
             })
             .collect();
         policies.sort_by(|a, b| (&a.policy, &a.version).cmp(&(&b.policy, &b.version)));
@@ -595,6 +616,7 @@ impl RolloutExecutor {
             max_queue_depth: self.config.max_queue_depth,
             active_requests: self.active.load(Ordering::Acquire),
             queued_requests: self.queued.load(Ordering::Acquire),
+            accepting: self.accepting.load(Ordering::Acquire),
             policies,
             capabilities: vec![
                 "multi_lora".into(),
@@ -615,6 +637,12 @@ impl RolloutExecutor {
         validate_name("version", &request.version)?;
         validate_sha256(&request.adapter_sha256)?;
         let _publish = self.publish_lock.lock().await;
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(RolloutError::Unavailable(format!(
+                "rollout executor '{}' is draining",
+                self.config.name
+            )));
+        }
         {
             let state = self.policy_state.read().await;
             if let Some(existing) = state
@@ -627,6 +655,12 @@ impl RolloutExecutor {
                         request.policy, request.version
                     )));
                 }
+                if existing.retiring.load(Ordering::Acquire) {
+                    return Err(RolloutError::Unavailable(format!(
+                        "policy '{}:{}' is retiring",
+                        request.policy, request.version
+                    )));
+                }
                 return Ok(RolloutPolicyInfo {
                     policy: existing.policy.clone(),
                     version: existing.version.clone(),
@@ -634,6 +668,7 @@ impl RolloutExecutor {
                     backend_model: existing.backend_model.clone(),
                     current: state.current.get(&existing.policy) == Some(&existing.version),
                     active_requests: existing.active.load(Ordering::Acquire) as u32,
+                    retiring: false,
                 });
             }
             if state.versions.len() >= MAX_POLICY_VERSIONS {
@@ -668,7 +703,9 @@ impl RolloutExecutor {
             adapter_sha256: request.adapter_sha256,
             backend_model: backend_model.clone(),
             active: AtomicUsize::new(0),
+            retiring: AtomicBool::new(false),
             drained: Notify::new(),
+            retirement: Mutex::new(()),
         });
         let previous = {
             let mut state = self.policy_state.write().await;
@@ -686,7 +723,11 @@ impl RolloutExecutor {
                     if version == request.version {
                         None
                     } else {
-                        state.versions.remove(&(request.policy.clone(), version))
+                        state
+                            .versions
+                            .get(&(request.policy.clone(), version))
+                            .cloned()
+                            .inspect(|entry| entry.retiring.store(true, Ordering::Release))
                     }
                 })
             }
@@ -694,7 +735,7 @@ impl RolloutExecutor {
         if let Some(previous) = previous {
             let executor = self.clone();
             tokio::spawn(async move {
-                if let Err(error) = executor.retire_entry(previous).await {
+                if let Err(error) = executor.retire_tracked_entry(previous).await {
                     tracing::warn!(
                         executor = %executor.config.name,
                         error = %error.message(),
@@ -711,6 +752,7 @@ impl RolloutExecutor {
             backend_model,
             current: true,
             active_requests: 0,
+            retiring: false,
         })
     }
 
@@ -724,18 +766,35 @@ impl RolloutExecutor {
         let entry = {
             let mut state = self.policy_state.write().await;
             let key = (policy.to_string(), version.to_string());
-            let entry = state.versions.remove(&key).ok_or_else(|| {
+            let entry = state.versions.get(&key).cloned().ok_or_else(|| {
                 RolloutError::NotFound(format!("policy '{policy}:{version}' not found"))
             })?;
-            if state.current.get(policy) == Some(&version.to_string()) {
+            entry.retiring.store(true, Ordering::Release);
+            if state
+                .current
+                .get(policy)
+                .is_some_and(|value| value == version)
+            {
                 state.current.remove(policy);
             }
             entry
         };
-        self.retire_entry(entry).await
+        self.retire_tracked_entry(entry).await
     }
 
-    async fn retire_entry(&self, entry: Arc<PolicyEntry>) -> Result<(), RolloutError> {
+    async fn retire_tracked_entry(&self, entry: Arc<PolicyEntry>) -> Result<(), RolloutError> {
+        let _retirement = entry.retirement.lock().await;
+        {
+            let state = self.policy_state.read().await;
+            let key = (entry.policy.clone(), entry.version.clone());
+            if !state
+                .versions
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, &entry))
+            {
+                return Ok(());
+            }
+        }
         loop {
             let notified = entry.drained.notified();
             tokio::pin!(notified);
@@ -745,22 +804,37 @@ impl RolloutExecutor {
             }
             notified.await;
         }
-        self.unload_adapter(&entry.backend_model).await
+        self.unload_adapter(&entry.backend_model).await?;
+        let mut state = self.policy_state.write().await;
+        let key = (entry.policy.clone(), entry.version.clone());
+        if state
+            .versions
+            .get(&key)
+            .is_some_and(|current| Arc::ptr_eq(current, &entry))
+        {
+            state.versions.remove(&key);
+        }
+        Ok(())
     }
 
     async fn shutdown(&self) -> Result<(), RolloutError> {
+        // Wait for a publication already in flight, then prevent any later
+        // publication from inserting an adapter after this snapshot.
+        let _publish = self.publish_lock.lock().await;
         let entries = {
             let mut state = self.policy_state.write().await;
             state.current.clear();
             state
                 .versions
-                .drain()
-                .map(|(_, value)| value)
+                .values()
+                .inspect(|entry| entry.retiring.store(true, Ordering::Release))
+                .cloned()
                 .collect::<Vec<_>>()
         };
+        drop(_publish);
         let mut first = None;
         for entry in entries {
-            if let Err(error) = self.retire_entry(entry).await {
+            if let Err(error) = self.retire_tracked_entry(entry).await {
                 first.get_or_insert(error);
             }
         }
@@ -1010,6 +1084,11 @@ impl RolloutExecutor {
             .ok_or_else(|| {
                 RolloutError::NotFound(format!("policy '{policy}:{version}' not found"))
             })?;
+        if entry.retiring.load(Ordering::Acquire) {
+            return Err(RolloutError::Unavailable(format!(
+                "policy '{policy}:{version}' is retiring"
+            )));
+        }
         entry.active.fetch_add(1, Ordering::AcqRel);
         Ok(entry)
     }
@@ -1449,6 +1528,10 @@ mod tests {
     struct MockBackend {
         loads: Mutex<Vec<serde_json::Value>>,
         unloads: Mutex<Vec<serde_json::Value>>,
+        block_load: AtomicBool,
+        load_started: Notify,
+        release_load: Notify,
+        unload_failures: AtomicUsize,
         generations: AtomicUsize,
     }
 
@@ -1461,6 +1544,10 @@ mod tests {
             Json(body): Json<serde_json::Value>,
         ) -> StatusCode {
             state.loads.lock().await.push(body);
+            if state.block_load.load(Ordering::Acquire) {
+                state.load_started.notify_one();
+                state.release_load.notified().await;
+            }
             StatusCode::OK
         }
         async fn unload(
@@ -1468,7 +1555,17 @@ mod tests {
             Json(body): Json<serde_json::Value>,
         ) -> StatusCode {
             state.unloads.lock().await.push(body);
-            StatusCode::OK
+            if state
+                .unload_failures
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                StatusCode::OK
+            }
         }
         async fn completion(
             State(state): State<Arc<MockBackend>>,
@@ -1548,6 +1645,43 @@ mod tests {
         }
     }
 
+    async fn create_published_executor(
+        address: SocketAddr,
+    ) -> (RolloutRegistry, Arc<RolloutExecutor>, tempfile::TempDir) {
+        let root = tempfile::tempdir().unwrap();
+        let adapter = root.path().join("adapter-v1");
+        std::fs::create_dir(&adapter).unwrap();
+        std::fs::write(adapter.join("adapter_config.json"), b"{}").unwrap();
+        std::fs::write(adapter.join("adapter_model.safetensors"), b"weights").unwrap();
+        let digest = hash_adapter_dir(&adapter).unwrap();
+        let registry = RolloutRegistry::default();
+        registry
+            .create(CreateRolloutExecutorRequest {
+                name: "fused".into(),
+                backend: "vllm".into(),
+                endpoint: format!("http://{address}"),
+                adapter_root: root.path().display().to_string(),
+                fallback_pool: None,
+                max_concurrent_requests: Some(2),
+                max_queue_depth: Some(2),
+                request_timeout_secs: Some(5),
+            })
+            .await
+            .unwrap();
+        let executor = registry.get("fused").await.unwrap();
+        executor
+            .publish_policy(PublishRolloutPolicyRequest {
+                policy: "policy".into(),
+                version: "step-1".into(),
+                adapter_path: "adapter-v1".into(),
+                adapter_sha256: digest,
+                retain_previous: false,
+            })
+            .await
+            .unwrap();
+        (registry, executor, root)
+    }
+
     #[tokio::test]
     async fn publish_generate_retry_and_retire_are_end_to_end_safe() {
         let (address, backend, server) = start_mock_backend().await;
@@ -1612,6 +1746,126 @@ mod tests {
         executor.retire_policy("policy", "step-1").await.unwrap();
         assert_eq!(backend.unloads.lock().await.len(), 1);
         registry.delete("fused").await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_policy_unload_stays_tracked_and_can_be_retried() {
+        let (address, backend, server) = start_mock_backend().await;
+        let (_registry, executor, _root) = create_published_executor(address).await;
+        backend.unload_failures.store(1, Ordering::Release);
+
+        assert!(matches!(
+            executor.retire_policy("policy", "step-1").await,
+            Err(RolloutError::Backend(_))
+        ));
+        let info = executor.info().await;
+        assert_eq!(info.policies.len(), 1);
+        assert!(info.policies[0].retiring);
+        assert!(!info.policies[0].current);
+
+        let mut explicit = sample_generate("request-after-retire");
+        explicit.version = Some("step-1".into());
+        assert!(matches!(
+            executor.generate(explicit).await,
+            Err(RolloutError::Unavailable(_))
+        ));
+
+        executor.retire_policy("policy", "step-1").await.unwrap();
+        assert!(executor.info().await.policies.is_empty());
+        assert_eq!(backend.unloads.lock().await.len(), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_executor_shutdown_stays_registered_and_can_be_retried() {
+        let (address, backend, server) = start_mock_backend().await;
+        let (registry, executor, _root) = create_published_executor(address).await;
+        backend.unload_failures.store(1, Ordering::Release);
+
+        assert!(matches!(
+            registry.delete("fused").await,
+            Err(RolloutError::Backend(_))
+        ));
+        let retained = registry.get("fused").await.unwrap();
+        assert!(Arc::ptr_eq(&retained, &executor));
+        let info = retained.info().await;
+        assert!(!info.accepting);
+        assert_eq!(info.policies.len(), 1);
+        assert!(info.policies[0].retiring);
+        assert!(matches!(
+            retained
+                .generate(sample_generate("request-after-shutdown"))
+                .await,
+            Err(RolloutError::Unavailable(_))
+        ));
+
+        registry.delete("fused").await.unwrap();
+        assert!(matches!(
+            registry.get("fused").await,
+            Err(RolloutError::NotFound(_))
+        ));
+        assert_eq!(backend.unloads.lock().await.len(), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_inflight_publication_and_unloads_it() {
+        let (address, backend, server) = start_mock_backend().await;
+        let root = tempfile::tempdir().unwrap();
+        let adapter = root.path().join("adapter-v1");
+        std::fs::create_dir(&adapter).unwrap();
+        std::fs::write(adapter.join("adapter_config.json"), b"{}").unwrap();
+        std::fs::write(adapter.join("adapter_model.safetensors"), b"weights").unwrap();
+        let digest = hash_adapter_dir(&adapter).unwrap();
+        let registry = Arc::new(RolloutRegistry::default());
+        registry
+            .create(CreateRolloutExecutorRequest {
+                name: "fused".into(),
+                backend: "vllm".into(),
+                endpoint: format!("http://{address}"),
+                adapter_root: root.path().display().to_string(),
+                fallback_pool: None,
+                max_concurrent_requests: Some(2),
+                max_queue_depth: Some(2),
+                request_timeout_secs: Some(5),
+            })
+            .await
+            .unwrap();
+        let executor = registry.get("fused").await.unwrap();
+        let observer = executor.clone();
+        backend.block_load.store(true, Ordering::Release);
+
+        let publication = tokio::spawn(async move {
+            executor
+                .publish_policy(PublishRolloutPolicyRequest {
+                    policy: "policy".into(),
+                    version: "step-1".into(),
+                    adapter_path: "adapter-v1".into(),
+                    adapter_sha256: digest,
+                    retain_previous: false,
+                })
+                .await
+        });
+        backend.load_started.notified().await;
+        let registry_for_delete = registry.clone();
+        let deletion = tokio::spawn(async move { registry_for_delete.delete("fused").await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while observer.accepting.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        backend.release_load.notify_one();
+
+        publication.await.unwrap().unwrap();
+        deletion.await.unwrap().unwrap();
+        assert_eq!(backend.unloads.lock().await.len(), 1);
+        assert!(matches!(
+            registry.get("fused").await,
+            Err(RolloutError::NotFound(_))
+        ));
         server.abort();
     }
 
