@@ -1376,10 +1376,13 @@ pub(crate) async fn fork_machine_inner(
         state,
         clone,
         prep,
-        req_share_weights,
-        fork_env,
-        wait_ready,
-        req_hold,
+        PreparedForkBoot {
+            share_weights: req_share_weights,
+            fork_env,
+            wait_ready,
+            hold: req_hold,
+            cuda_worker_ready_timeout: None,
+        },
     )
     .await
 }
@@ -1477,10 +1480,13 @@ pub(crate) async fn fork_held_machines_inner(
                 state,
                 clone.clone(),
                 prep,
-                share_weights,
-                Vec::new(),
-                true,
-                true,
+                PreparedForkBoot {
+                    share_weights,
+                    fork_env: Vec::new(),
+                    wait_ready: true,
+                    hold: true,
+                    cuda_worker_ready_timeout: Some(ready_timeout),
+                },
             )
             .await;
             (clone, result)
@@ -1531,15 +1537,27 @@ where
     any_succeeded
 }
 
-async fn boot_prepared_fork_inner(
-    state: Arc<ApiState>,
-    clone: String,
-    prep: crate::agent::fork::PreparedFork,
+struct PreparedForkBoot {
     share_weights: bool,
     fork_env: Vec<(String, String)>,
     wait_ready: bool,
     hold: bool,
+    cuda_worker_ready_timeout: Option<std::time::Duration>,
+}
+
+async fn boot_prepared_fork_inner(
+    state: Arc<ApiState>,
+    clone: String,
+    prep: crate::agent::fork::PreparedFork,
+    boot: PreparedForkBoot,
 ) -> Result<MachineInfo, ApiError> {
+    let PreparedForkBoot {
+        share_weights,
+        fork_env,
+        wait_ready,
+        hold,
+        cuda_worker_ready_timeout,
+    } = boot;
     // Phase 2: boot the clone from the golden's in-memory snapshot (warm — its
     // processes are already running in the restored RAM, so unlike a cold start
     // there is no image workload to launch), then rejuvenate its identity.
@@ -1575,6 +1593,31 @@ async fn boot_prepared_fork_inner(
             return Err(format!("failed to boot clone: {}", e));
         }
 
+        let pid = manager.child_pid();
+        if record.cuda
+            && cuda_worker_ready_timeout.is_some()
+            && std::env::var_os("SMOLVM_CUDA_DAEMON").is_none()
+            && std::env::var("SMOLVM_CUDA_WARM_DIAL").as_deref() != Ok("0")
+        {
+            let worker_ready = pid
+                .and_then(|pid| process_start_time(pid).map(|started| (pid, started)))
+                .ok_or_else(|| "clone process identity unavailable for CUDA readiness".to_string())
+                .and_then(|(pid, started)| {
+                    crate::cuda_daemon::wait_for_clone_worker_ready(
+                        pid,
+                        started,
+                        cuda_worker_ready_timeout.expect("checked above"),
+                    )
+                    .map_err(|error| error.to_string())
+                });
+            if let Err(error) = worker_ready {
+                manager.kill();
+                manager.cleanup_data_dir();
+                let _ = db.remove_vm(&clone_b);
+                return Err(format!("CUDA clone worker readiness failed: {error}"));
+            }
+        }
+
         // Give the clone a fresh on-disk identity (hostname, machine-id, SSH
         // host keys, RNG) so it does not carry the golden's per-machine secrets
         // into a (possibly different) tenant. FAIL-CLOSED: if the reset can't be
@@ -1605,7 +1648,6 @@ async fn boot_prepared_fork_inner(
             .map_err(|e| format!("forkpoint release failed: {e}"))?;
         }
 
-        let pid = manager.child_pid();
         Ok::<_, String>((manager, pid, record))
     })
     .await

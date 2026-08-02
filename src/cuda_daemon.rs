@@ -32,6 +32,154 @@ pub fn socket_path() -> PathBuf {
     root.join("cuda-daemon.sock")
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloneWorkerStatus {
+    Ready,
+    Failed,
+}
+
+fn clone_worker_status_path(vm_pid: u32) -> PathBuf {
+    socket_path()
+        .parent()
+        .unwrap_or_else(|| Path::new("/tmp"))
+        .join("cuda-worker-ready")
+        .join(vm_pid.to_string())
+}
+
+fn encode_clone_worker_status(start_time: u64, status: CloneWorkerStatus) -> String {
+    let status = match status {
+        CloneWorkerStatus::Ready => "ready",
+        CloneWorkerStatus::Failed => "failed",
+    };
+    format!("{start_time} {status}\n")
+}
+
+fn decode_clone_worker_status(value: &str) -> Option<(u64, CloneWorkerStatus)> {
+    let mut fields = value.split_whitespace();
+    let start_time = fields.next()?.parse().ok()?;
+    let status = match fields.next()? {
+        "ready" => CloneWorkerStatus::Ready,
+        "failed" => CloneWorkerStatus::Failed,
+        _ => return None,
+    };
+    fields.next().is_none().then_some((start_time, status))
+}
+
+fn publish_clone_worker_status(vm_pid: u32, status: CloneWorkerStatus) -> io::Result<()> {
+    let start_time = crate::process::process_start_time(vm_pid as i32).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("clone VM process {vm_pid} exited before CUDA worker readiness"),
+        )
+    })?;
+    let path = clone_worker_status_path(vm_pid);
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("CUDA worker status path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(".{vm_pid}.{}.tmp", std::process::id()));
+    std::fs::write(&temporary, encode_clone_worker_status(start_time, status))?;
+    if let Err(error) = std::fs::rename(&temporary, &path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn prune_dead_clone_worker_statuses() {
+    let Some(directory) = clone_worker_status_path(0).parent().map(Path::to_path_buf) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Publication uses a same-directory temporary file so rename is
+        // atomic. Do not race that write: only reap a stranded temporary after
+        // it is far older than the sub-millisecond publication window.
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with('.'))
+        {
+            let stale = entry
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age >= Duration::from_secs(60));
+            if stale {
+                let _ = std::fs::remove_file(path);
+            }
+            continue;
+        }
+        let live = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<i32>().ok())
+            .zip(
+                std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|value| decode_clone_worker_status(&value))
+                    .map(|(started, _)| started),
+            )
+            .is_some_and(|(pid, started)| {
+                crate::process::is_our_process_strict(pid, Some(started))
+            });
+        if !live {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+pub(crate) fn wait_for_clone_worker_ready(
+    vm_pid: i32,
+    vm_start_time: u64,
+    timeout: Duration,
+) -> io::Result<()> {
+    let vm_pid_u32 = u32::try_from(vm_pid)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid clone VM pid"))?;
+    let path = clone_worker_status_path(vm_pid_u32);
+    let deadline = Instant::now() + timeout;
+    loop {
+        match std::fs::read_to_string(&path) {
+            Ok(value) => {
+                if let Some((start_time, status)) = decode_clone_worker_status(&value) {
+                    if start_time == vm_start_time {
+                        let _ = std::fs::remove_file(&path);
+                        return match status {
+                            CloneWorkerStatus::Ready => Ok(()),
+                            CloneWorkerStatus::Failed => Err(io::Error::other(
+                                "CUDA clone worker failed during reconstruction",
+                            )),
+                        };
+                    }
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        if !crate::process::is_our_process_strict(vm_pid, Some(vm_start_time)) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "clone VM exited before its CUDA worker became ready",
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "CUDA clone worker did not become ready within {}s",
+                    timeout.as_secs()
+                ),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 const TENSOR_PUBLISH_MAGIC: [u8; 4] = *b"TBP1";
 const TENSOR_CONSUME_MAGIC: [u8; 4] = *b"TBC1";
 const TENSOR_RESPONSE_MAGIC: [u8; 4] = *b"TBR1";
@@ -874,6 +1022,7 @@ fn spawn_child_reaper() {
             // Long-lived daemons use IDLE_SECS=0, but their completed fork
             // lineages must still release retained descriptors and metadata.
             prune_dead_metadata_layout_waiters();
+            prune_dead_clone_worker_statuses();
             let _ = live_clone_worker_count();
             let _ = live_host_snapshot_count();
             thread::sleep(Duration::from_secs(2));
@@ -1595,6 +1744,51 @@ type CloneChannelSeed = (
     Vec<(u64, u64, u64)>,
 );
 
+struct CloneWorkerReadiness {
+    vm_pid: Option<u32>,
+    published: bool,
+}
+
+impl CloneWorkerReadiness {
+    fn new(vm_pid: Option<u32>) -> Self {
+        Self {
+            vm_pid,
+            published: false,
+        }
+    }
+
+    fn publish_ready(&mut self) {
+        let Some(vm_pid) = self.vm_pid else {
+            return;
+        };
+        match publish_clone_worker_status(vm_pid, CloneWorkerStatus::Ready) {
+            Ok(()) => self.published = true,
+            Err(error) => {
+                tracing::warn!(vm_pid, %error, "failed to publish CUDA clone-worker readiness")
+            }
+        }
+    }
+}
+
+impl Drop for CloneWorkerReadiness {
+    fn drop(&mut self) {
+        let Some(vm_pid) = self.vm_pid else {
+            return;
+        };
+        let path = clone_worker_status_path(vm_pid);
+        if self.published && !path.exists() {
+            return;
+        }
+        if self.published && crate::process::process_start_time(vm_pid as i32).is_none() {
+            let _ = std::fs::remove_file(path);
+            return;
+        }
+        if let Err(error) = publish_clone_worker_status(vm_pid, CloneWorkerStatus::Failed) {
+            tracing::debug!(vm_pid, %error, "failed to publish CUDA clone-worker failure");
+        }
+    }
+}
+
 /// Path 3 (M1): serve one isolating fork-clone connection in THIS separate worker
 /// process. A per-clone process has its own CUDA primary context and thus its own
 /// UVA space, so it can place memory at the golden's exact virtual addresses
@@ -1607,6 +1801,9 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
     install_crash_handler("cuda-clone-worker");
     // File-ring transport (per-worker: one worker == one clone VM == one dir).
     smolvm_cuda::host::ring_dir_set(std::env::var("SMOLVM_CUDA_CLONE_RING_DIR").ok());
+    let clone_procmem = procmem_from_env();
+    let clone_vm_pid = clone_procmem.as_ref().map(|(pid, _)| *pid);
+    let mut readiness = CloneWorkerReadiness::new(clone_vm_pid);
     let mut backend = make_backend();
     // Our own primary context (separate process ⇒ own UVA), so we can place memory
     // at the golden's exact VAs.
@@ -1649,8 +1846,6 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
     // Clone transport: consume the proc-mem advert (SMVGPVM1) the clone proxy
     // sent right after its clone preamble, so D2H/H2D reach the clone's LIVE
     // guest RAM via /proc/<pid>/mem instead of the ring-copy fallback.
-    let clone_procmem = procmem_from_env();
-    let clone_vm_pid = clone_procmem.as_ref().map(|(pid, _)| *pid);
     if let Some((pid, regions)) = clone_procmem {
         let n = regions.len();
         if regions.is_empty() {
@@ -1819,6 +2014,7 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
     } else {
         None
     };
+    readiness.publish_ready();
     // The handed-off connection may be a local UDS (VM on this host) or a TCP
     // socket (remote client driving this GPU host) — wrap by actual domain.
     // (getsockname is portable unix; SO_DOMAIN would be Linux-only.)
@@ -3728,6 +3924,11 @@ fn route_clone_connection(
         }
         let tokens = smolvm_cuda::host::layout_tokens();
         if tokens.is_empty() {
+            if let Some((vm_pid, _)) = procmem.as_ref() {
+                if let Err(error) = publish_clone_worker_status(*vm_pid, CloneWorkerStatus::Ready) {
+                    tracing::warn!(vm_pid, %error, "failed to publish empty CUDA clone readiness");
+                }
+            }
             tracing::info!(
                 clone_id,
                 "warm dial: no golden process layouts yet; deferring spawn to first real channel"
@@ -3748,6 +3949,15 @@ fn route_clone_connection(
             }
         }
         let [token] = memory_tokens.as_slice() else {
+            if memory_tokens.is_empty() {
+                if let Some((vm_pid, _)) = procmem.as_ref() {
+                    if let Err(error) =
+                        publish_clone_worker_status(*vm_pid, CloneWorkerStatus::Ready)
+                    {
+                        tracing::warn!(vm_pid, %error, "failed to publish metadata-only CUDA clone readiness");
+                    }
+                }
+            }
             tracing::info!(
                 clone_id,
                 layouts = memory_tokens.len(),
@@ -3776,6 +3986,9 @@ fn route_clone_connection(
                 true
             }
             Err(e) => {
+                if let Some((vm_pid, _)) = procmem.as_ref() {
+                    let _ = publish_clone_worker_status(*vm_pid, CloneWorkerStatus::Failed);
+                }
                 tracing::warn!(error = %e, token, clone_id, "warm dial: process worker spawn failed");
                 true
             }
@@ -3948,6 +4161,9 @@ fn route_clone_connection(
             maybe_evict_frozen_golden(token, options, &reg);
         }
         Err(e) => {
+            if let Some((vm_pid, _)) = procmem.as_ref() {
+                let _ = publish_clone_worker_status(*vm_pid, CloneWorkerStatus::Failed);
+            }
             // REJECT rather than serve in-process: this IS an isolating clone
             // (preamble matched), and the legacy shared path can't serve it —
             // its inherited pointers are garbage in a fresh context, so the
@@ -5798,8 +6014,9 @@ mod mps_tests {
         clone_worker_idle_timeout_from, clone_worker_share_env, clone_worker_spawn_pace,
         clone_worker_vm_is_alive, consume_procmem_preamble, create_host_snapshot_memfd,
         create_private_mps_paths, daemon_has_live_cuda_clients, decode_attach_procmem,
-        disabled_worker_route, encode_attach_procmem, fork_snapshot_enabled,
-        golden_eviction_enabled, host_snapshot_fits, host_snapshot_reconstructable, lift_owned_fds,
+        decode_clone_worker_status, disabled_worker_route, encode_attach_procmem,
+        encode_clone_worker_status, fork_snapshot_enabled, golden_eviction_enabled,
+        host_snapshot_fits, host_snapshot_reconstructable, lift_owned_fds,
         live_host_snapshot_count, map_module_blob_fd, mps_enabled, ordinary_regions_are_reserved,
         posix_spawn_clone_worker, prepare_module_blob, prepare_streamed_module_blob,
         range_is_reserved, read_host_snapshot, reconstruct_golden_modules, recv_fd,
@@ -5807,7 +6024,7 @@ mod mps_tests {
         send_tensor_bundle_to_parent, serve_tensor_bundle_consumer,
         spawn_clone_attach_listener_with_timeout, spawn_tensor_bundle_receiver,
         unique_live_clone_worker, validate_tensor_bundle_metadata, write_module_handoff,
-        CloneWorkerSpawnFds, TENSOR_CONSUME_MAGIC,
+        CloneWorkerSpawnFds, CloneWorkerStatus, TENSOR_CONSUME_MAGIC,
     };
     use std::collections::HashMap;
     use std::io::{self, Write};
@@ -6563,6 +6780,17 @@ mod mps_tests {
         assert_eq!(clone_worker_share_env(true, Some("false")), Some("0"));
         assert_eq!(clone_worker_share_env(true, Some("off")), Some("0"));
         assert_eq!(clone_worker_share_env(false, None), None);
+    }
+
+    #[test]
+    fn clone_worker_status_round_trips_and_rejects_ambiguous_records() {
+        for status in [CloneWorkerStatus::Ready, CloneWorkerStatus::Failed] {
+            let encoded = encode_clone_worker_status(42, status);
+            assert_eq!(decode_clone_worker_status(&encoded), Some((42, status)));
+        }
+        assert_eq!(decode_clone_worker_status("42 ready trailing"), None);
+        assert_eq!(decode_clone_worker_status("42 unknown"), None);
+        assert_eq!(decode_clone_worker_status("ready"), None);
     }
 
     #[test]
