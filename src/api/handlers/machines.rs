@@ -1388,17 +1388,34 @@ pub(crate) async fn fork_machine_inner(
 /// through a bounded queue. Preparation is all-or-nothing; once booting begins,
 /// each result is reported as soon as it completes so successful workers can be
 /// leased while the remainder of the batch is still restoring.
+pub(crate) struct ForkBatchOutcome {
+    pub retained_snapshot: Option<crate::agent::fork::RetainedForkSnapshot>,
+}
+
+pub(crate) struct ForkHeldBatch {
+    pub golden: String,
+    pub clones: Vec<String>,
+    pub share_weights: bool,
+    pub ready_timeout: std::time::Duration,
+    pub retained_snapshot: Option<crate::agent::fork::RetainedForkSnapshot>,
+    pub max_parallel: usize,
+}
+
 pub(crate) async fn fork_held_machines_inner(
     state: Arc<ApiState>,
-    golden: String,
-    clones: Vec<String>,
-    share_weights: bool,
-    ready_timeout: std::time::Duration,
-    max_parallel: usize,
+    batch: ForkHeldBatch,
     result_tx: UnboundedSender<(String, Result<MachineInfo, ApiError>)>,
-) -> Result<(), ApiError> {
+) -> Result<ForkBatchOutcome, ApiError> {
+    let ForkHeldBatch {
+        golden,
+        clones,
+        share_weights,
+        ready_timeout,
+        retained_snapshot,
+        max_parallel,
+    } = batch;
     if clones.is_empty() {
-        return Ok(());
+        return Ok(ForkBatchOutcome { retained_snapshot });
     }
 
     let golden_for_wait = golden.clone();
@@ -1437,16 +1454,23 @@ pub(crate) async fn fork_held_machines_inner(
                     hold: true,
                 })
                 .collect();
-            crate::agent::fork::prepare_forks(&db, &golden_for_prep, &specs)
+            crate::agent::fork::prepare_forks_reusing(
+                &db,
+                &golden_for_prep,
+                &specs,
+                retained_snapshot.as_ref(),
+            )
         })
         .await
         .map_err(|e| ApiError::internal(format!("task error: {e}")))?
         .map_err(classify_fork_error)?
     };
 
-    let snapshot_dir = prepared[0].snapshot_dir.clone();
-    let resume_golden_on_rollback = prepared[0].resume_golden_on_rollback;
-    let boots = prepared.into_iter().zip(clones).map(|(prep, clone)| {
+    let snapshot_dir = prepared.forks[0].snapshot_dir.clone();
+    let resume_golden_on_rollback = prepared.forks[0].resume_golden_on_rollback;
+    let snapshot_reused = prepared.snapshot_reused;
+    let reusable_snapshot = prepared.retained_snapshot;
+    let boots = prepared.forks.into_iter().zip(clones).map(|(prep, clone)| {
         let state = state.clone();
         async move {
             let result = boot_prepared_fork_inner(
@@ -1474,7 +1498,7 @@ pub(crate) async fn fork_held_machines_inner(
     // If every restore failed, no clone depends on this checkpoint and an
     // initially-running golden can safely resume for a later retry. A partial
     // success must retain the paused golden and shared snapshot.
-    if !any_succeeded {
+    if !any_succeeded && !snapshot_reused {
         if let Err(error) = std::fs::remove_dir_all(&snapshot_dir) {
             tracing::warn!(path = %snapshot_dir.display(), %error, "failed to remove unused batch fork snapshot");
         }
@@ -1486,7 +1510,9 @@ pub(crate) async fn fork_held_machines_inner(
     }
 
     drop(guards);
-    Ok(())
+    Ok(ForkBatchOutcome {
+        retained_snapshot: any_succeeded.then_some(reusable_snapshot).flatten(),
+    })
 }
 
 async fn run_bounded_futures<F, T>(

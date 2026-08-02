@@ -180,6 +180,30 @@ pub struct PreparedFork {
     pub resume_golden_on_rollback: bool,
 }
 
+/// A checkpoint that may be reused while the exact same golden process remains
+/// paused. The PID start time prevents an old on-disk checkpoint from being
+/// applied after a golden restart or PID reuse.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RetainedForkSnapshot {
+    /// Directory containing the libkrun checkpoint and memfd manifest.
+    pub(crate) path: PathBuf,
+    /// Host process that produced the checkpoint.
+    pub(crate) golden_pid: i32,
+    /// Kernel process start time paired with `golden_pid`.
+    pub(crate) golden_pid_start_time: u64,
+}
+
+/// Prepared batch plus the checkpoint identity that can service later refills.
+pub(crate) struct PreparedForkBatch {
+    /// Clones registered from one checkpoint.
+    pub(crate) forks: Vec<PreparedFork>,
+    /// Checkpoint bound to the current golden process, when its identity is
+    /// strong enough to reuse safely.
+    pub(crate) retained_snapshot: Option<RetainedForkSnapshot>,
+    /// Whether this call reused `retained_snapshot` instead of checkpointing.
+    pub(crate) snapshot_reused: bool,
+}
+
 /// Parameters for one clone in a single-snapshot fork operation.
 pub struct ForkSpec<'a> {
     /// New machine name.
@@ -263,6 +287,18 @@ pub fn prepare_forks(
     golden: &str,
     specs: &[ForkSpec<'_>],
 ) -> Result<Vec<PreparedFork>> {
+    Ok(prepare_forks_reusing(db, golden, specs, None)?.forks)
+}
+
+/// Prepare a batch while reusing a proven checkpoint when it still belongs to
+/// the exact paused golden process. Invalid or stale hints fall back to a fresh
+/// checkpoint; they can never cause a restore from a restarted golden.
+pub(crate) fn prepare_forks_reusing(
+    db: &SmolvmDb,
+    golden: &str,
+    specs: &[ForkSpec<'_>],
+    retained: Option<&RetainedForkSnapshot>,
+) -> Result<PreparedForkBatch> {
     if specs.is_empty() {
         return Err(Error::config("fork", "at least one clone is required"));
     }
@@ -333,48 +369,62 @@ pub fn prepare_forks(
     // Never remove a colliding random directory because a live clone may still
     // be using an older snapshot.
     let snapshot_root = gdir.join("s");
-    std::fs::create_dir_all(&snapshot_root)
-        .map_err(|e| Error::agent("create snapshot root", e.to_string()))?;
-    let snapshot_dir = (0..128)
-        .find_map(|_| {
-            let candidate = snapshot_root.join(host_random_hex(8));
-            match std::fs::create_dir(&candidate) {
-                Ok(()) => Some(Ok(candidate)),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
-                Err(error) => Some(Err(error)),
-            }
-        })
-        .transpose()
-        .map_err(|e| Error::agent("create snapshot dir", e.to_string()))?
-        .ok_or_else(|| Error::agent("create snapshot dir", "could not allocate a unique id"))?;
-    if let Some(result) =
-        crate::process::vm_drop_ids(&crate::agent::vm_uid_registry_dir(), &gdir, None, None)
-    {
-        let (uid, gid) =
-            result.map_err(|e| Error::agent("fork: resolve golden uid", e.to_string()))?;
-        crate::process::chown_tree(&snapshot_dir, uid, gid)
-            .map_err(|e| Error::agent("fork: chown snapshot dir", e.to_string()))?;
-    }
+    let reusable = retained.filter(|snapshot| {
+        retained_snapshot_is_reusable(&golden_rec, golden_was_paused, &snapshot_root, snapshot)
+    });
+    let (snapshot_dir, snapshot_reused) = if let Some(snapshot) = reusable {
+        tracing::info!(
+            golden,
+            path = %snapshot.path.display(),
+            clones = specs.len(),
+            "fork: reusing retained golden RAM checkpoint"
+        );
+        (snapshot.path.clone(), true)
+    } else {
+        std::fs::create_dir_all(&snapshot_root)
+            .map_err(|e| Error::agent("create snapshot root", e.to_string()))?;
+        let snapshot_dir = (0..128)
+            .find_map(|_| {
+                let candidate = snapshot_root.join(host_random_hex(8));
+                match std::fs::create_dir(&candidate) {
+                    Ok(()) => Some(Ok(candidate)),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .transpose()
+            .map_err(|e| Error::agent("create snapshot dir", e.to_string()))?
+            .ok_or_else(|| Error::agent("create snapshot dir", "could not allocate a unique id"))?;
+        if let Some(result) =
+            crate::process::vm_drop_ids(&crate::agent::vm_uid_registry_dir(), &gdir, None, None)
+        {
+            let (uid, gid) =
+                result.map_err(|e| Error::agent("fork: resolve golden uid", e.to_string()))?;
+            crate::process::chown_tree(&snapshot_dir, uid, gid)
+                .map_err(|e| Error::agent("fork: chown snapshot dir", e.to_string()))?;
+        }
 
-    let t_snap = std::time::Instant::now();
-    let reply = control_socket_cmd(&ctl, &format!("FORK {}", snapshot_dir.display()));
-    let reply = match reply {
-        Ok(reply) if reply.starts_with("OK") => reply,
-        Ok(reply) => {
-            let _ = std::fs::remove_dir_all(&snapshot_dir);
-            return Err(Error::agent("fork", format!("golden FORK failed: {reply}")));
-        }
-        Err(error) => {
-            let _ = std::fs::remove_dir_all(&snapshot_dir);
-            return Err(error);
-        }
+        let t_snap = std::time::Instant::now();
+        let reply = control_socket_cmd(&ctl, &format!("FORK {}", snapshot_dir.display()));
+        let reply = match reply {
+            Ok(reply) if reply.starts_with("OK") => reply,
+            Ok(reply) => {
+                let _ = std::fs::remove_dir_all(&snapshot_dir);
+                return Err(Error::agent("fork", format!("golden FORK failed: {reply}")));
+            }
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&snapshot_dir);
+                return Err(error);
+            }
+        };
+        tracing::info!(
+            elapsed_ms = t_snap.elapsed().as_millis() as u64,
+            clones = specs.len(),
+            response = %reply,
+            "fork: golden RAM checkpoint written"
+        );
+        (snapshot_dir, false)
     };
-    tracing::info!(
-        elapsed_ms = t_snap.elapsed().as_millis() as u64,
-        clones = specs.len(),
-        response = %reply,
-        "fork: golden RAM checkpoint written"
-    );
 
     let mut prepared = Vec::with_capacity(specs.len());
     for spec in specs {
@@ -396,7 +446,9 @@ pub fn prepare_forks(
                     let _ = db.remove_vm(&clone.clone_record.name);
                     let _ = std::fs::remove_dir_all(vm_data_dir(&clone.clone_record.name));
                 }
-                let _ = std::fs::remove_dir_all(&snapshot_dir);
+                if !snapshot_reused {
+                    let _ = std::fs::remove_dir_all(&snapshot_dir);
+                }
                 if golden_was_paused {
                     return Err(error);
                 }
@@ -412,7 +464,45 @@ pub fn prepare_forks(
             }
         }
     }
-    Ok(prepared)
+    let retained_snapshot =
+        golden_rec
+            .pid
+            .zip(golden_rec.pid_start_time)
+            .map(|(golden_pid, golden_pid_start_time)| RetainedForkSnapshot {
+                path: snapshot_dir,
+                golden_pid,
+                golden_pid_start_time,
+            });
+    Ok(PreparedForkBatch {
+        forks: prepared,
+        retained_snapshot,
+        snapshot_reused,
+    })
+}
+
+fn reusable_snapshot_path(snapshot_root: &Path, snapshot: &Path) -> bool {
+    snapshot.parent() == Some(snapshot_root)
+        && snapshot
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.len() == 8 && name.bytes().all(|b| b.is_ascii_hexdigit()))
+            .unwrap_or(false)
+        && snapshot
+            .symlink_metadata()
+            .map(|metadata| metadata.file_type().is_dir())
+            .unwrap_or(false)
+}
+
+fn retained_snapshot_is_reusable(
+    golden: &VmRecord,
+    golden_was_paused: bool,
+    snapshot_root: &Path,
+    snapshot: &RetainedForkSnapshot,
+) -> bool {
+    golden_was_paused
+        && golden.pid == Some(snapshot.golden_pid)
+        && golden.pid_start_time == Some(snapshot.golden_pid_start_time)
+        && reusable_snapshot_path(snapshot_root, &snapshot.path)
 }
 
 fn prepare_clone_from_snapshot(
@@ -1021,6 +1111,61 @@ mod tests {
         assert!(fork_base_already_paused("OK paused\n"));
         assert!(!fork_base_already_paused("OK running\n"));
         assert!(!fork_base_already_paused("ERR not forkable\n"));
+    }
+
+    #[test]
+    fn retained_snapshot_requires_the_same_paused_golden_process() {
+        let temp = tempfile::tempdir().unwrap();
+        let snapshot_root = temp.path().join("s");
+        let snapshot_path = snapshot_root.join("a1b2c3d4");
+        std::fs::create_dir_all(&snapshot_path).unwrap();
+        let snapshot = RetainedForkSnapshot {
+            path: snapshot_path,
+            golden_pid: 123,
+            golden_pid_start_time: 456,
+        };
+        let mut golden = VmRecord::new("golden".into(), 2, 1024, vec![], vec![], false);
+        golden.pid = Some(123);
+        golden.pid_start_time = Some(456);
+
+        assert!(retained_snapshot_is_reusable(
+            &golden,
+            true,
+            &snapshot_root,
+            &snapshot
+        ));
+        assert!(!retained_snapshot_is_reusable(
+            &golden,
+            false,
+            &snapshot_root,
+            &snapshot
+        ));
+        golden.pid_start_time = Some(457);
+        assert!(!retained_snapshot_is_reusable(
+            &golden,
+            true,
+            &snapshot_root,
+            &snapshot
+        ));
+    }
+
+    #[test]
+    fn retained_snapshot_path_must_be_a_direct_real_checkpoint_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let snapshot_root = temp.path().join("s");
+        std::fs::create_dir_all(&snapshot_root).unwrap();
+        let valid = snapshot_root.join("0123abcd");
+        std::fs::create_dir(&valid).unwrap();
+
+        assert!(reusable_snapshot_path(&snapshot_root, &valid));
+        assert!(!reusable_snapshot_path(
+            &snapshot_root,
+            &snapshot_root.join("short")
+        ));
+        assert!(!reusable_snapshot_path(
+            &snapshot_root,
+            &temp.path().join("0123abcd")
+        ));
     }
 
     #[test]
