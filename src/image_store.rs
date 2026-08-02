@@ -153,26 +153,57 @@ impl ImageStore {
 pub async fn authorized_digest(reference: &str, auth: &PullAuth) -> Result<String> {
     let parsed = Reference::parse(reference)
         .map_err(|e| Error::config("image-store", format!("bad reference: {}", e.reason)))?;
-    let repo = repo_path(&parsed);
     let want = parsed
         .digest
         .clone()
         .or_else(|| parsed.tag.clone())
         .unwrap_or_else(|| "latest".to_string());
-    let base_url = if smolvm_registry::is_local_registry(&parsed.registry) {
-        format!("http://{}", parsed.registry)
-    } else {
-        format!("https://{}", parsed.registry)
-    };
-    let client = auth.apply(smolvm_registry::RegistryClient::new(base_url));
-    let manifest_bytes = client
-        .get_manifest_resolved(&repo, &want)
-        .await
-        .map_err(|e| Error::agent("image-store: authorize", e.to_string()))?;
-    Ok(format!(
-        "sha256:{}",
-        hex::encode(Sha256::digest(&manifest_bytes))
+
+    // Resolve the registry the way the GUEST does — via `registry_pull_hosts`,
+    // not the configured default — so the host-side gate and the in-guest pull
+    // target the same registry. A bare `alpine` resolves to Docker Hub here, not
+    // the smol registry, matching what the guest would actually pull.
+    let hosts = crate::registry::registry_pull_hosts(reference);
+    let mut last_err: Option<String> = None;
+    for host in &hosts {
+        let (base_url, repo) = endpoint_for(host, &parsed);
+        let client = auth.apply(smolvm_registry::RegistryClient::new(base_url));
+        match client.get_manifest_resolved(&repo, &want).await {
+            Ok(bytes) => {
+                return Ok(format!("sha256:{}", hex::encode(Sha256::digest(&bytes))));
+            }
+            Err(e) => last_err = Some(e.to_string()),
+        }
+    }
+    Err(Error::agent(
+        "image-store: authorize",
+        last_err.unwrap_or_else(|| "no candidate registry resolved the image".to_string()),
     ))
+}
+
+/// Map a candidate pull host (from `registry_pull_hosts`) plus the parsed name to
+/// the registry API base URL and repository path. Docker Hub's OCI API lives at
+/// `registry-1.docker.io` and official images sit under `library/`; the smol
+/// registry serves its API at `registry.smolmachines.com`.
+fn endpoint_for(host: &str, parsed: &Reference) -> (String, String) {
+    let repo_with = |prefix_library: bool| -> String {
+        match &parsed.namespace {
+            Some(ns) => format!("{}/{}", ns, parsed.name),
+            None if prefix_library => format!("library/{}", parsed.name),
+            None => parsed.name.clone(),
+        }
+    };
+    match host {
+        "docker.io" | "docker.com" | "index.docker.io" | "registry-1.docker.io" => {
+            ("https://registry-1.docker.io".to_string(), repo_with(true))
+        }
+        h if h.ends_with("smolmachines.com") => (
+            "https://registry.smolmachines.com".to_string(),
+            repo_with(false),
+        ),
+        h if smolvm_registry::is_local_registry(h) => (format!("http://{}", h), repo_with(false)),
+        h => (format!("https://{}", h), repo_with(false)),
+    }
 }
 
 /// The registry repository path for a reference (`namespace/name` or `name`).
