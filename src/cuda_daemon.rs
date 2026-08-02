@@ -3386,6 +3386,22 @@ fn clone_worker_share_env(requested: bool, configured: Option<&str>) -> Option<&
     }
 }
 
+#[cfg(unix)]
+fn clone_worker_spawn_pace(pool_size: Option<u32>) -> Duration {
+    #[cfg(target_os = "linux")]
+    if pool_size.is_some_and(|size| size > 4) {
+        // Launching more than four reconstructed CUDA contexts in one burst
+        // can starve concurrent KVM first-entry long enough to exhaust its
+        // bounded transient-ENOMEM retry window. The old fork/exec path paced
+        // workers accidentally while copying the daemon's page tables; retain
+        // only the measured minimum interval after switching to posix_spawn.
+        return Duration::from_millis(20);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = pool_size;
+    Duration::ZERO
+}
+
 /// Decide whether a clone-marked connection should bypass worker routing when
 /// worker mode is disabled. Real channels fall through to ordinary serving;
 /// warm dials carry no Init and must be consumed instead of parking forever.
@@ -3492,6 +3508,7 @@ fn route_clone_connection(
                     worker_pid = pid,
                     "warm dial: spawned clone process worker ahead of its first CUDA call"
                 );
+                std::thread::sleep(clone_worker_spawn_pace(options.fork_pool_size));
                 maybe_evict_frozen_golden(*token, options, &reg);
                 true
             }
@@ -4560,6 +4577,144 @@ fn serialize_module_handoff(token: u64) -> io::Result<Option<(u64, Vec<u8>)>> {
     Ok(Some((revision, blob)))
 }
 
+#[cfg(unix)]
+struct PosixSpawnActions(libc::posix_spawn_file_actions_t);
+
+#[cfg(unix)]
+impl PosixSpawnActions {
+    fn new() -> io::Result<Self> {
+        let mut actions = unsafe { std::mem::zeroed() };
+        // SAFETY: `actions` points to writable storage of the libc-declared type.
+        let error = unsafe { libc::posix_spawn_file_actions_init(&mut actions) };
+        if error == 0 {
+            Ok(Self(actions))
+        } else {
+            Err(io::Error::from_raw_os_error(error))
+        }
+    }
+
+    fn dup2(&mut self, source: i32, destination: i32) -> io::Result<()> {
+        // SAFETY: the actions object is initialized and both descriptors are
+        // copied by value into the action list.
+        let error =
+            unsafe { libc::posix_spawn_file_actions_adddup2(&mut self.0, source, destination) };
+        if error == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(error))
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PosixSpawnActions {
+    fn drop(&mut self) {
+        // SAFETY: this object is constructed only after a successful init and
+        // destroyed exactly once here.
+        unsafe { libc::posix_spawn_file_actions_destroy(&mut self.0) };
+    }
+}
+
+#[cfg(unix)]
+struct CloneWorkerSpawnFds<'a> {
+    connection: i32,
+    exports: &'a [i32],
+    control: (i32, i32),
+    publish: Option<(i32, i32)>,
+    module: Option<(i32, i32)>,
+}
+
+/// Launch a clone worker without copying the CUDA daemon's large address space.
+///
+/// `Command::pre_exec` forces fork/exec, whose page-table copy becomes visible
+/// once the daemon retains multi-gigabyte CUDA snapshots. `posix_spawn`
+/// preserves the exact descriptor and environment contract while Linux libc
+/// can use its vfork-style path.
+#[cfg(unix)]
+fn posix_spawn_clone_worker(
+    exe: &Path,
+    env_overrides: &[(std::ffi::OsString, std::ffi::OsString)],
+    fds: CloneWorkerSpawnFds<'_>,
+) -> io::Result<u32> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut actions = PosixSpawnActions::new()?;
+    actions.dup2(fds.connection, 3)?;
+    for (index, source) in fds.exports.iter().copied().enumerate() {
+        actions.dup2(source, 4 + index as i32)?;
+    }
+    actions.dup2(fds.control.0, fds.control.1)?;
+    if let Some((source, slot)) = fds.publish {
+        actions.dup2(source, slot)?;
+    }
+    if let Some((source, slot)) = fds.module {
+        actions.dup2(source, slot)?;
+    }
+
+    let exe = std::ffi::CString::new(exe.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "clone-worker executable path contains NUL",
+        )
+    })?;
+    let argv_storage = [
+        exe.clone(),
+        std::ffi::CString::new("_cuda-clone-worker").unwrap(),
+        std::ffi::CString::new("3").unwrap(),
+    ];
+    let mut argv = argv_storage
+        .iter()
+        .map(|value| value.as_ptr().cast_mut())
+        .chain(std::iter::once(std::ptr::null_mut()))
+        .collect::<Vec<_>>();
+
+    let mut environment = std::env::vars_os().collect::<std::collections::BTreeMap<_, _>>();
+    for (key, value) in env_overrides {
+        environment.insert(key.clone(), value.clone());
+    }
+    let env_storage = environment
+        .into_iter()
+        .map(|(key, value)| {
+            let key = key.as_os_str().as_bytes();
+            let value = value.as_os_str().as_bytes();
+            let mut entry = Vec::with_capacity(key.len() + value.len() + 1);
+            entry.extend_from_slice(key);
+            entry.push(b'=');
+            entry.extend_from_slice(value);
+            std::ffi::CString::new(entry).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "clone-worker environment contains NUL",
+                )
+            })
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let mut envp = env_storage
+        .iter()
+        .map(|value| value.as_ptr().cast_mut())
+        .chain(std::iter::once(std::ptr::null_mut()))
+        .collect::<Vec<_>>();
+
+    let mut pid = 0;
+    // SAFETY: all C strings and pointer arrays live through the call, are NUL
+    // terminated, and the initialized action list contains valid descriptors.
+    let error = unsafe {
+        libc::posix_spawn(
+            &mut pid,
+            exe.as_ptr(),
+            &actions.0,
+            std::ptr::null(),
+            argv.as_mut_ptr(),
+            envp.as_mut_ptr(),
+        )
+    };
+    if error == 0 {
+        u32::try_from(pid).map_err(|_| io::Error::other("clone-worker pid is out of range"))
+    } else {
+        Err(io::Error::from_raw_os_error(error))
+    }
+}
+
 /// Path 3 (M1): hand the accepted connection to a fresh worker PROCESS (its own
 /// CUDA context, hence its own UVA — so it can place memory at the golden's exact
 /// VAs). `dup2` the socket fd onto fd 3 in the child (clears CLOEXEC) and exec
@@ -4573,7 +4728,6 @@ fn spawn_clone_worker(
     procmem: Option<ProcMemAdvert>,
     options: ServeOptions,
 ) -> io::Result<(u32, std::os::unix::io::RawFd)> {
-    use std::os::unix::process::CommandExt;
     let exe = std::env::current_exe()?;
     let eviction_mode = std::env::var("SMOLVM_CUDA_GOLDEN_EVICT").ok();
     let configured_sharing = std::env::var("SMOLVM_CUDA_FORK_SHARE_WEIGHTS").ok();
@@ -5035,104 +5189,99 @@ fn spawn_clone_worker(
             return Err(error);
         }
     };
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("_cuda-clone-worker").arg("3");
-    cmd.env("SMOLVM_CUDA_CLONE_LAYOUT", layout);
-    cmd.env("SMOLVM_CUDA_CLONE_DEVICE", golden_dev.to_string());
-    cmd.env("SMOLVM_CUDA_CLONE_CTRL", ctrl_slot.to_string());
+    let mut worker_env = vec![
+        (
+            std::ffi::OsString::from("SMOLVM_CUDA_CLONE_LAYOUT"),
+            std::ffi::OsString::from(layout),
+        ),
+        (
+            std::ffi::OsString::from("SMOLVM_CUDA_CLONE_DEVICE"),
+            std::ffi::OsString::from(golden_dev.to_string()),
+        ),
+        (
+            std::ffi::OsString::from("SMOLVM_CUDA_CLONE_CTRL"),
+            std::ffi::OsString::from(ctrl_slot.to_string()),
+        ),
+    ];
     if publish_enabled {
-        cmd.env("SMOLVM_CUDA_CLONE_PUBLISH_CTRL", publish_slot.to_string());
+        worker_env.push((
+            std::ffi::OsString::from("SMOLVM_CUDA_CLONE_PUBLISH_CTRL"),
+            std::ffi::OsString::from(publish_slot.to_string()),
+        ));
     }
     if let Some(limit) = options.vram_limit_bytes {
-        cmd.env("SMOLVM_CUDA_VRAM_LIMIT_BYTES", limit.to_string());
+        worker_env.push((
+            std::ffi::OsString::from("SMOLVM_CUDA_VRAM_LIMIT_BYTES"),
+            std::ffi::OsString::from(limit.to_string()),
+        ));
     }
     if let Some(pool) = options.fork_pool_size {
-        cmd.env("SMOLVM_CUDA_FORK_POOL_SIZE", pool.to_string());
+        worker_env.push((
+            std::ffi::OsString::from("SMOLVM_CUDA_FORK_POOL_SIZE"),
+            std::ffi::OsString::from(pool.to_string()),
+        ));
     }
     // Clone live-RAM transport: hand the worker our (pid, gpa, host_va, len) so
     // it can pread/pwrite /proc/<pid>/mem for D2H/H2D instead of ring-copying.
     if let Some((pid, regions)) = &procmem {
-        cmd.env("SMOLVM_CUDA_CLONE_PROCMEM", procmem_to_env(*pid, regions));
+        worker_env.push((
+            std::ffi::OsString::from("SMOLVM_CUDA_CLONE_PROCMEM"),
+            std::ffi::OsString::from(procmem_to_env(*pid, regions)),
+        ));
     }
     if let Some(rd) = ring_dir {
         // File-ring transport: the worker resolves RingSetupFile names
         // against the clone VM's advertised host ring dir.
-        cmd.env("SMOLVM_CUDA_CLONE_RING_DIR", rd);
+        worker_env.push((
+            std::ffi::OsString::from("SMOLVM_CUDA_CLONE_RING_DIR"),
+            std::ffi::OsString::from(rd),
+        ));
     }
     // Per-fork density: --share-weights requests sharing, but the documented
     // daemon kill switch remains authoritative. This is needed for safe
     // all-private controls and emergency rollback; blindly replacing an
     // inherited "0" here made SMOLVM_CUDA_FORK_SHARE_WEIGHTS=0 ineffective.
     if let Some(setting) = clone_worker_share_env(share_weights, configured_sharing.as_deref()) {
-        cmd.env("SMOLVM_CUDA_FORK_SHARE_WEIGHTS", setting);
+        worker_env.push((
+            std::ffi::OsString::from("SMOLVM_CUDA_FORK_SHARE_WEIGHTS"),
+            std::ffi::OsString::from(setting),
+        ));
     }
     #[cfg(target_os = "linux")]
     if module_blob.is_some() {
-        cmd.env("SMOLVM_CUDA_CLONE_MODULES_FD", module_slot.to_string());
+        worker_env.push((
+            std::ffi::OsString::from("SMOLVM_CUDA_CLONE_MODULES_FD"),
+            std::ffi::OsString::from(module_slot.to_string()),
+        ));
     }
     #[cfg(not(target_os = "linux"))]
     if let Some(mp) = &modpath {
-        cmd.env("SMOLVM_CUDA_CLONE_MODULES", mp);
+        worker_env.push((
+            std::ffi::OsString::from("SMOLVM_CUDA_CLONE_MODULES"),
+            mp.as_os_str().to_os_string(),
+        ));
     }
     // Parent copies of the exported-physical fds, to close once the child has
-    // forked (it inherits its own set). Every open export fd holds a DRIVER
+    // spawned (it inherits its own set). Every open export fd holds a DRIVER
     // REFERENCE on the golden's physical allocation — leaking them in the
     // daemon pins the golden's VRAM long after the golden is torn down and its
     // session reclaimed (found: two dead goldens left ~3.2 GB resident).
     let parent_fds = export_fds.clone();
-    // SAFETY: dup2 in the forked child (async-signal-safe); fds were inherited at
-    // fork. Connection → fd 3; each exported physical → fd 4+idx.
-    unsafe {
-        cmd.pre_exec(move || {
-            if libc::dup2(conn_fd, 3) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            for (i, efd) in export_fds.iter().enumerate() {
-                if libc::dup2(*efd, 4 + i as i32) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-            // The export fds from cuMemExportToShareableHandle are O_CLOEXEC. dup2 to
-            // a DIFFERENT fd clears CLOEXEC, but dup2(fd, fd) — when an export fd
-            // already sits at its destination (commonly the first, fd 4) — is a
-            // no-op that does NOT clear it, so that fd would be closed on exec and
-            // the worker's import fails e=999 (a region left uninitialized → a later
-            // read of a weight there faults). Clear CLOEXEC on every handed-off fd.
-            if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            for i in 0..export_fds.len() as i32 {
-                if libc::fcntl(4 + i, libc::F_SETFD, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-            if libc::dup2(ctrl_child, ctrl_slot) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::fcntl(ctrl_slot, libc::F_SETFD, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if publish_enabled {
-                if libc::dup2(publish_child, publish_slot) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::fcntl(publish_slot, libc::F_SETFD, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-            #[cfg(target_os = "linux")]
-            if module_child >= 0 {
-                if libc::dup2(module_child, module_slot) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::fcntl(module_slot, libc::F_SETFD, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-            Ok(())
-        });
-    }
-    let spawned = cmd.spawn().map(|child| child.id());
+    #[cfg(target_os = "linux")]
+    let module_action = (module_child >= 0).then_some((module_child, module_slot));
+    #[cfg(not(target_os = "linux"))]
+    let module_action = None;
+    let spawned = posix_spawn_clone_worker(
+        &exe,
+        &worker_env,
+        CloneWorkerSpawnFds {
+            connection: conn_fd,
+            exports: &export_fds,
+            control: (ctrl_child, ctrl_slot),
+            publish: publish_enabled.then_some((publish_child, publish_slot)),
+            module: module_action,
+        },
+    );
     // The child (if any) forked with its own copies; drop ours either way so
     // the golden's physicals can actually be released at teardown.
     for efd in parent_fds {
@@ -5255,24 +5404,88 @@ impl Drop for FileLock {
 mod mps_tests {
     use super::{
         clone_layout_reservation_envelopes, clone_worker_idle_expired,
-        clone_worker_idle_timeout_from, clone_worker_share_env, clone_worker_vm_is_alive,
-        consume_procmem_preamble, create_host_snapshot_memfd, create_private_mps_paths,
-        daemon_has_live_cuda_clients, decode_attach_procmem, disabled_worker_route,
-        encode_attach_procmem, fork_snapshot_enabled, golden_eviction_enabled, host_snapshot_fits,
-        host_snapshot_reconstructable, lift_owned_fds, live_host_snapshot_count,
-        map_module_blob_fd, mps_enabled, ordinary_regions_are_reserved, prepare_module_blob,
-        prepare_streamed_module_blob, range_is_reserved, read_host_snapshot,
-        reconstruct_golden_modules, recv_fd, redeem_tensor_bundle_from_stream, seal_host_snapshot,
-        select_golden_owner, send_fd, send_tensor_bundle_to_parent, serve_tensor_bundle_consumer,
+        clone_worker_idle_timeout_from, clone_worker_share_env, clone_worker_spawn_pace,
+        clone_worker_vm_is_alive, consume_procmem_preamble, create_host_snapshot_memfd,
+        create_private_mps_paths, daemon_has_live_cuda_clients, decode_attach_procmem,
+        disabled_worker_route, encode_attach_procmem, fork_snapshot_enabled,
+        golden_eviction_enabled, host_snapshot_fits, host_snapshot_reconstructable, lift_owned_fds,
+        live_host_snapshot_count, map_module_blob_fd, mps_enabled, ordinary_regions_are_reserved,
+        posix_spawn_clone_worker, prepare_module_blob, prepare_streamed_module_blob,
+        range_is_reserved, read_host_snapshot, reconstruct_golden_modules, recv_fd,
+        redeem_tensor_bundle_from_stream, seal_host_snapshot, select_golden_owner, send_fd,
+        send_tensor_bundle_to_parent, serve_tensor_bundle_consumer,
         spawn_clone_attach_listener_with_timeout, spawn_tensor_bundle_receiver,
         unique_live_clone_worker, validate_tensor_bundle_metadata, write_module_handoff,
-        TENSOR_CONSUME_MAGIC,
+        CloneWorkerSpawnFds, TENSOR_CONSUME_MAGIC,
     };
     use std::collections::HashMap;
     use std::io::{self, Write};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn high_fanout_clone_workers_keep_a_bounded_spawn_interval() {
+        assert_eq!(clone_worker_spawn_pace(None), Duration::ZERO);
+        assert_eq!(clone_worker_spawn_pace(Some(4)), Duration::ZERO);
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(clone_worker_spawn_pace(Some(5)), Duration::from_millis(20));
+            assert_eq!(clone_worker_spawn_pace(Some(64)), Duration::from_millis(20));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(clone_worker_spawn_pace(Some(5)), Duration::ZERO);
+            assert_eq!(clone_worker_spawn_pace(Some(64)), Duration::ZERO);
+        }
+    }
+
+    #[test]
+    fn clone_worker_posix_spawn_preserves_the_descriptor_contract() {
+        let mut connection = [-1; 2];
+        let mut control = [-1; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET,
+                    0,
+                    connection.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        assert_eq!(
+            unsafe {
+                libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, control.as_mut_ptr())
+            },
+            0
+        );
+        let pid = posix_spawn_clone_worker(
+            std::path::Path::new("/bin/true"),
+            &[("SMOLVM_SPAWN_TEST".into(), "1".into())],
+            CloneWorkerSpawnFds {
+                connection: connection[1],
+                exports: &[],
+                control: (control[1], 4),
+                publish: None,
+                module: None,
+            },
+        )
+        .unwrap();
+        unsafe {
+            for fd in connection.into_iter().chain(control) {
+                libc::close(fd);
+            }
+        }
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid as i32, &mut status, 0) },
+            pid as i32
+        );
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
 
     #[test]
     fn worker_fd_sources_are_lifted_above_every_dup_destination() {
