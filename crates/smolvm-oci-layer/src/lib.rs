@@ -207,8 +207,6 @@ fn pack_sidecar_sentinel(path: &Path) -> Option<&'static str> {
 /// whiteout translation only takes effect on Linux; on other hosts the markers
 /// would surface as `Unsupported` errors, so this is called on the Linux node.
 pub fn extract_oci_layer<R: Read>(reader: R, dest: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
     // Layers arrive gzip- or zstd-compressed (or, rarely, plain). Decompress
     // transparently so a zstd layer no longer breaks extraction.
     let reader = decompress_layer_reader(reader)?;
@@ -233,8 +231,8 @@ pub fn extract_oci_layer<R: Read>(reader: R, dest: &Path) -> std::io::Result<()>
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
-                    "layer is a smolmachine pack (contains '{sentinel}') — pull it via the \
-                     smolmachine flow, not as a container image"
+                    "layer is a smolmachine pack (contains '{sentinel}') — pull it on the \
+                     host via the smolmachine flow, not as a container image"
                 ),
             ));
         }
@@ -277,8 +275,12 @@ pub fn extract_oci_layer<R: Read>(reader: R, dest: &Path) -> std::io::Result<()>
         }
 
         // Ensure the parent is writable before extracting children — OCI layers
-        // can set restrictive directory modes before their contents.
+        // can set restrictive directory modes before their contents. Unix-only:
+        // real cache-fills run on the Linux node; the crate just needs to compile
+        // on the macOS/Windows host builds of the main engine.
+        #[cfg(unix)]
         if let Some(parent) = full_path.parent() {
+            use std::os::unix::fs::PermissionsExt;
             if parent.is_dir() {
                 let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755));
             }
