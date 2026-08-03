@@ -38,6 +38,20 @@ fn should_retry_kvm_enomem(cpus: u8, fork_clone: bool) -> bool {
     cpus == 1 || fork_clone
 }
 
+#[cfg(unix)]
+fn needs_managed_cuda_daemon(
+    cuda: bool,
+    fork_context: bool,
+    shared_setting: Option<&str>,
+    external_daemon: bool,
+) -> bool {
+    cuda && !external_daemon
+        && match shared_setting {
+            Some(value) => value == "1",
+            None => fork_context,
+        }
+}
+
 /// Running VM configuration persisted to disk so new CLI invocations
 /// can restore the actual config of a detached VM.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1681,6 +1695,35 @@ impl AgentManager {
 
         let t_launch = Instant::now();
 
+        // A privileged node drops each VMM to a distinct uid. Start the shared
+        // CUDA daemon while this manager still has access to the node data dir;
+        // the isolated VMM then only needs permission to connect to its socket.
+        // Forkable CUDA cannot safely fall back in-process because restored
+        // clones must reconnect to the golden's daemon-owned device state.
+        #[cfg(unix)]
+        {
+            let shared_setting = std::env::var("SMOLVM_CUDA_SHARED").ok();
+            let external_daemon = std::env::var_os("SMOLVM_CUDA_DAEMON").is_some();
+            let fork_context = features.forkable || features.snapshot_dir.is_some();
+            if needs_managed_cuda_daemon(
+                features.cuda || resources.cuda,
+                fork_context,
+                shared_setting.as_deref(),
+                external_daemon,
+            ) {
+                let daemon_executable = match std::env::var_os("SMOLVM_BOOT_BINARY") {
+                    Some(path) => PathBuf::from(path),
+                    None => std::env::current_exe()
+                        .map_err(|error| Error::agent("find smolvm binary", error.to_string()))?,
+                };
+                crate::cuda_daemon::ensure_running_with_executable(
+                    &daemon_executable,
+                    fork_context,
+                )
+                .map_err(|error| Error::agent("start shared CUDA daemon", error.to_string()))?;
+            }
+        }
+
         let cpu_policy = std::env::var("SMOLVM_CUDA_FORK_CPU_POLICY")
             .ok()
             .map(|value| value.trim().to_ascii_lowercase())
@@ -1809,9 +1852,10 @@ impl AgentManager {
             // pattern as SHARED above: a CUDA golden's clones need the daemon in
             // address-preserving per-clone-worker mode or default-config torch
             // (expandable_segments) forks into a broken clone. Explicit operator
-            // settings win. The daemon reads these at ITS spawn (inherited from
-            // this VM's boot process via ensure_running), so a daemon already
-            // running in another mode keeps that mode until restarted.
+            // settings win. Both the privileged manager prestart above and the
+            // VM boot fallback propagate these defaults to a newly spawned
+            // daemon; a daemon already running in another mode keeps that mode
+            // until restarted.
             for flag in ["SMOLVM_CUDA_FORK_WORKERS", "SMOLVM_CUDA_FORK_ISOLATE"] {
                 if std::env::var_os(flag).is_none()
                     && (features.forkable || features.snapshot_dir.is_some())
@@ -2134,18 +2178,19 @@ impl AgentManager {
         // SMOLVM_VM_USE_SCOPE at startup and did NOT set SMOLVM_CGROUP_ROOT, so the
         // boot subprocess skipped self-placement and the VM is still in serve's
         // cgroup for this microsecond window — the adopt moves it out. Caps mirror
-        // process::place_in_cgroup (CGROUP_MEM_OVERHEAD_MIB=768, CGROUP_PIDS_MAX
+        // process::place_in_cgroup (VMM_MEM_OVERHEAD_MIB=768, CGROUP_PIDS_MAX
         // =1024) as scope properties. Best-effort: on failure the VM keeps running
         // (just not restart-safe), same as an uncapped cgroup join.
         #[cfg(target_os = "linux")]
         if std::env::var_os("SMOLVM_VM_USE_SCOPE").is_some() {
             if let Some(name) = self.name() {
                 let caps = crate::systemd_scope::ScopeCaps {
-                    memory_max_bytes: Some(
-                        (resources_for_config.memory_mib as u64 + 768) * 1024 * 1024,
-                    ),
+                    memory_max_bytes: Some(crate::process::vmm_memory_limit_bytes(
+                        resources_for_config.memory_mib,
+                        config.cuda,
+                    )),
                     cpu_quota_usec_per_sec: Some(
-                        (resources_for_config.cpus.max(1) as u64) * 1_000_000,
+                        u64::from(resources_for_config.cpus.max(1)) * 1_000_000,
                     ),
                     tasks_max: Some(1024),
                 };
@@ -2847,6 +2892,16 @@ mod tests {
         assert!(should_retry_kvm_enomem(1, false));
         assert!(should_retry_kvm_enomem(3, true));
         assert!(!should_retry_kvm_enomem(3, false));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn managed_cuda_daemon_is_mandatory_for_automatic_forking() {
+        assert!(needs_managed_cuda_daemon(true, true, None, false));
+        assert!(needs_managed_cuda_daemon(true, false, Some("1"), false));
+        assert!(!needs_managed_cuda_daemon(false, true, None, false));
+        assert!(!needs_managed_cuda_daemon(true, true, Some("0"), false));
+        assert!(!needs_managed_cuda_daemon(true, true, None, true));
     }
 
     // The distro-package case: the rootfs directory is not writable by the user

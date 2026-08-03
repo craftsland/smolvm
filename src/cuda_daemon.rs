@@ -35,6 +35,76 @@ pub fn socket_path() -> PathBuf {
     root.join("cuda-daemon.sock")
 }
 
+#[cfg(target_os = "linux")]
+fn daemon_socket_access(
+    effective_uid: u32,
+    kvm_gid: Option<libc::gid_t>,
+) -> io::Result<(u32, Option<libc::gid_t>)> {
+    if effective_uid != 0 {
+        return Ok((0o600, None));
+    }
+    let gid = kvm_gid.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "privileged shared CUDA daemon requires a kvm group for isolated VMM access",
+        )
+    })?;
+    Ok((0o660, Some(gid)))
+}
+
+#[cfg(target_os = "linux")]
+fn current_daemon_socket_access() -> io::Result<(u32, Option<libc::gid_t>)> {
+    daemon_socket_access(unsafe { libc::geteuid() }, crate::process::kvm_group_gid())
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn current_daemon_socket_access() -> io::Result<(u32, Option<libc::gid_t>)> {
+    Ok((0o600, None))
+}
+
+#[cfg(unix)]
+fn configure_daemon_socket_access(
+    sock: &Path,
+    mode: u32,
+    group: Option<libc::gid_t>,
+) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if let Some(gid) = group {
+        let path = std::ffi::CString::new(sock.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "CUDA daemon socket contains NUL",
+            )
+        })?;
+        if unsafe { libc::chown(path.as_ptr(), u32::MAX, gid) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    std::fs::set_permissions(sock, std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(unix)]
+fn bind_daemon_listener(sock: &Path) -> io::Result<UdsListener> {
+    let (mode, group) = current_daemon_socket_access()?;
+    // AF_UNIX socket nodes start at 0777 minus umask. Restrict the node during
+    // bind/listen itself so an unrelated process cannot queue a connection in
+    // the interval before the final ownership update.
+    let socket_umask = libc::mode_t::try_from(0o777_u32 & !mode).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid CUDA daemon socket mode",
+        )
+    })?;
+    let old_umask = unsafe { libc::umask(socket_umask) };
+    let listener = UdsListener::bind(sock);
+    unsafe { libc::umask(old_umask) };
+    let listener = listener?;
+    configure_daemon_socket_access(sock, mode, group)?;
+    Ok(listener)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CloneWorkerStatus {
     Ready,
@@ -1228,7 +1298,13 @@ pub fn run(sock: &Path) -> io::Result<()> {
     let _ = std::fs::remove_file(sock);
     #[cfg(unix)]
     install_shutdown_handler(sock);
+    #[cfg(unix)]
+    let listener = bind_daemon_listener(sock)?;
+    #[cfg(not(unix))]
     let listener = UdsListener::bind(sock)?;
+    // Per-VM uid isolation deliberately gives every VMM a distinct uid while
+    // retaining only the shared kvm supplementary group. Grant that group
+    // access to the daemon boundary without exposing it to unrelated host users.
     match spawn_tensor_bundle_service(sock) {
         Ok(path) => {
             TENSOR_BUNDLE_SERVICE_READY.store(true, Ordering::Release);
@@ -5725,7 +5801,29 @@ fn spawn_clone_worker(
 /// daemons (a second would bind-fail and exit, but the lock avoids the churn and
 /// the stale-socket-removal race).
 pub fn ensure_running() -> io::Result<PathBuf> {
+    let executable = std::env::current_exe()?;
+    ensure_running_with_executable(&executable, false)
+}
+
+/// Ensure the shared daemon is running by launching `executable` when a new
+/// daemon is required.
+///
+/// Embedders use this entry point because their current executable is the host
+/// runtime (for example Node or Python), while `SMOLVM_BOOT_BINARY` names the
+/// bundled helper that implements the `_cuda-daemon` subcommand.
+pub(crate) fn ensure_running_with_executable(
+    executable: &Path,
+    automatic_fork_workers: bool,
+) -> io::Result<PathBuf> {
     let sock = socket_path();
+    // A privileged node launches the daemon before dropping each VMM to its
+    // dedicated uid. Those VMMs may connect to the live socket but must not
+    // need write access to the shared data directory merely to create/open the
+    // spawn lock. Check the read-only fast path first; the lock still
+    // serializes every absent/stale-daemon spawn below.
+    if is_alive(&sock) {
+        return Ok(sock);
+    }
     if let Some(parent) = sock.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -5735,7 +5833,6 @@ pub fn ensure_running() -> io::Result<PathBuf> {
     }
     let _ = std::fs::remove_file(&sock); // stale node from a dead daemon
     use std::os::unix::process::CommandExt;
-    let exe = std::env::current_exe()?;
     // Dev diagnostic: SMOLVM_CUDA_DAEMON_STDERR=<path> captures the daemon's
     // stderr (fork-isolation traces, backend selection) instead of dropping it.
     let stderr = match std::env::var_os("SMOLVM_CUDA_DAEMON_STDERR") {
@@ -5747,15 +5844,23 @@ pub fn ensure_running() -> io::Result<PathBuf> {
             .unwrap_or_else(|_| Stdio::null()),
         None => Stdio::null(),
     };
-    Command::new(exe)
+    let mut command = Command::new(executable);
+    command
         .args(["_cuda-daemon", &sock.to_string_lossy()])
         .env("CUDA_DEVICE_ORDER", CUDA_DEVICE_ORDER)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(stderr)
         // Own process group so the daemon outlives the VM that first spawned it.
-        .process_group(0)
-        .spawn()?;
+        .process_group(0);
+    if automatic_fork_workers {
+        for flag in ["SMOLVM_CUDA_FORK_WORKERS", "SMOLVM_CUDA_FORK_ISOLATE"] {
+            if std::env::var_os(flag).is_none() {
+                command.env(flag, "1");
+            }
+        }
+    }
+    command.spawn()?;
     for _ in 0..200 {
         if is_alive(&sock) {
             return Ok(sock);
@@ -5800,10 +5905,10 @@ mod mps_tests {
         clone_layout_reservation_envelopes, clone_worker_idle_expired,
         clone_worker_idle_timeout_from, clone_worker_share_env, clone_worker_spawn_pace,
         clone_worker_vm_is_alive, consume_procmem_preamble, create_host_snapshot_memfd,
-        create_private_mps_paths, daemon_has_live_cuda_clients, decode_attach_procmem,
-        decode_clone_worker_status, disabled_worker_route, encode_attach_procmem,
-        encode_clone_worker_status, fork_snapshot_enabled, golden_eviction_enabled,
-        host_snapshot_fits, host_snapshot_reconstructable, lift_owned_fds,
+        create_private_mps_paths, daemon_has_live_cuda_clients, daemon_socket_access,
+        decode_attach_procmem, decode_clone_worker_status, disabled_worker_route,
+        encode_attach_procmem, encode_clone_worker_status, fork_snapshot_enabled,
+        golden_eviction_enabled, host_snapshot_fits, host_snapshot_reconstructable, lift_owned_fds,
         live_host_snapshot_count, map_module_blob_fd, mps_enabled, ordinary_regions_are_reserved,
         posix_spawn_clone_worker, prepare_module_blob, prepare_streamed_module_blob,
         range_is_reserved, read_host_snapshot, reconstruct_golden_modules, recv_fd,
@@ -5818,6 +5923,16 @@ mod mps_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn daemon_socket_is_private_or_limited_to_the_vmm_group() {
+        assert_eq!(daemon_socket_access(1000, None).unwrap(), (0o600, None));
+        assert_eq!(
+            daemon_socket_access(0, Some(123)).unwrap(),
+            (0o660, Some(123))
+        );
+        assert!(daemon_socket_access(0, None).is_err());
+    }
 
     #[test]
     fn high_fanout_clone_workers_keep_a_bounded_spawn_interval() {

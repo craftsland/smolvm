@@ -401,11 +401,10 @@ const CGROUP_CPU_PERIOD_US: u64 = 100_000;
 #[cfg(target_os = "linux")]
 const CGROUP_PIDS_MAX: u32 = 1024;
 
-/// Extra MiB granted on top of guest RAM for VMM/virtio/gpu overhead when sizing
+/// Fixed MiB granted beyond guest RAM and any CUDA host mapping when sizing
 /// `memory.max`. This is defense-in-depth atop the guest RAM bound already
 /// enforced by `krun_set_vm_config`, not the primary memory control.
-#[cfg(target_os = "linux")]
-const CGROUP_MEM_OVERHEAD_MIB: u64 = 768;
+const VMM_MEM_OVERHEAD_MIB: u64 = 768;
 
 /// Resolve this process's cgroup v2 directory from `/proc/self/cgroup`.
 ///
@@ -468,14 +467,14 @@ pub fn setup_cgroup_delegation_root() -> Option<std::path::PathBuf> {
 /// Caps applied (best-effort, each independently):
 /// - `cpu.max` = `vcpus * 100ms / 100ms` → bounds CPU to ~`vcpus` cores.
 /// - `pids.max` = [`CGROUP_PIDS_MAX`] → caps host tasks (fork-bomb containment).
-/// - `memory.max` = guest RAM + [`CGROUP_MEM_OVERHEAD_MIB`] → defense-in-depth.
+/// - `memory.max` = guest RAM, CUDA mapping allowance, and fixed overhead.
 ///
 /// `root` must be a delegated root with `cpu`/`memory`/`pids` enabled in its
 /// `subtree_control` (see [`setup_cgroup_delegation_root`]); otherwise the limit
 /// files won't exist and the caps silently degrade while the process still runs.
 /// Never blocks boot.
 #[cfg(target_os = "linux")]
-pub fn place_in_cgroup(root: &std::path::Path, vcpus: u8, memory_mib: u32) {
+pub fn place_in_cgroup(root: &std::path::Path, vcpus: u8, memory_mib: u32, cuda: bool) {
     let pid = unsafe { libc::getpid() };
     let vm = root.join(format!("vm-{pid}"));
     if let Err(e) = std::fs::create_dir(&vm) {
@@ -487,15 +486,15 @@ pub fn place_in_cgroup(root: &std::path::Path, vcpus: u8, memory_mib: u32) {
     }
 
     // Set limits on the leaf *before* joining it.
-    let quota_us = (vcpus.max(1) as u64) * CGROUP_CPU_PERIOD_US;
+    let quota_us = u64::from(vcpus.max(1)) * CGROUP_CPU_PERIOD_US;
     let _ = write_cgroup(
         &vm,
         "cpu.max",
         &format!("{quota_us} {CGROUP_CPU_PERIOD_US}"),
     );
     let _ = write_cgroup(&vm, "pids.max", &CGROUP_PIDS_MAX.to_string());
-    let mem_bytes = (memory_mib as u64 + CGROUP_MEM_OVERHEAD_MIB) * 1024 * 1024;
-    let _ = write_cgroup(&vm, "memory.max", &mem_bytes.to_string());
+    let memory_limit_bytes = vmm_memory_limit_bytes(memory_mib, cuda);
+    let _ = write_cgroup(&vm, "memory.max", &memory_limit_bytes.to_string());
 
     // Join the leaf last; from here the caps above govern this process tree.
     if let Err(e) = write_cgroup(&vm, "cgroup.procs", &pid.to_string()) {
@@ -504,9 +503,24 @@ pub fn place_in_cgroup(root: &std::path::Path, vcpus: u8, memory_mib: u32) {
         return;
     }
     tracing::info!(
-        vcpus, memory_mib, cgroup = %vm.display(),
+        vcpus, memory_mib, cuda, memory_limit_bytes, cgroup = %vm.display(),
         "placed VMM subprocess in per-VM cgroup with cpu/pids/memory caps"
     );
+}
+
+/// Bound host memory for a VMM while leaving room beyond its configured guest
+/// RAM. CUDA device mappings and forkable memfd-backed guest pages can both be
+/// charged to the VMM cgroup, so CUDA needs room for one additional guest-sized
+/// mapping plus the fixed process overhead. CPU-only VMs retain the tighter
+/// historical guest-plus-overhead cap.
+pub fn vmm_memory_limit_bytes(guest_memory_mib: u32, cuda: bool) -> u64 {
+    let guest = u64::from(guest_memory_mib);
+    let limit_mib = if cuda {
+        guest.saturating_mul(2).saturating_add(VMM_MEM_OVERHEAD_MIB)
+    } else {
+        guest.saturating_add(VMM_MEM_OVERHEAD_MIB)
+    };
+    limit_mib.saturating_mul(1024 * 1024)
 }
 
 /// Bound each CUDA fork-pool VM to its configured CPU count or an even share
@@ -804,7 +818,7 @@ pub fn restrict_filesystem(
 /// Look up the `kvm` group's gid, so it can be kept as a supplementary group
 /// across the privilege drop (the VMM needs `/dev/kvm`).
 #[cfg(target_os = "linux")]
-fn kvm_group_gid() -> Option<libc::gid_t> {
+pub(crate) fn kvm_group_gid() -> Option<libc::gid_t> {
     let grp = unsafe { libc::getgrnam(c"kvm".as_ptr()) };
     if grp.is_null() {
         None
@@ -2579,7 +2593,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cuda_fork_pool_vcpus_avoids_host_oversubscription() {
+    fn cuda_fork_pool_vcpus_preserve_reliable_guest_topology() {
         assert_eq!(cuda_fork_pool_vcpus(4, 24, 26), 2);
         assert_eq!(cuda_fork_pool_vcpus(4, 8, 26), 3);
         assert_eq!(cuda_fork_pool_vcpus(2, 8, 26), 2);
@@ -2592,6 +2606,45 @@ mod tests {
         assert_eq!(cuda_fork_pool_vcpus(1, 32, 8), 1);
         assert_eq!(cuda_fork_pool_vcpus(0, 1, 0), 1);
         assert_eq!(cuda_fork_pool_vcpus(4, 0, 26), 4);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_uses_guest_cpu_and_cuda_memory_limits() {
+        let root = tempfile::tempdir().expect("temp cgroup root");
+        let pid = unsafe { libc::getpid() };
+        let vm = root.path().join(format!("vm-{pid}"));
+        std::fs::create_dir(&vm).expect("create fake VM cgroup");
+        for file in ["cpu.max", "pids.max", "memory.max", "cgroup.procs"] {
+            std::fs::write(vm.join(file), []).expect("create fake cgroup control");
+        }
+
+        place_in_cgroup(root.path(), 2, 1024, true);
+
+        assert_eq!(
+            std::fs::read_to_string(vm.join("cpu.max")).expect("read boot CPU quota"),
+            "200000 100000"
+        );
+        assert_eq!(
+            std::fs::read_to_string(vm.join("cgroup.procs")).expect("read fake membership"),
+            pid.to_string()
+        );
+        assert_eq!(
+            std::fs::read_to_string(vm.join("memory.max")).expect("read memory limit"),
+            ((2 * 1024_u64 + VMM_MEM_OVERHEAD_MIB) * 1024 * 1024).to_string()
+        );
+    }
+
+    #[test]
+    fn cuda_vmm_memory_limit_allows_device_and_memfd_mappings() {
+        assert_eq!(
+            vmm_memory_limit_bytes(8192, true),
+            (2 * 8192_u64 + VMM_MEM_OVERHEAD_MIB) * 1024 * 1024
+        );
+        assert_eq!(
+            vmm_memory_limit_bytes(8192, false),
+            (8192_u64 + VMM_MEM_OVERHEAD_MIB) * 1024 * 1024
+        );
     }
 
     #[test]

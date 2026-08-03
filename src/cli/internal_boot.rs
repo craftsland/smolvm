@@ -145,6 +145,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
             std::path::Path::new(&cgroup_root),
             config.resources.cpus,
             config.resources.memory_mib,
+            config.cuda,
         );
     }
 
