@@ -270,6 +270,10 @@ impl SmolvmDb {
                  name TEXT PRIMARY KEY NOT NULL,
                  data BLOB NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS fork_pool_snapshots (
+                 golden TEXT PRIMARY KEY NOT NULL,
+                 data BLOB NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS fork_pool_slots (
                  machine_name TEXT PRIMARY KEY NOT NULL,
                  pool_name TEXT NOT NULL,
@@ -695,6 +699,61 @@ impl SmolvmDb {
                 pools.push(serde_json::from_slice(&bytes).db_err("deserialize fork pool")?);
             }
             Ok(pools)
+        })
+    }
+
+    /// Durably publish the RAM checkpoint that can refill pools for one golden.
+    pub(crate) fn set_fork_pool_snapshot(
+        &self,
+        golden: &str,
+        snapshot: &crate::agent::fork::RetainedForkSnapshot,
+    ) -> Result<()> {
+        let data = serde_json::to_vec(snapshot).db_err("serialize fork pool snapshot")?;
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO fork_pool_snapshots (golden, data) VALUES (?1, ?2)
+                 ON CONFLICT(golden) DO UPDATE SET data = excluded.data",
+                params![golden, data],
+            )
+            .db_err(format!("set fork pool snapshot for '{golden}'"))?;
+            Ok(())
+        })
+    }
+
+    /// Load every retained pool checkpoint after a controller restart.
+    pub(crate) fn list_fork_pool_snapshots(
+        &self,
+    ) -> Result<Vec<(String, crate::agent::fork::RetainedForkSnapshot)>> {
+        self.with_read_conn(|conn| {
+            let mut stmt = conn
+                .prepare_cached("SELECT golden, data FROM fork_pool_snapshots ORDER BY golden")
+                .db_err("prepare list fork pool snapshots")?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .db_err("query fork pool snapshots")?;
+            let mut snapshots = Vec::new();
+            for row in rows {
+                let (golden, data) = row.db_err("read fork pool snapshot row")?;
+                let snapshot = serde_json::from_slice(&data)
+                    .db_err(format!("deserialize fork pool snapshot for '{golden}'"))?;
+                snapshots.push((golden, snapshot));
+            }
+            Ok(snapshots)
+        })
+    }
+
+    /// Forget a checkpoint only after its golden is resumed or no pool can use it.
+    pub(crate) fn remove_fork_pool_snapshot(&self, golden: &str) -> Result<bool> {
+        self.with_conn(|conn| {
+            let changed = conn
+                .execute(
+                    "DELETE FROM fork_pool_snapshots WHERE golden = ?1",
+                    params![golden],
+                )
+                .db_err(format!("remove fork pool snapshot for '{golden}'"))?;
+            Ok(changed == 1)
         })
     }
 
@@ -2015,6 +2074,27 @@ mod tests {
         assert_eq!(value, "test_value");
 
         assert!(db.get_config("nonexistent").unwrap().is_none());
+    }
+
+    #[test]
+    fn fork_pool_snapshot_survives_database_reopen_and_can_be_removed() {
+        let (dir, db) = temp_db();
+        let snapshot = crate::agent::fork::RetainedForkSnapshot {
+            path: PathBuf::from("/golden/s/12345678"),
+            golden_pid: 123,
+            golden_pid_start_time: 456,
+        };
+        db.set_fork_pool_snapshot("golden", &snapshot).unwrap();
+        drop(db);
+
+        let reopened = SmolvmDb::open_at(&dir.path().join("test.db")).unwrap();
+        assert_eq!(
+            reopened.list_fork_pool_snapshots().unwrap(),
+            vec![("golden".to_string(), snapshot)]
+        );
+        assert!(reopened.remove_fork_pool_snapshot("golden").unwrap());
+        assert!(reopened.list_fork_pool_snapshots().unwrap().is_empty());
+        assert!(!reopened.remove_fork_pool_snapshot("golden").unwrap());
     }
 
     #[test]
