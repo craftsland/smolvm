@@ -984,48 +984,131 @@ pub fn activate_held_fork(
     } else {
         "mkdir -p /etc/smolvm".to_string()
     };
-    let script = format!(
-        "set -e; \
-         if [ -f '{release}' ]; then exit 42; fi; \
-         if [ ! -f '{ready}' ]; then exit 43; fi; \
-         {ensure_env_parent}; \
-         umask 077; cat > '{env_path}.tmp'; mv '{env_path}.tmp' '{env_path}'; \
-         printf '%s\\n' smolvm-forkpoint-release-v1 > '{release}.tmp'; \
-         mv '{release}.tmp' '{release}'",
-        ready = smolvm_protocol::forkpoint::READY_PATH,
-        release = smolvm_protocol::forkpoint::RELEASE_PATH,
+    // The token makes this operation safe to repeat after an ambiguous socket
+    // timeout. A release can wake a CUDA-heavy workload before the guest agent's
+    // reply reaches the host; without an idempotency receipt, retrying could vend
+    // the same clean slot twice while failing immediately could discard a slot
+    // that was actually released successfully.
+    let activation_token = format!(
+        "{}{}",
+        crate::util::generate_short_id(),
+        crate::util::generate_short_id()
+    );
+    let receipt = format!("{}/activation", smolvm_protocol::forkpoint::STATE_DIR);
+    let script = build_activation_script(
+        smolvm_protocol::forkpoint::READY_PATH,
+        smolvm_protocol::forkpoint::RELEASE_PATH,
+        &receipt,
+        &ensure_env_parent,
+        &env_path,
+        &activation_token,
     );
     let socket = vm_data_dir(clone).join("agent.sock");
-    let mut client = AgentClient::connect_with_retry(&socket)
-        .map_err(|e| Error::agent("activate held fork", format!("agent connect: {e}")))?;
-    match client.vm_exec(
-        vec!["/bin/sh".into(), "-c".into(), script],
-        vec![],
-        None,
-        Some(Duration::from_secs(10)),
-        Some(content),
-    ) {
-        Ok((0, _, _)) => Ok(merged),
-        Ok((42, _, _)) => Err(Error::agent(
-            "activate held fork",
-            format!("clone '{clone}' was already released"),
-        )),
-        Ok((43, _, _)) => Err(Error::agent(
-            "activate held fork",
-            format!("clone '{clone}' is not parked at a forkpoint"),
-        )),
-        Ok((code, _, stderr)) => Err(Error::agent(
-            "activate held fork",
-            format!(
-                "clone '{clone}' activation exited {code}: {}",
-                String::from_utf8_lossy(&stderr).trim()
-            ),
-        )),
-        Err(e) => Err(Error::agent(
-            "activate held fork",
-            format!("clone '{clone}': {e}"),
-        )),
+    for attempt in 1..=2 {
+        let mut client = match AgentClient::connect_with_retry(&socket) {
+            Ok(client) => client,
+            Err(error) if attempt == 1 => {
+                tracing::warn!(
+                    clone,
+                    %error,
+                    "held-fork activation connect was ambiguous; retrying idempotently"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            Err(error) => {
+                return Err(Error::agent(
+                    "activate held fork",
+                    format!("agent connect: {error}"),
+                ));
+            }
+        };
+        match client.vm_exec(
+            vec!["/bin/sh".into(), "-c".into(), script.clone()],
+            vec![],
+            None,
+            Some(Duration::from_secs(10)),
+            Some(content.clone()),
+        ) {
+            Ok((0, _, _)) => return Ok(merged),
+            Ok((42, _, _)) => {
+                return Err(Error::agent(
+                    "activate held fork",
+                    format!("clone '{clone}' was already released"),
+                ));
+            }
+            Ok((43, _, _)) => {
+                return Err(Error::agent(
+                    "activate held fork",
+                    format!("clone '{clone}' is not parked at a forkpoint"),
+                ));
+            }
+            Ok((code, _, stderr)) if attempt == 1 => {
+                tracing::warn!(
+                    clone,
+                    code,
+                    stderr = %String::from_utf8_lossy(&stderr).trim(),
+                    "held-fork activation attempt failed; retrying idempotently"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Ok((code, _, stderr)) => {
+                return Err(Error::agent(
+                    "activate held fork",
+                    format!(
+                        "clone '{clone}' activation exited {code}: {}",
+                        String::from_utf8_lossy(&stderr).trim()
+                    ),
+                ));
+            }
+            Err(error) if attempt == 1 => {
+                tracing::warn!(
+                    clone,
+                    %error,
+                    "held-fork activation reply was ambiguous; retrying idempotently"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => {
+                return Err(Error::agent(
+                    "activate held fork",
+                    format!("clone '{clone}': {error}"),
+                ));
+            }
+        }
     }
+    unreachable!("held-fork activation loop always returns")
+}
+
+fn build_activation_script(
+    ready: &str,
+    release: &str,
+    receipt: &str,
+    ensure_env_parent: &str,
+    env_path: &str,
+    activation_token: &str,
+) -> String {
+    format!(
+        "set -e; \
+         if [ -f '{release}' ]; then \
+           [ \"$(cat '{receipt}' 2>/dev/null)\" = '{activation_token}' ] && exit 0; \
+           exit 42; \
+         fi; \
+         if [ ! -f '{ready}' ]; then exit 43; fi; \
+         receipt_tmp='{receipt}.{activation_token}.'$$; \
+         printf '%s\\n' '{activation_token}' > \"$receipt_tmp\"; \
+         if ! ln \"$receipt_tmp\" '{receipt}' 2>/dev/null; then \
+           rm -f \"$receipt_tmp\"; \
+           [ \"$(cat '{receipt}' 2>/dev/null)\" = '{activation_token}' ] || exit 42; \
+         else rm -f \"$receipt_tmp\"; fi; \
+         {ensure_env_parent}; \
+         env_tmp='{env_path}.{activation_token}.'$$; \
+         release_tmp='{release}.{activation_token}.'$$; \
+         trap 'rm -f \"$env_tmp\" \"$release_tmp\"' EXIT; \
+         cat > \"$env_tmp\"; mv \"$env_tmp\" '{env_path}'; \
+         printf '%s\\n' smolvm-forkpoint-release-v1 > \"$release_tmp\"; \
+         mv \"$release_tmp\" '{release}'"
+    )
 }
 
 /// Fail-closed fork finalizer. A clone whose identity could not be rejuvenated
@@ -1202,6 +1285,119 @@ mod tests {
                 ("DATASET".to_string(), "math".to_string()),
             ]
         );
+    }
+
+    #[cfg(unix)]
+    fn run_activation_script(script: &str, stdin: &str) -> std::process::Output {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn activation script");
+        child
+            .stdin
+            .take()
+            .expect("activation stdin")
+            .write_all(stdin.as_bytes())
+            .expect("write activation input");
+        child
+            .wait_with_output()
+            .expect("wait for activation script")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn held_fork_activation_is_idempotent_after_an_ambiguous_reply() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("ready"), b"ready\n").unwrap();
+        let ready = state.join("ready");
+        let release = state.join("release");
+        let receipt = state.join("activation");
+        let env_path = workspace.join("fork-env");
+        let ensure_parent = format!("mkdir -p '{}'", workspace.display());
+        let token = "0123456789abcdef";
+        let script = build_activation_script(
+            ready.to_str().unwrap(),
+            release.to_str().unwrap(),
+            receipt.to_str().unwrap(),
+            &ensure_parent,
+            env_path.to_str().unwrap(),
+            token,
+        );
+
+        let first = run_activation_script(&script, "LR=1e-4\n");
+        assert!(
+            first.status.success(),
+            "{}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(&env_path).unwrap(), "LR=1e-4\n");
+        assert_eq!(
+            std::fs::read_to_string(&receipt).unwrap(),
+            format!("{token}\n")
+        );
+        assert!(release.is_file());
+
+        // A lost reply may cause the host to send the same activation again.
+        // The receipt proves ownership and makes that retry a successful no-op.
+        let retry = run_activation_script(&script, "LR=changed\n");
+        assert!(retry.status.success());
+        assert_eq!(std::fs::read_to_string(&env_path).unwrap(), "LR=1e-4\n");
+
+        let other = build_activation_script(
+            ready.to_str().unwrap(),
+            release.to_str().unwrap(),
+            receipt.to_str().unwrap(),
+            &ensure_parent,
+            env_path.to_str().unwrap(),
+            "fedcba9876543210",
+        );
+        assert_eq!(
+            run_activation_script(&other, "LR=other\n").status.code(),
+            Some(42)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn held_fork_activation_retry_finishes_a_partial_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("ready"), b"ready\n").unwrap();
+        let ready = state.join("ready");
+        let release = state.join("release");
+        let receipt = state.join("activation");
+        let env_path = workspace.join("fork-env");
+        let ensure_parent = format!("mkdir -p '{}'", workspace.display());
+        let token = "0123456789abcdef";
+        std::fs::write(&receipt, format!("{token}\n")).unwrap();
+        let script = build_activation_script(
+            ready.to_str().unwrap(),
+            release.to_str().unwrap(),
+            receipt.to_str().unwrap(),
+            &ensure_parent,
+            env_path.to_str().unwrap(),
+            token,
+        );
+
+        let retry = run_activation_script(&script, "LR=3e-4\n");
+        assert!(
+            retry.status.success(),
+            "{}",
+            String::from_utf8_lossy(&retry.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(&env_path).unwrap(), "LR=3e-4\n");
+        assert!(release.is_file());
     }
 
     #[test]
