@@ -1670,7 +1670,7 @@ async fn boot_prepared_fork_inner(
         #[cfg(unix)]
         if record.cuda
             && cuda_worker_ready_timeout.is_some()
-            && std::env::var_os("SMOLVM_CUDA_DAEMON").is_none()
+            && crate::cuda_daemon::clone_worker_readiness_supported()
             && std::env::var("SMOLVM_CUDA_WARM_DIAL").as_deref() != Ok("0")
         {
             let worker_ready = pid

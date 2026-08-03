@@ -25,6 +25,9 @@ use std::time::{Duration, Instant};
 
 /// Stable host-device enumeration shared with device-scoped admission.
 const CUDA_DEVICE_ORDER: &str = "PCI_BUS_ID";
+const CUDA_WORKER_STATUS_SOCKET_ENV: &str = "SMOLVM_CUDA_WORKER_STATUS_SOCKET";
+const CLONE_WORKER_READINESS_CAPABILITY_VERSION: u32 = 1;
+const CLONE_WORKER_CAPABILITY_FILE: &str = "daemon.capability";
 
 /// Control-socket path for the shared daemon, under the smolvm data dir (so the
 /// daemon and every boot subprocess agree on one location).
@@ -111,12 +114,108 @@ enum CloneWorkerStatus {
     Failed,
 }
 
-fn clone_worker_status_path(vm_pid: u32) -> PathBuf {
-    socket_path()
+fn local_cuda_daemon_socket(explicit: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    match explicit {
+        Some(value) => {
+            let path = PathBuf::from(value);
+            path.is_absolute().then_some(path)
+        }
+        None => Some(socket_path()),
+    }
+}
+
+fn clone_worker_status_socket() -> PathBuf {
+    std::env::var_os(CUDA_WORKER_STATUS_SOCKET_ENV)
+        .and_then(|value| local_cuda_daemon_socket(Some(&value)))
+        .or_else(|| {
+            std::env::var_os("SMOLVM_CUDA_DAEMON")
+                .and_then(|value| local_cuda_daemon_socket(Some(&value)))
+        })
+        .unwrap_or_else(socket_path)
+}
+
+fn clone_worker_status_dir_for(cuda_socket: &Path) -> PathBuf {
+    let mut name = cuda_socket
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("cuda-daemon.sock"))
+        .to_os_string();
+    name.push(".workers");
+    cuda_socket
         .parent()
-        .unwrap_or_else(|| Path::new("/tmp"))
-        .join("cuda-worker-ready")
-        .join(vm_pid.to_string())
+        .unwrap_or_else(|| Path::new("."))
+        .join(name)
+}
+
+fn clone_worker_status_path(vm_pid: u32) -> PathBuf {
+    clone_worker_status_dir_for(&clone_worker_status_socket()).join(vm_pid.to_string())
+}
+
+fn clone_worker_capability_path(cuda_socket: &Path) -> PathBuf {
+    clone_worker_status_dir_for(cuda_socket).join(CLONE_WORKER_CAPABILITY_FILE)
+}
+
+fn encode_clone_worker_capability(pid: u32, start_time: u64) -> String {
+    format!(
+        "{CLONE_WORKER_READINESS_CAPABILITY_VERSION} {pid} {start_time} {:016x}\n",
+        smolvm_cuda::PROTO_HASH
+    )
+}
+
+fn decode_clone_worker_capability(value: &str) -> Option<(u32, u64)> {
+    let mut fields = value.split_whitespace();
+    let version = fields.next()?.parse::<u32>().ok()?;
+    let pid = fields.next()?.parse::<u32>().ok()?;
+    let start_time = fields.next()?.parse::<u64>().ok()?;
+    let protocol = u64::from_str_radix(fields.next()?, 16).ok()?;
+    (fields.next().is_none()
+        && version == CLONE_WORKER_READINESS_CAPABILITY_VERSION
+        && protocol == smolvm_cuda::PROTO_HASH)
+        .then_some((pid, start_time))
+}
+
+fn publish_clone_worker_capability(cuda_socket: &Path) -> io::Result<()> {
+    let pid = std::process::id();
+    let start_time = crate::process::process_start_time(pid as i32).ok_or_else(|| {
+        io::Error::other("CUDA daemon process identity is unavailable for worker readiness")
+    })?;
+    let path = clone_worker_capability_path(cuda_socket);
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("CUDA worker capability path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(".daemon.{pid}.tmp"));
+    std::fs::write(&temporary, encode_clone_worker_capability(pid, start_time))?;
+    if let Err(error) = std::fs::rename(&temporary, &path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn clone_worker_readiness_supported_at(
+    cuda_socket: &Path,
+    mut process_is_alive: impl FnMut(i32, u64) -> bool,
+) -> bool {
+    std::fs::read_to_string(clone_worker_capability_path(cuda_socket))
+        .ok()
+        .and_then(|value| decode_clone_worker_capability(&value))
+        .and_then(|(pid, start_time)| i32::try_from(pid).ok().map(|pid| (pid, start_time)))
+        .is_some_and(|(pid, start_time)| process_is_alive(pid, start_time))
+}
+
+/// Whether the configured daemon can publish host-local clone-worker readiness.
+pub(crate) fn clone_worker_readiness_supported() -> bool {
+    let explicit = std::env::var_os("SMOLVM_CUDA_DAEMON");
+    let Some(cuda_socket) = local_cuda_daemon_socket(explicit.as_deref()) else {
+        return false;
+    };
+    // The managed daemon is always the current binary and preserves the
+    // existing fail-closed barrier. Explicit local daemons opt in by publishing
+    // a live, protocol-matched capability; remote TCP and legacy daemons do not.
+    explicit.is_none()
+        || clone_worker_readiness_supported_at(&cuda_socket, |pid, start_time| {
+            crate::process::is_our_process_strict(pid, Some(start_time))
+        })
 }
 
 fn encode_clone_worker_status(start_time: u64, status: CloneWorkerStatus) -> String {
@@ -163,11 +262,18 @@ fn prune_dead_clone_worker_statuses() {
     let Some(directory) = clone_worker_status_path(0).parent().map(Path::to_path_buf) else {
         return;
     };
+    prune_dead_clone_worker_statuses_in(&directory);
+}
+
+fn prune_dead_clone_worker_statuses_in(directory: &Path) {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
+        if entry.file_name() == std::ffi::OsStr::new(CLONE_WORKER_CAPABILITY_FILE) {
+            continue;
+        }
         // Publication uses a same-directory temporary file so rename is
         // atomic. Do not race that write: only reap a stranded temporary after
         // it is far older than the sub-millisecond publication window.
@@ -1263,6 +1369,10 @@ pub fn run(sock: &Path) -> io::Result<()> {
     // libcuda in the control plane. Pinning the daemon to PCI order makes that
     // mapping deterministic while still honoring CUDA_VISIBLE_DEVICES order.
     std::env::set_var("CUDA_DEVICE_ORDER", CUDA_DEVICE_ORDER);
+    // Clone workers inherit this exact bound path. An explicit daemon can live
+    // outside SMOLVM_DATA_DIR, so deriving readiness files from the default
+    // socket would make the control plane wait in the wrong directory.
+    std::env::set_var(CUDA_WORKER_STATUS_SOCKET_ENV, sock);
     // Become our own process-group leader so a clean-shutdown signal can take the
     // whole group (this daemon + its clone workers) down together without ever
     // touching the shell/ssh session that launched us. The `ensure_running` spawn
@@ -1305,6 +1415,10 @@ pub fn run(sock: &Path) -> io::Result<()> {
     // Per-VM uid isolation deliberately gives every VMM a distinct uid while
     // retaining only the shared kvm supplementary group. Grant that group
     // access to the daemon boundary without exposing it to unrelated host users.
+    if let Err(error) = publish_clone_worker_capability(sock) {
+        let _ = std::fs::remove_file(sock);
+        return Err(error);
+    }
     match spawn_tensor_bundle_service(sock) {
         Ok(path) => {
             TENSOR_BUNDLE_SERVICE_READY.store(true, Ordering::Release);
@@ -5904,16 +6018,18 @@ mod mps_tests {
     use super::{
         clone_layout_reservation_envelopes, clone_worker_idle_expired,
         clone_worker_idle_timeout_from, clone_worker_share_env, clone_worker_spawn_pace,
-        clone_worker_vm_is_alive, consume_procmem_preamble, create_host_snapshot_memfd,
-        create_private_mps_paths, daemon_has_live_cuda_clients, daemon_socket_access,
-        decode_attach_procmem, decode_clone_worker_status, disabled_worker_route,
-        encode_attach_procmem, encode_clone_worker_status, fork_snapshot_enabled,
+        clone_worker_status_dir_for, clone_worker_vm_is_alive, consume_procmem_preamble,
+        create_host_snapshot_memfd, create_private_mps_paths, daemon_has_live_cuda_clients,
+        daemon_socket_access, decode_attach_procmem, decode_clone_worker_capability,
+        decode_clone_worker_status, disabled_worker_route, encode_attach_procmem,
+        encode_clone_worker_capability, encode_clone_worker_status, fork_snapshot_enabled,
         golden_eviction_enabled, host_snapshot_fits, host_snapshot_reconstructable, lift_owned_fds,
-        live_host_snapshot_count, map_module_blob_fd, mps_enabled, ordinary_regions_are_reserved,
-        posix_spawn_clone_worker, prepare_module_blob, prepare_streamed_module_blob,
-        range_is_reserved, read_host_snapshot, reconstruct_golden_modules, recv_fd,
-        redeem_tensor_bundle_from_stream, seal_host_snapshot, select_golden_owner, send_fd,
-        send_tensor_bundle_to_parent, serve_tensor_bundle_consumer,
+        live_host_snapshot_count, local_cuda_daemon_socket, map_module_blob_fd, mps_enabled,
+        ordinary_regions_are_reserved, posix_spawn_clone_worker, prepare_module_blob,
+        prepare_streamed_module_blob, prune_dead_clone_worker_statuses_in,
+        publish_clone_worker_capability, range_is_reserved, read_host_snapshot,
+        reconstruct_golden_modules, recv_fd, redeem_tensor_bundle_from_stream, seal_host_snapshot,
+        select_golden_owner, send_fd, send_tensor_bundle_to_parent, serve_tensor_bundle_consumer,
         spawn_clone_attach_listener_with_timeout, spawn_tensor_bundle_receiver,
         unique_live_clone_worker, validate_tensor_bundle_metadata, write_module_handoff,
         CloneWorkerSpawnFds, CloneWorkerStatus, TENSOR_CONSUME_MAGIC,
@@ -6673,6 +6789,60 @@ mod mps_tests {
         assert_eq!(decode_clone_worker_status("42 ready trailing"), None);
         assert_eq!(decode_clone_worker_status("42 unknown"), None);
         assert_eq!(decode_clone_worker_status("ready"), None);
+    }
+
+    #[test]
+    fn explicit_daemon_readiness_uses_a_socket_scoped_directory() {
+        let socket = std::path::Path::new("/run/smolvm/custom.sock");
+        assert_eq!(
+            clone_worker_status_dir_for(socket),
+            std::path::Path::new("/run/smolvm/custom.sock.workers")
+        );
+        assert_eq!(
+            local_cuda_daemon_socket(Some(std::ffi::OsStr::new("/run/smolvm/custom.sock"))),
+            Some(socket.to_path_buf())
+        );
+        assert_eq!(
+            local_cuda_daemon_socket(Some(std::ffi::OsStr::new("gpu.example:7001"))),
+            None
+        );
+        assert_eq!(
+            local_cuda_daemon_socket(Some(std::ffi::OsStr::new("relative.sock"))),
+            None
+        );
+    }
+
+    #[test]
+    fn readiness_capability_is_protocol_bound_and_unambiguous() {
+        let encoded = encode_clone_worker_capability(42, 99);
+        assert_eq!(decode_clone_worker_capability(&encoded), Some((42, 99)));
+        assert_eq!(
+            decode_clone_worker_capability("1 42 99 0000000000000000\n"),
+            None
+        );
+        assert_eq!(
+            decode_clone_worker_capability(&format!("{} trailing", encoded.trim_end())),
+            None
+        );
+    }
+
+    #[test]
+    fn published_readiness_capability_identifies_the_live_daemon() {
+        let temporary = tempfile::tempdir().unwrap();
+        let socket = temporary.path().join("external.sock");
+        publish_clone_worker_capability(&socket).unwrap();
+        let capability = super::clone_worker_capability_path(&socket);
+        assert!(super::clone_worker_readiness_supported_at(
+            &socket,
+            |pid, started| pid == std::process::id() as i32
+                && crate::process::process_start_time(pid) == Some(started)
+        ));
+        assert!(!super::clone_worker_readiness_supported_at(
+            &socket,
+            |_, _| false
+        ));
+        prune_dead_clone_worker_statuses_in(capability.parent().unwrap());
+        assert!(capability.is_file());
     }
 
     #[test]
