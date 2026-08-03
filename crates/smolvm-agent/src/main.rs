@@ -3601,8 +3601,8 @@ fn handle_run_detached(
     Ok(())
 }
 
-/// Check whether a crun container is currently running by querying `crun state`
-/// and verifying the PID is still alive.
+/// Check whether a crun container is currently running from its persisted
+/// status record and the live process identity.
 ///
 /// Returns `false` on any error (missing state files, parse failures, etc.)
 /// so callers fall through to starting a fresh container.
@@ -3611,7 +3611,7 @@ pub fn is_container_running(container_id: &str) -> bool {
     crun_container_pid(container_id).is_some()
 }
 
-/// Init PID of a container that is registered, `running`, and whose process is
+/// Init PID of a container that is registered, started, and whose process is
 /// genuinely alive — `None` otherwise.
 ///
 /// Carries the liveness check [`is_container_running`] is now defined in terms
@@ -3620,31 +3620,96 @@ pub fn is_container_running(container_id: &str) -> bool {
 /// crun a second time and race the answer.
 #[cfg(target_os = "linux")]
 pub fn crun_container_pid(container_id: &str) -> Option<u32> {
-    let output = crun::CrunCommand::state(container_id)
-        .capture_output()
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let v: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    crun_container_pid_at(
+        container_id,
+        std::path::Path::new(paths::CRUN_ROOT_DIR),
+        std::path::Path::new("/proc"),
+    )
+}
 
-    if v.get("status").and_then(|s| s.as_str()) != Some("running") {
+#[cfg(target_os = "linux")]
+fn crun_container_pid_at(
+    container_id: &str,
+    state_root: &std::path::Path,
+    proc_root: &std::path::Path,
+) -> Option<u32> {
+    if !valid_crun_container_id(container_id) {
         return None;
     }
 
-    let pid = v.get("pid").and_then(|p| p.as_i64()).unwrap_or(0);
-    if pid <= 0 {
+    let state_dir = state_root.join(container_id);
+
+    // crun leaves exec.fifo present until `crun start` releases a created
+    // container. The old `crun state` path reported that state as `created`,
+    // not `running`; preserve that distinction without entering crun.
+    if state_dir.join("exec.fifo").exists() {
         return None;
     }
 
-    // kill(pid, 0) checks process existence without sending a signal.
-    // Handles stale "running" state left after SIGKILL of a container.
-    // SAFETY: signal 0 never terminates a process; checks existence only.
-    if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+    let status = std::fs::read(state_dir.join("status")).ok()?;
+    let identity = parse_crun_process_identity(&status)?;
+    let proc_stat =
+        std::fs::read_to_string(proc_root.join(identity.pid.to_string()).join("stat")).ok()?;
+    validate_crun_process_identity(identity, &proc_stat)
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CrunProcessIdentity {
+    pid: u32,
+    start_time: u64,
+}
+
+/// crun accepts only this deliberately small ID alphabet. Mirror it before
+/// constructing a state path so an overlay's persisted ID cannot escape the
+/// runtime root.
+#[cfg(target_os = "linux")]
+fn valid_crun_container_id(container_id: &str) -> bool {
+    !container_id.is_empty()
+        && !container_id.starts_with('.')
+        && container_id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'+' | b'.' | b'-'))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_crun_process_identity(status: &[u8]) -> Option<CrunProcessIdentity> {
+    let value: serde_json::Value = serde_json::from_slice(status).ok()?;
+    let pid = value
+        .get("pid")?
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())?;
+    if pid == 0 {
         return None;
     }
-    u32::try_from(pid).ok()
+    let start_time = value
+        .get("process-start-time")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    Some(CrunProcessIdentity { pid, start_time })
+}
+
+/// Verify the status record against `/proc/<pid>/stat`, including PID-reuse
+/// protection. Field 2 (`comm`) may contain spaces and `)`, so fields are
+/// counted only after its final closing parenthesis. `starttime` is field 22,
+/// or index 19 in that remainder (whose index 0 is field 3, process state).
+#[cfg(target_os = "linux")]
+fn validate_crun_process_identity(identity: CrunProcessIdentity, proc_stat: &str) -> Option<u32> {
+    let (_, remainder) = proc_stat.rsplit_once(')')?;
+    let fields: Vec<&str> = remainder.split_whitespace().collect();
+    let state = fields.first()?.as_bytes().first().copied()?;
+    if matches!(state, b'Z' | b'X') {
+        return None;
+    }
+    let actual_start_time = fields.get(19)?.parse::<u64>().ok()?;
+
+    // Older crun status files omit the start time (encoded here as zero). In
+    // that compatibility case the successfully-read, non-zombie proc record is
+    // still stronger than the old PID-only kill(0) check.
+    if identity.start_time != 0 && identity.start_time != actual_start_time {
+        return None;
+    }
+    Some(identity.pid)
 }
 
 /// Non-Linux stub.
@@ -6119,6 +6184,115 @@ mod bg_reap_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    fn proc_stat_fixture(pid: u32, state: char, start_time: u64) -> String {
+        let before_start = (1..=18)
+            .map(|field| field.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        // Deliberately put both spaces and ')' in comm to guard the parsing
+        // rule used by Linux and crun: the final ')' terminates field 2.
+        format!("{pid} (worker ) name) {state} {before_start} {start_time} 0")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn crun_container_ids_match_runtime_validation() {
+        for valid in ["smolvm-abc123", "UPPER_lower+1.2-3"] {
+            assert!(valid_crun_container_id(valid), "rejected valid ID {valid}");
+        }
+        for invalid in ["", ".hidden", "../escape", "with/slash", "with space"] {
+            assert!(
+                !valid_crun_container_id(invalid),
+                "accepted invalid ID {invalid}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn crun_container_pid_reads_status_without_runtime_subprocess() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("state");
+        let proc_root = temp.path().join("proc");
+        let state_dir = state_root.join("smolvm-test");
+        let proc_dir = proc_root.join("123");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::create_dir_all(&proc_dir).unwrap();
+        std::fs::write(
+            state_dir.join("status"),
+            br#"{"pid":123,"process-start-time":4242}"#,
+        )
+        .unwrap();
+        std::fs::write(proc_dir.join("stat"), proc_stat_fixture(123, 'S', 4242)).unwrap();
+
+        assert_eq!(
+            crun_container_pid_at("smolvm-test", &state_root, &proc_root),
+            Some(123)
+        );
+
+        // A still-created container has an init process, but is not yet a
+        // running workload and must not be selected for namespace entry.
+        std::fs::write(state_dir.join("exec.fifo"), []).unwrap();
+        assert_eq!(
+            crun_container_pid_at("smolvm-test", &state_root, &proc_root),
+            None
+        );
+
+        // Path traversal is rejected before any status lookup.
+        assert_eq!(
+            crun_container_pid_at("../smolvm-test", &state_root, &proc_root),
+            None
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn crun_status_identity_rejects_invalid_pids() {
+        assert_eq!(
+            parse_crun_process_identity(br#"{"pid":123,"process-start-time":456}"#),
+            Some(CrunProcessIdentity {
+                pid: 123,
+                start_time: 456
+            })
+        );
+        assert!(parse_crun_process_identity(br#"{"pid":0}"#).is_none());
+        assert!(parse_crun_process_identity(br#"{"pid":-1}"#).is_none());
+        assert!(parse_crun_process_identity(br#"{"pid":"123"}"#).is_none());
+        assert!(parse_crun_process_identity(br#"{"process-start-time":456}"#).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn crun_status_identity_is_start_time_and_state_verified() {
+        let identity = CrunProcessIdentity {
+            pid: 123,
+            start_time: 4242,
+        };
+        assert_eq!(
+            validate_crun_process_identity(identity, &proc_stat_fixture(123, 'S', 4242)),
+            Some(123)
+        );
+        assert!(
+            validate_crun_process_identity(identity, &proc_stat_fixture(123, 'S', 4243)).is_none()
+        );
+        assert!(
+            validate_crun_process_identity(identity, &proc_stat_fixture(123, 'Z', 4242)).is_none()
+        );
+        assert!(validate_crun_process_identity(identity, "malformed proc stat").is_none());
+
+        // crun treats a missing/zero recorded start time as a legacy status
+        // file. We still require a readable, non-zombie /proc identity.
+        let legacy = CrunProcessIdentity {
+            pid: 321,
+            start_time: 0,
+        };
+        assert_eq!(
+            validate_crun_process_identity(legacy, &proc_stat_fixture(321, 'I', 9999)),
+            Some(321)
+        );
+    }
 
     // Regression for `--dns` being silently dropped on the TSI backend: an
     // explicit override must win over whatever is currently in resolv.conf,
