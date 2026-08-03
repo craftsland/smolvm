@@ -2017,6 +2017,43 @@ impl AgentManager {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| exe.clone());
         let mut cmd = std::process::Command::new(&boot_exe);
+        // libkrun dlopen()s libkrunfw by bare soname at krun_start_enter time and
+        // carries no rpath, so the dynamic linker must be told where to look
+        // BEFORE the child launches — the loader caches its search path at
+        // process start, so the set_var the launcher does inside the child is too
+        // late for that inner dlopen. Point it at the dirs holding the libs: an
+        // explicit SMOLVM_LIB_DIR, the directory next to the boot binary (the
+        // bundled SDK ships smol-vmm beside libkrun/libkrunfw), and that dir's
+        // `lib/` subdir (the CLI tarball layout). Existing value is preserved.
+        // Without this, in-process embedders that don't inherit a wrapper's
+        // DYLD_LIBRARY_PATH (the Node/Bun SDK) fail every local boot with
+        // "Couldn't find or load libkrunfw" → krun_start_enter -2.
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let mut search: Vec<std::path::PathBuf> = Vec::new();
+            if let Some(dir) = std::env::var_os("SMOLVM_LIB_DIR") {
+                search.push(std::path::PathBuf::from(dir));
+            }
+            if let Some(parent) = boot_exe.parent() {
+                search.push(parent.to_path_buf());
+                search.push(parent.join("lib"));
+            }
+            let var = if cfg!(target_os = "macos") {
+                "DYLD_LIBRARY_PATH"
+            } else {
+                "LD_LIBRARY_PATH"
+            };
+            if let Some(existing) = std::env::var_os(var) {
+                if !existing.is_empty() {
+                    search.push(std::path::PathBuf::from(existing));
+                }
+            }
+            if !search.is_empty() {
+                if let Ok(joined) = std::env::join_paths(search) {
+                    cmd.env(var, joined);
+                }
+            }
+        }
         cmd.args(["_boot-vm", &config_path.to_string_lossy()])
             .env(
                 "SMOLVM_BOOT_WATCH_PARENT",
