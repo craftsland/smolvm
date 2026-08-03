@@ -618,7 +618,11 @@ impl SmolvmDb {
         F: FnOnce(&mut VmRecord),
     {
         self.with_conn(|conn| {
-            let tx = conn.transaction().db_err("begin transaction")?;
+            // Reserve the writer before reading. A deferred transaction can
+            // fail with SQLITE_BUSY_SNAPSHOT when it upgrades to a write.
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .db_err("begin transaction")?;
 
             let data: Option<Vec<u8>> = tx
                 .query_row(
@@ -1981,6 +1985,52 @@ mod tests {
         assert_eq!(removed.name, "test-vm");
 
         assert!(db.get_vm("test-vm").unwrap().is_none());
+    }
+
+    #[test]
+    fn concurrent_vm_updates_wait_instead_of_failing_busy_snapshot() {
+        let (_dir, db) = temp_db();
+        for name in ["slot-0", "slot-1"] {
+            db.insert_vm(
+                name,
+                &VmRecord::new(name.to_string(), 1, 256, vec![], vec![], false),
+            )
+            .unwrap();
+        }
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_db = db.clone();
+        let first = std::thread::spawn(move || {
+            first_db.update_vm("slot-0", |record| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                record.forkpoint_held = false;
+            })
+        });
+        entered_rx.recv().unwrap();
+
+        let (second_started_tx, second_started_rx) = std::sync::mpsc::channel();
+        let (second_entered_tx, second_entered_rx) = std::sync::mpsc::channel();
+        let second_db = db.clone();
+        let second = std::thread::spawn(move || {
+            second_started_tx.send(()).unwrap();
+            second_db.update_vm("slot-1", |record| {
+                second_entered_tx.send(()).unwrap();
+                record.forkpoint_held = false;
+            })
+        });
+        second_started_rx.recv().unwrap();
+        let entered_while_first_active = second_entered_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_ok();
+        release_tx.send(()).unwrap();
+
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+        assert!(!entered_while_first_active);
+        assert!(!db.get_vm("slot-0").unwrap().unwrap().forkpoint_held);
+        assert!(!db.get_vm("slot-1").unwrap().unwrap().forkpoint_held);
     }
 
     /// A read must not block behind a stalled write. Before the connection pool,
