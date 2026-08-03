@@ -76,8 +76,10 @@ package() {
     install -Dm0755 smolvm-bin "$pkgdir/usr/lib/smolvm/smolvm-bin"
     cp -a lib "$pkgdir/usr/lib/smolvm/lib"
     cp -r agent-rootfs "$pkgdir/usr/lib/smolvm/agent-rootfs"
-    # pre-formatted storage template (optional at runtime; saves a mkfs on first pack)
-    install -Dm644 storage-template.ext4 "$pkgdir/usr/lib/smolvm/storage-template.ext4"
+    # pre-formatted disk templates, zstd-compressed (optional at runtime; the
+    # engine expands them to sparse files on first use, saving a mkfs)
+    install -Dm644 storage-template.ext4.zst "$pkgdir/usr/lib/smolvm/storage-template.ext4.zst"
+    install -Dm644 overlay-template.ext4.zst "$pkgdir/usr/lib/smolvm/overlay-template.ext4.zst"
     install -Dm644 "../LICENSE-$pkgver" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
     install -Dm644 README.txt "$pkgdir/usr/share/doc/$pkgname/README.txt"
 }
