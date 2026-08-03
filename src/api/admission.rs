@@ -17,9 +17,11 @@ const MIN_STABLE_SAMPLES: u32 = 5;
 const PRESSURE_TTL: Duration = Duration::from_secs(30);
 const REPROBE_INTERVAL: Duration = Duration::from_secs(15 * 60);
 #[cfg(any(target_os = "linux", test))]
-const MIN_VRAM_RESERVE_MIB: u64 = 8 * 1024;
+const TARGET_VRAM_RESERVE_MIB: u64 = 8 * 1024;
 #[cfg(any(target_os = "linux", test))]
 const VRAM_RESERVE_PERCENT: u64 = 10;
+#[cfg(any(target_os = "linux", test))]
+const SMALL_DEVICE_RESERVE_CAP_PERCENT: u64 = 25;
 const CPU_SATURATION_PERCENT: f64 = 90.0;
 const MARGINAL_GAIN_PERCENT: f64 = 2.0;
 const MIN_GPU_ACTIVITY_PERCENT: f64 = 10.0;
@@ -67,7 +69,14 @@ impl GpuSample {
 
 #[cfg(any(target_os = "linux", test))]
 fn device_reserve_mib(total_memory_mib: u64) -> u64 {
-    MIN_VRAM_RESERVE_MIB.max(total_memory_mib.saturating_mul(VRAM_RESERVE_PERCENT) / 100)
+    let percentage_reserve = total_memory_mib.saturating_mul(VRAM_RESERVE_PERCENT) / 100;
+    // An absolute 8 GiB reserve would consume all capacity on an 8 GiB GPU and
+    // prevent automatic admission from ever testing a larger safe residency.
+    // Retain at least 10%, while capping the absolute target at one quarter of
+    // smaller devices so calibration still has useful capacity to explore.
+    let absolute_reserve = TARGET_VRAM_RESERVE_MIB
+        .min(total_memory_mib.saturating_mul(SMALL_DEVICE_RESERVE_CAP_PERCENT) / 100);
+    percentage_reserve.max(absolute_reserve)
 }
 
 /// Public, read-only controller state returned with pool status.
@@ -131,6 +140,7 @@ struct PoolAdmissionState {
     host_cpu_sum: f64,
     window_peak_gpu_memory_mib: u64,
     idle_gpu_memory_mib: Option<u64>,
+    waiting_for_maturity: bool,
     completed_at_start: u64,
     latest_gpu: Option<GpuSample>,
     latest_host_cpu_percent: Option<f64>,
@@ -168,6 +178,7 @@ impl PoolAdmissionState {
             host_cpu_sum: 0.0,
             window_peak_gpu_memory_mib: 0,
             idle_gpu_memory_mib: None,
+            waiting_for_maturity: false,
             completed_at_start: completed_total,
             latest_gpu: None,
             latest_host_cpu_percent: None,
@@ -183,6 +194,7 @@ impl PoolAdmissionState {
         self.gpu_utilization_sum = 0.0;
         self.host_cpu_sum = 0.0;
         self.window_peak_gpu_memory_mib = 0;
+        self.waiting_for_maturity = false;
         self.completed_at_start = completed_total;
     }
 
@@ -288,8 +300,13 @@ impl PoolAdmissionState {
         let mean_gpu = self.gpu_utilization_sum / f64::from(self.window_samples);
         let mean_cpu = self.host_cpu_sum / f64::from(self.window_samples);
         let completed = completed_total.saturating_sub(self.completed_at_start);
-        let completion_rate = (completed > 0 && elapsed.as_secs_f64() > 0.0)
-            .then(|| completed as f64 / elapsed.as_secs_f64());
+        // A partial cohort is phase-sensitive: two completions from a
+        // three-resident probe can look identical to the prior two-resident
+        // rate even when the third job is about to finish. Judge finite jobs
+        // only after every resident slot has completed once in this window.
+        let completion_rate =
+            (active > 0 && completed >= u64::from(active) && elapsed.as_secs_f64() > 0.0)
+                .then(|| completed as f64 / elapsed.as_secs_f64());
         let score = Score {
             gpu_utilization_percent: mean_gpu,
             completion_rate,
@@ -299,6 +316,33 @@ impl PoolAdmissionState {
             .saturating_sub(self.window_peak_gpu_memory_mib);
         let memory_safe = gpu.memory_safe() && observed_free_mib >= gpu.reserve_mib;
         let cpu_safe = mean_cpu < CPU_SATURATION_PERCENT;
+
+        if memory_safe
+            && cpu_safe
+            && self.waiting_for_maturity
+            && completion_rate.is_none()
+            && gpu.utilization_percent >= MIN_GPU_ACTIVITY_PERCENT
+        {
+            self.reset_window(now, active, completed_total);
+            self.reason = format!(
+                "CUDA activity observed; starting a mature window at resident limit {}",
+                self.effective_limit
+            );
+            return;
+        }
+        if memory_safe
+            && cpu_safe
+            && completion_rate.is_none()
+            && mean_gpu < MIN_GPU_ACTIVITY_PERCENT
+        {
+            self.waiting_for_maturity = true;
+            self.reason = format!(
+                "waiting for CUDA activity or {active} completions before evaluating resident limit {}",
+                self.effective_limit
+            );
+            return;
+        }
+        self.waiting_for_maturity = false;
 
         if let Some((prior_limit, prior_score)) = self.testing_from.take() {
             let improvement = score.improvement_over(prior_score);
@@ -359,32 +403,32 @@ impl PoolAdmissionState {
         }
 
         if !self.settled && self.has_pressure(now) && memory_safe && cpu_safe {
-            if completion_rate.is_none() && mean_gpu < MIN_GPU_ACTIVITY_PERCENT {
-                self.reason = format!(
-                    "waiting for CUDA activity or a completion before probing beyond {}",
-                    self.effective_limit
-                );
-                self.reset_window(now, active, completed_total);
-                return;
-            }
-            let next = self.effective_limit.saturating_mul(2).min(self.ceiling);
-            if next > self.effective_limit {
-                let projected_free_mib = self
-                    .projected_free_memory_mib(gpu, active, next)
-                    .unwrap_or(observed_free_mib);
-                if projected_free_mib < gpu.reserve_mib {
+            let desired_next = self.effective_limit.saturating_mul(2).min(self.ceiling);
+            if desired_next > self.effective_limit {
+                let Some((next, projected_free_mib)) =
+                    self.largest_memory_safe_candidate(gpu, active, desired_next)
+                else {
+                    let projected_free_mib = self
+                        .projected_free_memory_mib(gpu, active, desired_next)
+                        .unwrap_or(observed_free_mib);
                     self.settled = true;
                     self.last_probe = now;
                     self.reason = format!(
-                        "holding at {}: projected limit {next} leaves {projected_free_mib} MiB free; preserving {} MiB reserve",
+                        "holding at {}: projected limit {desired_next} leaves {projected_free_mib} MiB free; preserving {} MiB reserve",
                         self.effective_limit, gpu.reserve_mib
                     );
                     self.reset_window(now, active, completed_total);
                     return;
-                }
+                };
                 self.testing_from = Some((self.effective_limit, score));
                 self.effective_limit = next;
-                self.reason = format!("probing resident limit {next}");
+                self.reason = if next == desired_next {
+                    format!("probing resident limit {next}")
+                } else {
+                    format!(
+                        "probing memory-safe resident limit {next}; projected free memory {projected_free_mib} MiB"
+                    )
+                };
                 self.reset_window(now, active, completed_total);
                 return;
             }
@@ -435,6 +479,31 @@ impl PoolAdmissionState {
             gpu.total_memory_mib
                 .saturating_sub(peak.saturating_add(projected_additional)),
         )
+    }
+
+    fn largest_memory_safe_candidate(
+        &self,
+        gpu: GpuSample,
+        active: u32,
+        upper: u32,
+    ) -> Option<(u32, u64)> {
+        if active == 0 || upper <= active {
+            return None;
+        }
+        let mut low = active.saturating_add(1);
+        let mut high = upper;
+        let mut best = None;
+        while low <= high {
+            let candidate = low + (high - low) / 2;
+            let projected_free = self.projected_free_memory_mib(gpu, active, candidate)?;
+            if projected_free >= gpu.reserve_mib {
+                best = Some((candidate, projected_free));
+                low = candidate.saturating_add(1);
+            } else {
+                high = candidate.saturating_sub(1);
+            }
+        }
+        best
     }
 
     fn snapshot(&self) -> AdmissionSnapshot {
@@ -1259,10 +1328,18 @@ mod tests {
     fn heterogeneous_devices_each_use_their_own_reserve() {
         let small = GpuSample::new(0, 70.0, 15 * 1024, 9 * 1024, 24 * 1024);
         let large = GpuSample::new(1, 80.0, 135 * 1024, 25 * 1024, 160 * 1024);
-        assert_eq!(small.reserve_mib, 8 * 1024);
+        assert_eq!(small.reserve_mib, 6 * 1024);
         assert_eq!(large.reserve_mib, 16 * 1024);
         assert!(small.memory_safe());
         assert!(large.memory_safe());
+    }
+
+    #[test]
+    fn small_devices_keep_proportional_headroom() {
+        assert_eq!(device_reserve_mib(8 * 1024), 2 * 1024);
+        assert_eq!(device_reserve_mib(16 * 1024), 4 * 1024);
+        assert_eq!(device_reserve_mib(32 * 1024), 8 * 1024);
+        assert_eq!(device_reserve_mib(80 * 1024), 8 * 1024);
     }
 
     #[test]
@@ -1429,24 +1506,190 @@ mod tests {
         assert!(waiting.calibrating);
         assert!(waiting.reason.contains("waiting for CUDA activity"));
 
-        // Once CUDA is active, the mature eight-worker footprint projects a
-        // 16-worker candidate below the device reserve, so calibration settles
-        // without releasing the unsafe wave.
+        // Once CUDA is active, the mature eight-worker footprint rejects the
+        // unsafe 16-worker doubling step but identifies 14 as the largest
+        // candidate that preserves the device reserve.
         stable_window(
             &registry,
             &pool,
             start + Duration::from_secs(8),
             (8, 0, 90.0, 58_119, 65.0),
         );
+        assert_eq!(pool_limit(&registry, &pool), Some(14));
+        let probing = registry.snapshot(&pool).unwrap();
+        assert!(probing.calibrating);
+
+        // The memory-safe candidate still has to produce a measurable gain.
+        stable_window(
+            &registry,
+            &pool,
+            start + Duration::from_secs(17),
+            (14, 0, 90.0, 71_919, 65.0),
+        );
         assert_eq!(pool_limit(&registry, &pool), Some(8));
         let settled = registry.snapshot(&pool).unwrap();
         assert!(!settled.calibrating);
+        assert!(settled.reason.contains("marginal gain"));
+    }
+
+    #[test]
+    fn small_device_probes_between_current_and_unsafe_doubling_step() {
+        let registry = AdmissionRegistry::default();
+        let pool = pool(6);
+        let start = Instant::now();
+        let small_gpu = |utilization, used| {
+            Some(GpuSample::new(
+                0,
+                utilization,
+                used,
+                8 * 1024 - used,
+                8 * 1024,
+            ))
+        };
+        registry.observe_at(&pool, 0, 0, small_gpu(0.0, 800), Some(10.0), start);
+        registry.note_blocked("rollouts");
+        for second in 0..=8 {
+            registry.observe_at(
+                &pool,
+                2,
+                u64::from(second == 8),
+                small_gpu(90.0, 4_200),
+                Some(40.0),
+                start + Duration::from_secs(second),
+            );
+        }
+
+        let snapshot = registry.snapshot(&pool).unwrap();
+        assert_eq!(snapshot.effective_limit, 3);
+        assert!(snapshot.calibrating);
+        assert!(snapshot.reason.contains("memory-safe resident limit 3"));
+    }
+
+    #[test]
+    fn partial_candidate_cohort_does_not_trigger_a_phase_biased_rollback() {
+        let registry = AdmissionRegistry::default();
+        let pool = pool(6);
+        let start = Instant::now();
+        let small_gpu = |used| Some(GpuSample::new(0, 0.0, used, 8 * 1024 - used, 8 * 1024));
+        registry.observe_at(&pool, 0, 0, small_gpu(800), Some(10.0), start);
+        registry.note_blocked("rollouts");
+
+        for second in 0..=8 {
+            registry.observe_at(
+                &pool,
+                2,
+                if second == 8 { 2 } else { 0 },
+                small_gpu(4_200),
+                Some(40.0),
+                start + Duration::from_secs(second),
+            );
+        }
+        assert_eq!(pool_limit(&registry, &pool), Some(3));
+
+        // Only two of the three candidate residents have completed. The old
+        // eight-second comparison treated this as zero marginal gain and
+        // rolled back immediately, just before the third completion arrived.
+        for second in 0..=8 {
+            registry.observe_at(
+                &pool,
+                3,
+                if second == 8 { 4 } else { 2 },
+                small_gpu(4_700),
+                Some(40.0),
+                start + Duration::from_secs(9 + second),
+            );
+        }
+        let snapshot = registry.snapshot(&pool).unwrap();
+        assert_eq!(snapshot.effective_limit, 3);
+        assert!(snapshot.calibrating);
+        assert!(snapshot.reason.contains("3 completions"));
+    }
+
+    #[test]
+    fn complete_candidate_cohort_settles_at_intermediate_limit() {
+        let registry = AdmissionRegistry::default();
+        let pool = pool(6);
+        let start = Instant::now();
+        let small_gpu = |used| Some(GpuSample::new(0, 0.0, used, 8 * 1024 - used, 8 * 1024));
+        registry.observe_at(&pool, 0, 0, small_gpu(800), Some(10.0), start);
+        registry.note_blocked("rollouts");
+
+        for second in 0..=8 {
+            registry.observe_at(
+                &pool,
+                2,
+                if second == 8 { 2 } else { 0 },
+                small_gpu(4_200),
+                Some(40.0),
+                start + Duration::from_secs(second),
+            );
+        }
+        assert_eq!(pool_limit(&registry, &pool), Some(3));
+
+        for second in 0..=8 {
+            registry.observe_at(
+                &pool,
+                3,
+                if second == 8 { 5 } else { 2 },
+                small_gpu(5_000),
+                Some(40.0),
+                start + Duration::from_secs(9 + second),
+            );
+        }
+
+        let snapshot = registry.snapshot(&pool).unwrap();
+        assert_eq!(snapshot.effective_limit, 3);
+        assert!(!snapshot.calibrating);
         assert!(
-            settled.reason.contains("projected limit 16"),
+            snapshot.reason.contains("holding at 3"),
             "{}",
-            settled.reason
+            snapshot.reason
         );
-        assert!(settled.reason.contains("preserving 8192 MiB reserve"));
+    }
+
+    #[test]
+    fn partial_candidate_memory_pressure_rolls_back_without_waiting_for_cohort() {
+        let registry = AdmissionRegistry::default();
+        let pool = pool(6);
+        let start = Instant::now();
+        let small_gpu = |used| Some(GpuSample::new(0, 0.0, used, 8 * 1024 - used, 8 * 1024));
+        registry.observe_at(&pool, 0, 0, small_gpu(800), Some(10.0), start);
+        registry.note_blocked("rollouts");
+
+        for second in 0..=8 {
+            registry.observe_at(
+                &pool,
+                2,
+                if second == 8 { 2 } else { 0 },
+                small_gpu(4_200),
+                Some(40.0),
+                start + Duration::from_secs(second),
+            );
+        }
+        assert_eq!(pool_limit(&registry, &pool), Some(3));
+
+        // Incomplete jobs and low GPU activity can extend a candidate's
+        // maturity window, but must never defer rollback after memory headroom
+        // drops below the device reserve.
+        for second in 0..=8 {
+            registry.observe_at(
+                &pool,
+                3,
+                2,
+                small_gpu(7_000),
+                Some(40.0),
+                start + Duration::from_secs(9 + second),
+            );
+        }
+
+        let snapshot = registry.snapshot(&pool).unwrap();
+        assert_eq!(snapshot.effective_limit, 2);
+        assert!(!snapshot.calibrating);
+        assert!(
+            snapshot.reason.contains("limiting GPU has 1192 MiB free"),
+            "{}",
+            snapshot.reason
+        );
     }
 
     #[test]
@@ -1458,10 +1701,10 @@ mod tests {
         registry.note_blocked("rollouts");
 
         stable_window(&registry, &pool, start, (4, 0, 60.0, 45_000, 50.0));
-        assert_eq!(pool_limit(&registry, &pool), Some(4));
+        assert_eq!(pool_limit(&registry, &pool), Some(6));
         let snapshot = registry.snapshot(&pool).unwrap();
-        assert!(!snapshot.calibrating);
-        assert!(snapshot.reason.contains("projected limit 8"));
+        assert!(snapshot.calibrating);
+        assert!(snapshot.reason.contains("memory-safe resident limit 6"));
     }
 
     #[test]
@@ -1476,14 +1719,14 @@ mod tests {
         // unrelated process exits. Do not interpret that stale baseline as a
         // zero-byte worker footprint and release another residency wave.
         stable_window(&registry, &pool, start, (4, 0, 60.0, 45_000, 50.0));
-        assert_eq!(pool_limit(&registry, &pool), Some(4));
+        assert_eq!(pool_limit(&registry, &pool), Some(6));
         let snapshot = registry.snapshot(&pool).unwrap();
-        assert!(!snapshot.calibrating);
-        assert!(snapshot.reason.contains("projected limit 8"));
+        assert!(snapshot.calibrating);
+        assert!(snapshot.reason.contains("memory-safe resident limit 6"));
     }
 
     #[test]
-    fn a_completed_cpu_heavy_job_is_a_mature_calibration_signal() {
+    fn a_completed_cpu_heavy_cohort_is_a_mature_calibration_signal() {
         let registry = AdmissionRegistry::default();
         let pool = pool(12);
         let start = Instant::now();
@@ -1494,7 +1737,7 @@ mod tests {
             registry.observe_at(
                 &pool,
                 4,
-                u64::from(second == 8),
+                if second == 8 { 4 } else { 0 },
                 gpu(0.0, 20_000),
                 Some(50.0),
                 start + Duration::from_secs(second),
