@@ -1402,7 +1402,9 @@ pub(crate) struct ForkHeldBatch {
     pub share_weights: bool,
     pub ready_timeout: std::time::Duration,
     pub retained_snapshot: Option<crate::agent::fork::RetainedForkSnapshot>,
-    pub max_parallel: usize,
+    pub boot_slots: Arc<tokio::sync::Semaphore>,
+    pub snapshot_ready:
+        Option<tokio::sync::oneshot::Sender<crate::agent::fork::RetainedForkSnapshot>>,
 }
 
 pub(crate) async fn fork_held_machines_inner(
@@ -1416,7 +1418,8 @@ pub(crate) async fn fork_held_machines_inner(
         share_weights,
         ready_timeout,
         retained_snapshot,
-        max_parallel,
+        boot_slots,
+        mut snapshot_ready,
     } = batch;
     if clones.is_empty() {
         return Ok(ForkBatchOutcome { retained_snapshot });
@@ -1475,7 +1478,6 @@ pub(crate) async fn fork_held_machines_inner(
     let snapshot_reused = prepared.snapshot_reused;
     let reusable_snapshot = prepared.retained_snapshot;
     let pending_boots = prepared.forks.len();
-    let boot_slots = Arc::new(tokio::sync::Semaphore::new(max_parallel.max(1)));
     let boots = prepared.forks.into_iter().zip(clones).map(|(prep, clone)| {
         let state = state.clone();
         let boot_slots = boot_slots.clone();
@@ -1510,6 +1512,13 @@ pub(crate) async fn fork_held_machines_inner(
     // width; completed results are still reported as soon as each is usable.
     let any_succeeded = run_bounded_futures(boots, pending_boots, |result| {
         let succeeded = result.1.is_ok();
+        if succeeded {
+            if let (Some(sender), Some(snapshot)) =
+                (snapshot_ready.take(), reusable_snapshot.clone())
+            {
+                let _ = sender.send(snapshot);
+            }
+        }
         if result_tx.send(result).is_err() {
             tracing::warn!("fork pool result receiver closed before provisioning completed");
         }
@@ -2802,6 +2811,60 @@ mod tests {
             result_rx.recv().await.expect("remaining result");
         }
         assert!(runner.await.expect("runner task"));
+    }
+
+    #[tokio::test]
+    async fn shared_boot_slots_bound_independent_batches() {
+        const WIDTH: usize = 2;
+        const PER_BATCH: usize = 4;
+
+        let boot_slots = Arc::new(tokio::sync::Semaphore::new(WIDTH));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (started_tx, mut started_rx) = tokio::sync::watch::channel(0usize);
+        let build_batch = |offset| {
+            (0..PER_BATCH)
+                .map(|index| {
+                    let boot_slots = boot_slots.clone();
+                    let release = release.clone();
+                    let active = active.clone();
+                    let peak = peak.clone();
+                    let started_tx = started_tx.clone();
+                    async move {
+                        let permit = boot_slots.acquire_owned().await.expect("scheduler open");
+                        let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now_active, Ordering::SeqCst);
+                        started_tx.send_modify(|started| *started += 1);
+                        let gate = release.acquire().await.expect("test gate open");
+                        gate.forget();
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        drop(permit);
+                        offset + index
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let first = build_batch(0);
+        let second = build_batch(PER_BATCH);
+        drop(started_tx);
+
+        let first =
+            tokio::spawn(async move { run_bounded_futures(first, PER_BATCH, |_| true).await });
+        let second =
+            tokio::spawn(async move { run_bounded_futures(second, PER_BATCH, |_| true).await });
+
+        while *started_rx.borrow() < WIDTH {
+            started_rx.changed().await.expect("boots still pending");
+        }
+        assert_eq!(active.load(Ordering::SeqCst), WIDTH);
+        assert_eq!(peak.load(Ordering::SeqCst), WIDTH);
+
+        release.add_permits(PER_BATCH * 2);
+        assert!(first.await.expect("first batch task"));
+        assert!(second.await.expect("second batch task"));
+        assert_eq!(peak.load(Ordering::SeqCst), WIDTH);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
     }
 
     #[test]

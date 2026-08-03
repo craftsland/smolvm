@@ -31,6 +31,7 @@ pub struct ForkPoolController {
     nvml: Option<crate::api::admission::NvmlSampler>,
     host_cpu: crate::api::admission::HostCpuSampler,
     retained_snapshots: RetainedSnapshotMap,
+    boot_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl ForkPoolController {
@@ -51,6 +52,7 @@ impl ForkPoolController {
             nvml,
             host_cpu: crate::api::admission::HostCpuSampler::default(),
             retained_snapshots: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            boot_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_POOL_BOOTS)),
         }
     }
 
@@ -226,9 +228,10 @@ impl ForkPoolController {
             if deficit > 0 && self.filling.insert(pool.name.clone()) {
                 let state = self.state.clone();
                 let retained_snapshots = self.retained_snapshots.clone();
+                let boot_slots = self.boot_slots.clone();
                 let pool_name = pool.name.clone();
                 self.fills.spawn(async move {
-                    Self::fill_pool(state, pool, retained_snapshots).await;
+                    Self::fill_pool(state, pool, retained_snapshots, boot_slots).await;
                     pool_name
                 });
             }
@@ -412,12 +415,13 @@ impl ForkPoolController {
         state: Arc<ApiState>,
         pool: ForkPoolRecord,
         retained_snapshots: RetainedSnapshotMap,
+        boot_slots: Arc<tokio::sync::Semaphore>,
     ) {
         // A golden can produce only one RAM checkpoint at a time. Keep the
         // lifecycle lock through snapshot publication so another pool sharing
         // this golden reads the proven retained checkpoint instead of issuing
         // a second FORK command after the first caller has paused the VM.
-        let _golden_guard = state.lifecycle_lock(&pool.golden).lock_owned().await;
+        let golden_guard = state.lifecycle_lock(&pool.golden).lock_owned().await;
 
         // Bound each pool's work so a large cold fill cannot starve expiry and
         // cleanup for every other pool. Reserve the bounded deficit first so all
@@ -464,6 +468,7 @@ impl ForkPoolController {
         let retained_snapshot = retained_snapshots.lock().get(&pool.golden).cloned();
         let retained_snapshot_hint = retained_snapshot.clone();
         let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (snapshot_ready_tx, snapshot_ready_rx) = tokio::sync::oneshot::channel();
         let provision = fork_held_machines_inner(
             state.clone(),
             ForkHeldBatch {
@@ -472,7 +477,8 @@ impl ForkPoolController {
                 share_weights: pool.share_weights,
                 ready_timeout: Duration::from_secs(pool.ready_timeout_secs),
                 retained_snapshot,
-                max_parallel: MAX_CONCURRENT_POOL_BOOTS,
+                boot_slots,
+                snapshot_ready: Some(snapshot_ready_tx),
             },
             result_tx,
         );
@@ -484,16 +490,41 @@ impl ForkPoolController {
             }
             completed
         };
-        let (provision_result, completed) = tokio::join!(provision, process_results);
+        let manage_provision = async {
+            tokio::pin!(provision);
+            let mut golden_guard = Some(golden_guard);
+            let mut published_early = false;
+            let provision_result = tokio::select! {
+                ready = snapshot_ready_rx => {
+                    if let Ok(snapshot) = ready {
+                        update_retained_snapshot(
+                            &mut retained_snapshots.lock(),
+                            &pool.golden,
+                            retained_snapshot_hint.as_ref(),
+                            Some(snapshot),
+                        );
+                        published_early = true;
+                        drop(golden_guard.take());
+                    }
+                    provision.await
+                }
+                result = &mut provision => result,
+            };
+            (provision_result, published_early)
+        };
+        let ((provision_result, published_early), completed) =
+            tokio::join!(manage_provision, process_results);
 
         match provision_result {
             Ok(outcome) => {
-                update_retained_snapshot(
-                    &mut retained_snapshots.lock(),
-                    &pool.golden,
-                    retained_snapshot_hint.as_ref(),
-                    outcome.retained_snapshot,
-                );
+                if !published_early {
+                    update_retained_snapshot(
+                        &mut retained_snapshots.lock(),
+                        &pool.golden,
+                        retained_snapshot_hint.as_ref(),
+                        outcome.retained_snapshot,
+                    );
+                }
             }
             Err(error) => {
                 tracing::warn!(pool = %pool.name, error = ?error, workers = machines.len(), "failed to prepare fork pool worker batch");
