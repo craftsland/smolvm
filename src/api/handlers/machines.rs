@@ -1463,6 +1463,7 @@ pub(crate) async fn fork_held_machines_inner(
                 &golden_for_prep,
                 &specs,
                 retained_snapshot.as_ref(),
+                true,
             )
         })
         .await
@@ -1473,7 +1474,7 @@ pub(crate) async fn fork_held_machines_inner(
     let snapshot_dir = prepared.forks[0].snapshot_dir.clone();
     let resume_golden_on_rollback = prepared.forks[0].resume_golden_on_rollback;
     let snapshot_reused = prepared.snapshot_reused;
-    let reusable_snapshot = prepared.retained_snapshot;
+    let reusable_snapshot = prepared.retained_snapshot.clone();
     let pending_boots = prepared.forks.len();
     let boot_slots = Arc::new(tokio::sync::Semaphore::new(max_parallel.max(1)));
     let boots = prepared.forks.into_iter().zip(clones).map(|(prep, clone)| {
@@ -1520,13 +1521,20 @@ pub(crate) async fn fork_held_machines_inner(
     // If every restore failed, no clone depends on this checkpoint and an
     // initially-running golden can safely resume for a later retry. A partial
     // success must retain the paused golden and shared snapshot.
+    let mut rollback_completed = true;
     if !any_succeeded && !snapshot_reused {
-        if let Err(error) = std::fs::remove_dir_all(&snapshot_dir) {
-            tracing::warn!(path = %snapshot_dir.display(), %error, "failed to remove unused batch fork snapshot");
-        }
         if resume_golden_on_rollback {
             if let Err(error) = crate::agent::fork::resume_golden(&golden) {
                 tracing::warn!(%golden, %error, "failed to resume golden after batch restore failure");
+                rollback_completed = false;
+            }
+        }
+        if rollback_completed {
+            if let Err(error) = state.db().remove_fork_pool_snapshot(&golden) {
+                tracing::warn!(%golden, %error, "failed to remove rolled-back fork pool checkpoint");
+            }
+            if let Err(error) = std::fs::remove_dir_all(&snapshot_dir) {
+                tracing::warn!(path = %snapshot_dir.display(), %error, "failed to remove unused batch fork snapshot");
             }
         }
     }
@@ -1536,6 +1544,7 @@ pub(crate) async fn fork_held_machines_inner(
         retained_snapshot: retained_snapshot_after_boots(
             snapshot_reused,
             any_succeeded,
+            rollback_completed,
             reusable_snapshot,
         ),
     })
@@ -1544,12 +1553,13 @@ pub(crate) async fn fork_held_machines_inner(
 fn retained_snapshot_after_boots(
     snapshot_reused: bool,
     any_succeeded: bool,
+    rollback_completed: bool,
     reusable_snapshot: Option<crate::agent::fork::RetainedForkSnapshot>,
 ) -> Option<crate::agent::fork::RetainedForkSnapshot> {
     // A failed boot does not invalidate a checkpoint that preparation just
     // verified against the paused golden. Keep it so a transient KVM or guest
     // readiness failure cannot strand that golden without a refill path.
-    (snapshot_reused || any_succeeded)
+    (snapshot_reused || any_succeeded || !rollback_completed)
         .then_some(reusable_snapshot)
         .flatten()
 }
@@ -2700,7 +2710,7 @@ mod tests {
     fn failed_reused_checkpoint_remains_available_for_retry() {
         let snapshot = retained_snapshot();
         assert_eq!(
-            retained_snapshot_after_boots(true, false, Some(snapshot.clone())),
+            retained_snapshot_after_boots(true, false, true, Some(snapshot.clone())),
             Some(snapshot)
         );
     }
@@ -2708,7 +2718,7 @@ mod tests {
     #[test]
     fn failed_new_checkpoint_is_not_retained() {
         assert_eq!(
-            retained_snapshot_after_boots(false, false, Some(retained_snapshot())),
+            retained_snapshot_after_boots(false, false, true, Some(retained_snapshot())),
             None
         );
     }
@@ -2717,7 +2727,16 @@ mod tests {
     fn successful_new_checkpoint_is_retained() {
         let snapshot = retained_snapshot();
         assert_eq!(
-            retained_snapshot_after_boots(false, true, Some(snapshot.clone())),
+            retained_snapshot_after_boots(false, true, true, Some(snapshot.clone())),
+            Some(snapshot)
+        );
+    }
+
+    #[test]
+    fn failed_new_checkpoint_remains_available_when_rollback_fails() {
+        let snapshot = retained_snapshot();
+        assert_eq!(
+            retained_snapshot_after_boots(false, false, false, Some(snapshot.clone())),
             Some(snapshot)
         );
     }

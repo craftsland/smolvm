@@ -43,6 +43,21 @@ impl ForkPoolController {
                 None
             }
         };
+        let retained_snapshots = match state.db().list_fork_pool_snapshots() {
+            Ok(snapshots) => {
+                if !snapshots.is_empty() {
+                    tracing::info!(
+                        count = snapshots.len(),
+                        "restored retained fork pool checkpoints"
+                    );
+                }
+                snapshots.into_iter().collect()
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to restore retained fork pool checkpoints");
+                std::collections::HashMap::new()
+            }
+        };
         Self {
             state,
             shutdown_rx,
@@ -50,7 +65,7 @@ impl ForkPoolController {
             filling: std::collections::HashSet::new(),
             nvml,
             host_cpu: crate::api::admission::HostCpuSampler::default(),
-            retained_snapshots: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            retained_snapshots: Arc::new(parking_lot::Mutex::new(retained_snapshots)),
         }
     }
 
@@ -208,9 +223,33 @@ impl ForkPoolController {
             .filter(|pool| !pool.deleting)
             .map(|pool| pool.golden.as_str())
             .collect::<std::collections::HashSet<_>>();
-        self.retained_snapshots
-            .lock()
-            .retain(|golden, _| active_goldens.contains(golden.as_str()));
+        let stale_snapshots = {
+            let mut snapshots = self.retained_snapshots.lock();
+            let stale = snapshots
+                .keys()
+                .filter(|golden| !active_goldens.contains(golden.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            snapshots.retain(|golden, _| active_goldens.contains(golden.as_str()));
+            stale
+        };
+        if !stale_snapshots.is_empty() {
+            let db = self.state.db().clone();
+            match tokio::task::spawn_blocking(move || {
+                for golden in stale_snapshots {
+                    if let Err(error) = db.remove_fork_pool_snapshot(&golden) {
+                        tracing::warn!(%golden, %error, "failed to remove inactive fork pool checkpoint");
+                    }
+                }
+            })
+            .await
+            {
+                Ok(()) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "inactive fork pool checkpoint cleanup task failed");
+                }
+            }
+        }
         self.update_admission(&pools, sample_admission).await?;
         for pool in pools.into_iter().filter(|pool| !pool.deleting) {
             if self.filling.contains(&pool.name) {

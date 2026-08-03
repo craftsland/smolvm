@@ -183,7 +183,7 @@ pub struct PreparedFork {
 /// A checkpoint that may be reused while the exact same golden process remains
 /// paused. The PID start time prevents an old on-disk checkpoint from being
 /// applied after a golden restart or PID reuse.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct RetainedForkSnapshot {
     /// Directory containing the libkrun checkpoint and memfd manifest.
     pub(crate) path: PathBuf,
@@ -287,7 +287,7 @@ pub fn prepare_forks(
     golden: &str,
     specs: &[ForkSpec<'_>],
 ) -> Result<Vec<PreparedFork>> {
-    Ok(prepare_forks_reusing(db, golden, specs, None)?.forks)
+    Ok(prepare_forks_reusing(db, golden, specs, None, false)?.forks)
 }
 
 /// Prepare a batch while reusing a proven checkpoint when it still belongs to
@@ -298,6 +298,7 @@ pub(crate) fn prepare_forks_reusing(
     golden: &str,
     specs: &[ForkSpec<'_>],
     retained: Option<&RetainedForkSnapshot>,
+    persist_snapshot: bool,
 ) -> Result<PreparedForkBatch> {
     if specs.is_empty() {
         return Err(Error::config("fork", "at least one clone is required"));
@@ -432,6 +433,41 @@ pub(crate) fn prepare_forks_reusing(
         (snapshot_dir, false)
     };
 
+    let retained_snapshot =
+        golden_rec
+            .pid
+            .zip(golden_rec.pid_start_time)
+            .map(|(golden_pid, golden_pid_start_time)| RetainedForkSnapshot {
+                path: snapshot_dir.clone(),
+                golden_pid,
+                golden_pid_start_time,
+            });
+    if persist_snapshot && !snapshot_reused {
+        let persisted = retained_snapshot
+            .as_ref()
+            .ok_or_else(|| {
+                Error::agent(
+                    "fork",
+                    format!("golden '{golden}' process identity is unavailable"),
+                )
+            })
+            .and_then(|snapshot| {
+                db.set_fork_pool_snapshot(golden, snapshot)
+                    .map_err(|error| {
+                        Error::agent("persist fork pool checkpoint", error.to_string())
+                    })
+            });
+        if let Err(error) = persisted {
+            return Err(rollback_new_snapshot(
+                db,
+                golden,
+                &snapshot_dir,
+                false,
+                error,
+            ));
+        }
+    }
+
     let mut prepared = Vec::with_capacity(specs.len());
     for spec in specs {
         match prepare_clone_from_snapshot(
@@ -452,38 +488,48 @@ pub(crate) fn prepare_forks_reusing(
                     let _ = db.remove_vm(&clone.clone_record.name);
                     let _ = std::fs::remove_dir_all(vm_data_dir(&clone.clone_record.name));
                 }
-                if !snapshot_reused {
-                    let _ = std::fs::remove_dir_all(&snapshot_dir);
-                }
-                if golden_was_paused {
+                if snapshot_reused || golden_was_paused {
                     return Err(error);
                 }
-                return match resume_golden(golden) {
-                    Ok(()) => Err(error),
-                    Err(resume_error) => Err(Error::agent(
-                        "fork",
-                        format!(
-                            "clone preparation failed: {error}; golden rollback also failed: {resume_error}"
-                        ),
-                    )),
-                };
+                return Err(rollback_new_snapshot(
+                    db,
+                    golden,
+                    &snapshot_dir,
+                    persist_snapshot,
+                    error,
+                ));
             }
         }
     }
-    let retained_snapshot =
-        golden_rec
-            .pid
-            .zip(golden_rec.pid_start_time)
-            .map(|(golden_pid, golden_pid_start_time)| RetainedForkSnapshot {
-                path: snapshot_dir,
-                golden_pid,
-                golden_pid_start_time,
-            });
     Ok(PreparedForkBatch {
         forks: prepared,
         retained_snapshot,
         snapshot_reused,
     })
+}
+
+fn rollback_new_snapshot(
+    db: &SmolvmDb,
+    golden: &str,
+    snapshot_dir: &Path,
+    persisted: bool,
+    error: Error,
+) -> Error {
+    if let Err(resume_error) = resume_golden(golden) {
+        return Error::agent(
+            "fork",
+            format!("{error}; golden rollback also failed: {resume_error}"),
+        );
+    }
+    if persisted {
+        if let Err(remove_error) = db.remove_fork_pool_snapshot(golden) {
+            tracing::warn!(%golden, %remove_error, "failed to remove rolled-back fork pool checkpoint");
+        }
+    }
+    if let Err(remove_error) = std::fs::remove_dir_all(snapshot_dir) {
+        tracing::warn!(path = %snapshot_dir.display(), %remove_error, "failed to remove rolled-back fork snapshot");
+    }
+    error
 }
 
 fn reusable_snapshot_path(snapshot_root: &Path, snapshot: &Path) -> bool {
