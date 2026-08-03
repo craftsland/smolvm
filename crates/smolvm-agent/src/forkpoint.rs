@@ -11,7 +11,7 @@ use std::path::Path;
 use std::time::Duration;
 
 const AGENT_BINARY: &str = "/usr/local/bin/smolvm-agent";
-use smolvm_protocol::forkpoint::{HELPER_PATH, READY_PATH, RELEASE_PATH, STATE_DIR};
+use smolvm_protocol::forkpoint::{HELPER_PATH, READY_PATH, RELEASE_PATH, RESTORED_PATH, STATE_DIR};
 const READY_CONTENT: &[u8] = b"smolvm-forkpoint-v1\n";
 
 fn enabled() -> bool {
@@ -46,6 +46,7 @@ pub fn setup() {
         tracing::warn!(%error, "failed to set forkpoint state permissions");
     }
     let _ = std::fs::remove_file(READY_PATH);
+    let _ = std::fs::remove_file(RESTORED_PATH);
     let _ = std::fs::remove_file(RELEASE_PATH);
 
     if !Path::new(HELPER_PATH).exists() {
@@ -87,6 +88,7 @@ fn run_helper_inner() -> Result<(), String> {
     run_helper_at(
         Path::new(STATE_DIR),
         Path::new(READY_PATH),
+        Path::new(RESTORED_PATH),
         Path::new(RELEASE_PATH),
         Duration::from_millis(20),
     )
@@ -95,6 +97,7 @@ fn run_helper_inner() -> Result<(), String> {
 fn run_helper_at(
     state_dir: &Path,
     ready_path: &Path,
+    restored_path: &Path,
     release_path: &Path,
     poll_interval: Duration,
 ) -> Result<(), String> {
@@ -112,6 +115,19 @@ fn run_helper_at(
         .map_err(|error| format!("sync {}: {error}", ready_path.display()))?;
     println!("smolvm forkpoint ready; waiting for clone release");
     let _ = std::io::stdout().flush();
+
+    // Keep the snapshot boundary out of a timed kernel wait. Some VMM restore
+    // paths cannot reliably re-arm an inherited sleeping thread, which can
+    // leave every clone from that checkpoint parked after a successful host
+    // release. A restored clone writes RESTORED_PATH during identity setup;
+    // waits started after that point are native to the clone and safe to use.
+    while !restored_path.is_file() {
+        if release_path.is_file() {
+            let _ = std::fs::remove_file(ready_path);
+            return Ok(());
+        }
+        std::thread::yield_now();
+    }
 
     loop {
         if release_path.is_file() {
@@ -184,6 +200,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let state = temp.path().join("forkpoint");
         let ready = state.join("ready");
+        let restored = state.join("restored");
         let release = state.join("release");
         std::fs::create_dir(&state).unwrap();
 
@@ -194,6 +211,7 @@ mod tests {
             run_helper_at(
                 &state_thread,
                 &ready_thread,
+                &state_thread.join("restored"),
                 &release_thread,
                 Duration::from_millis(1),
             )
@@ -206,6 +224,42 @@ mod tests {
         }
         assert!(ready.is_file());
         assert!(!helper.is_finished());
+        std::fs::write(&restored, b"restored\n").unwrap();
+        std::fs::write(&release, b"release\n").unwrap();
+        helper.join().unwrap().unwrap();
+        assert!(!ready.exists());
+    }
+
+    #[test]
+    fn helper_can_release_before_restored_waits_are_armed() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("forkpoint");
+        let ready = state.join("ready");
+        let restored = state.join("restored");
+        let release = state.join("release");
+        std::fs::create_dir(&state).unwrap();
+
+        let state_thread = state.clone();
+        let ready_thread = ready.clone();
+        let restored_thread = restored.clone();
+        let release_thread = release.clone();
+        let helper = std::thread::spawn(move || {
+            run_helper_at(
+                &state_thread,
+                &ready_thread,
+                &restored_thread,
+                &release_thread,
+                Duration::from_secs(60),
+            )
+        });
+        for _ in 0..100 {
+            if ready.is_file() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(ready.is_file());
+        assert!(!restored.exists());
         std::fs::write(&release, b"release\n").unwrap();
         helper.join().unwrap().unwrap();
         assert!(!ready.exists());
