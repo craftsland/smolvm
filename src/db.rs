@@ -1275,7 +1275,7 @@ impl SmolvmDb {
                 payload_sha256: payload_sha256.map(str::to_owned),
                 created_at: now,
                 updated_at: now,
-                expires_at: now.saturating_add(ttl_secs),
+                expires_at: now.saturating_add(crate::pool::FORK_LEASE_ACTIVATION_GRACE_SECS),
                 ttl_secs,
                 last_error: None,
             };
@@ -1392,6 +1392,12 @@ impl SmolvmDb {
             }
             lease.state = next;
             lease.updated_at = now;
+            if expected == ForkLeaseState::Activating && next == ForkLeaseState::Active {
+                // The configured TTL is runtime ownership time. Payload staging
+                // and guest release can be delayed by host contention, so start
+                // its countdown only after activation commits.
+                lease.expires_at = now.saturating_add(lease.ttl_secs);
+            }
             lease.last_error = error.clone();
             let updated = serde_json::to_vec(&lease).db_err("serialize fork lease")?;
             tx.execute(
@@ -2707,6 +2713,39 @@ mod tests {
         assert_eq!(expired[0].state, ForkLeaseState::Expired);
         let retiring = db.list_retiring_fork_pool_slots().unwrap();
         assert_eq!(retiring.len(), 2);
+    }
+
+    #[test]
+    fn fork_lease_ttl_starts_after_activation_completes() {
+        let (_dir, db) = temp_db();
+        db.insert_fork_pool_if_not_exists(&test_pool("rollouts", 1))
+            .unwrap();
+        insert_ready_pool_slot(&db, "rollouts", "slot-delayed");
+        let claimed = db
+            .claim_fork_pool_slot(ForkPoolSlotClaim {
+                pool_name: "rollouts",
+                lease_id: "lease-delayed",
+                idempotency_key: "req-delayed",
+                assignment: &[],
+                payload_sha256: None,
+                require_private_workspace: false,
+                admission_limit: None,
+                ttl_secs: 30,
+                now: 200,
+            })
+            .unwrap();
+        let ClaimForkPoolSlot::Claimed(claimed) = claimed else {
+            panic!("expected claimed lease");
+        };
+        assert_eq!(claimed.expires_at, 500);
+
+        let active = db
+            .mark_fork_lease_active("lease-delayed", 231)
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.expires_at, 261);
+        assert!(db.expire_fork_leases(260).unwrap().is_empty());
+        assert_eq!(db.expire_fork_leases(261).unwrap().len(), 1);
     }
 
     #[test]

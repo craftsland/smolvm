@@ -2,6 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Maximum time a durably claimed worker may remain in the activation handoff.
+/// The user-facing lease TTL starts only after this phase commits.
+pub(crate) const FORK_LEASE_ACTIVATION_GRACE_SECS: u64 = 5 * 60;
+
 /// Configuration and lifecycle state for one automatic fork pool.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ForkPoolRecord {
