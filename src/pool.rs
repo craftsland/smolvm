@@ -17,6 +17,12 @@ pub struct ForkPoolRecord {
     /// Absent on records written before automatic admission was introduced.
     #[serde(default)]
     pub auto_admission: bool,
+    /// Host CUDA device ordinal inherited from the golden workload.
+    ///
+    /// Older shared-CUDA pool records predate this field and used CUDA's
+    /// default device, so a missing value on those records resolves to zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cuda_device_ordinal: Option<u32>,
     /// Share the golden's immutable CUDA allocations with each worker.
     pub share_weights: bool,
     /// Maximum time to wait for the golden's workload forkpoint.
@@ -27,6 +33,41 @@ pub struct ForkPoolRecord {
     pub created_at: u64,
     /// True after deletion has begun; no new workers or leases are admitted.
     pub deleting: bool,
+}
+
+impl ForkPoolRecord {
+    /// Device whose telemetry and active-lease budget govern this pool.
+    pub fn admission_device_ordinal(&self) -> Option<u32> {
+        self.cuda_device_ordinal
+            .or_else(|| self.share_weights.then_some(0))
+    }
+}
+
+/// Resolve the host CUDA device selected by a workload environment.
+///
+/// The CUDA shims expose one guest device and interpret an absent selector as
+/// host ordinal zero. An explicitly malformed selector must not silently join
+/// the wrong admission domain.
+pub fn cuda_device_ordinal_from_env(env: &[(String, String)]) -> Result<u32, String> {
+    let Some(value) = env
+        .iter()
+        .rev()
+        .find_map(|(key, value)| (key == "SMOLVM_CUDA_DEVICE").then_some(value))
+    else {
+        return Ok(0);
+    };
+    value.parse::<u32>().map_err(|_| {
+        format!("SMOLVM_CUDA_DEVICE must be a non-negative host CUDA device ordinal, got '{value}'")
+    })
+}
+
+/// Runtime-calibrated limits checked together with a durable pool claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForkPoolAdmissionLimit {
+    /// Fair-share ceiling for this pool while multiple pools have demand.
+    pub pool: u32,
+    /// Aggregate active-lease ceiling for every pool on the same CUDA device.
+    pub device: u32,
 }
 
 /// Controller lifecycle state for one machine owned by a fork pool.
@@ -200,5 +241,21 @@ mod tests {
         )
         .unwrap();
         assert!(!pool.auto_admission);
+        assert_eq!(pool.cuda_device_ordinal, None);
+        assert_eq!(pool.admission_device_ordinal(), Some(0));
+    }
+
+    #[test]
+    fn cuda_device_selector_defaults_to_zero_and_rejects_invalid_values() {
+        assert_eq!(cuda_device_ordinal_from_env(&[]).unwrap(), 0);
+        assert_eq!(
+            cuda_device_ordinal_from_env(&[("SMOLVM_CUDA_DEVICE".into(), "3".into())]).unwrap(),
+            3
+        );
+        assert!(
+            cuda_device_ordinal_from_env(&[("SMOLVM_CUDA_DEVICE".into(), "-1".into())])
+                .unwrap_err()
+                .contains("non-negative")
+        );
     }
 }

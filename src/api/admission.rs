@@ -5,12 +5,12 @@
 //! moving the gate below that boundary can deadlock the daemon accept loop and
 //! leaves the lease state ambiguous after a restart.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use crate::pool::ForkPoolRecord;
+use crate::pool::{ForkPoolAdmissionLimit, ForkPoolRecord};
 
 const OBSERVATION_WINDOW: Duration = Duration::from_secs(8);
 const MIN_STABLE_SAMPLES: u32 = 5;
@@ -23,67 +23,45 @@ const VRAM_RESERVE_PERCENT: u64 = 10;
 const CPU_SATURATION_PERCENT: f64 = 90.0;
 const MARGINAL_GAIN_PERCENT: f64 = 2.0;
 
-/// One node-wide GPU sample. Utilization and public memory counters remain
-/// aggregate, while admission uses the least-safe individual device because
-/// the current runtime does not yet have a durable pool-to-device mapping.
+/// Telemetry for one host CUDA device.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GpuSample {
-    /// Memory-weighted mean streaming-multiprocessor utilization.
+    /// Host CUDA device ordinal used by the guest-to-host mapping.
+    pub device_ordinal: u32,
+    /// Streaming-multiprocessor utilization.
     pub utilization_percent: f64,
-    /// Aggregate used device memory in MiB.
+    /// Used device memory in MiB.
     pub used_memory_mib: u64,
-    /// Aggregate device-memory capacity in MiB.
+    /// Device-memory capacity in MiB.
     pub total_memory_mib: u64,
-    /// Free memory on the device closest to violating its own reserve.
-    limiting_device_free_memory_mib: u64,
-    /// Capacity-derived reserve required on that limiting device.
-    limiting_device_reserve_mib: u64,
+    /// Free memory remaining on this device.
+    free_memory_mib: u64,
+    /// Capacity-derived headroom reserved on this device.
+    reserve_mib: u64,
 }
 
 impl GpuSample {
     #[cfg(any(target_os = "linux", test))]
-    fn from_devices(devices: impl IntoIterator<Item = GpuDeviceSample>) -> Option<Self> {
-        let mut count = 0_u32;
-        let mut total_memory_mib = 0_u64;
-        let mut used_memory_mib = 0_u64;
-        let mut weighted_utilization = 0_f64;
-        let mut limiting_device = None::<(i128, u64, u64)>;
-
-        for device in devices {
-            count = count.saturating_add(1);
-            total_memory_mib = total_memory_mib.saturating_add(device.total_memory_mib);
-            used_memory_mib = used_memory_mib.saturating_add(device.used_memory_mib);
-            weighted_utilization += device.utilization_percent * device.total_memory_mib as f64;
-
-            let reserve_mib = device_reserve_mib(device.total_memory_mib);
-            let headroom = i128::from(device.free_memory_mib) - i128::from(reserve_mib);
-            if limiting_device.is_none_or(|(least_headroom, _, _)| headroom < least_headroom) {
-                limiting_device = Some((headroom, device.free_memory_mib, reserve_mib));
-            }
-        }
-
-        let (_, limiting_device_free_memory_mib, limiting_device_reserve_mib) = limiting_device?;
-        (count > 0 && total_memory_mib > 0).then_some(Self {
-            utilization_percent: weighted_utilization / total_memory_mib as f64,
+    fn new(
+        device_ordinal: u32,
+        utilization_percent: f64,
+        used_memory_mib: u64,
+        free_memory_mib: u64,
+        total_memory_mib: u64,
+    ) -> Self {
+        Self {
+            device_ordinal,
+            utilization_percent,
             used_memory_mib,
             total_memory_mib,
-            limiting_device_free_memory_mib,
-            limiting_device_reserve_mib,
-        })
+            free_memory_mib,
+            reserve_mib: device_reserve_mib(total_memory_mib),
+        }
     }
 
     fn memory_safe(self) -> bool {
-        self.limiting_device_free_memory_mib >= self.limiting_device_reserve_mib
+        self.free_memory_mib >= self.reserve_mib
     }
-}
-
-#[cfg(any(target_os = "linux", test))]
-#[derive(Debug, Clone, Copy)]
-struct GpuDeviceSample {
-    utilization_percent: f64,
-    used_memory_mib: u64,
-    free_memory_mib: u64,
-    total_memory_mib: u64,
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -96,6 +74,10 @@ fn device_reserve_mib(total_memory_mib: u64) -> u64 {
 pub struct AdmissionSnapshot {
     /// Maximum active or activating leases currently admitted.
     pub effective_limit: u32,
+    /// Aggregate active-lease limit on the pool's CUDA device.
+    pub device_limit: u32,
+    /// Host CUDA device whose telemetry controls the limit.
+    pub device_ordinal: u32,
     /// Explanation of the most recent controller decision.
     pub reason: String,
     /// Whether the controller is comparing a candidate resident level.
@@ -310,8 +292,8 @@ impl PoolAdmissionState {
                 self.reason = if !memory_safe {
                     format!(
                         "returned to {prior_limit}: limiting GPU has {} MiB free; preserving {} MiB reserve",
-                        gpu.limiting_device_free_memory_mib,
-                        gpu.limiting_device_reserve_mib
+                        gpu.free_memory_mib,
+                        gpu.reserve_mib
                     )
                 } else if !cpu_safe {
                     format!("returned to {prior_limit}: host CPU saturated at {mean_cpu:.1}%")
@@ -346,8 +328,8 @@ impl PoolAdmissionState {
                 self.reason = if !memory_safe {
                     format!(
                         "returned to {lower_limit}: limiting GPU has {} MiB free; preserving {} MiB reserve",
-                        gpu.limiting_device_free_memory_mib,
-                        gpu.limiting_device_reserve_mib
+                        gpu.free_memory_mib,
+                        gpu.reserve_mib
                     )
                 } else {
                     format!("returned to {lower_limit}: host CPU saturated at {mean_cpu:.1}%")
@@ -373,9 +355,7 @@ impl PoolAdmissionState {
         self.reason = if !memory_safe {
             format!(
                 "holding at {}: limiting GPU has {} MiB free; preserving {} MiB reserve",
-                self.effective_limit,
-                gpu.limiting_device_free_memory_mib,
-                gpu.limiting_device_reserve_mib
+                self.effective_limit, gpu.free_memory_mib, gpu.reserve_mib
             )
         } else if !cpu_safe {
             format!(
@@ -391,6 +371,8 @@ impl PoolAdmissionState {
     fn snapshot(&self) -> AdmissionSnapshot {
         AdmissionSnapshot {
             effective_limit: self.effective_limit,
+            device_limit: self.effective_limit,
+            device_ordinal: 0,
             reason: self.reason.clone(),
             calibrating: !self.settled,
             gpu_utilization_percent: self.latest_gpu.map(|sample| sample.utilization_percent),
@@ -405,7 +387,25 @@ impl PoolAdmissionState {
 /// telemetry loop.
 #[derive(Default)]
 pub struct AdmissionRegistry {
-    pools: Mutex<HashMap<String, PoolAdmissionState>>,
+    inner: Mutex<AdmissionRegistryState>,
+}
+
+#[derive(Default)]
+struct AdmissionRegistryState {
+    devices: HashMap<u32, DeviceAdmissionState>,
+    pool_devices: HashMap<String, u32>,
+}
+
+struct DeviceAdmissionState {
+    admission: PoolAdmissionState,
+    pools: HashMap<String, DevicePoolState>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DevicePoolState {
+    ceiling: u32,
+    active: u32,
+    last_demand: Option<Instant>,
 }
 
 impl AdmissionRegistry {
@@ -418,38 +418,53 @@ impl AdmissionRegistry {
 
     /// Record that a caller had work but could not claim another resident slot.
     pub fn note_blocked(&self, pool_name: &str) {
-        if let Some(state) = self.pools.lock().get_mut(pool_name) {
-            state.last_blocked = Some(Instant::now());
-        }
-    }
-
-    /// Make a pool's current ceiling available to the claim path without
-    /// adding a telemetry sample. Event-driven reconciliation uses this after
-    /// pool mutations so calibration windows retain their periodic cadence.
-    pub fn ensure(&self, pool: &ForkPoolRecord, completed_total: u64) {
-        let mut pools = self.pools.lock();
-        if !pool.auto_admission {
-            pools.remove(&pool.name);
-            return;
-        }
         let now = Instant::now();
-        let ceiling = Self::ceiling(pool);
-        let state = pools
-            .entry(pool.name.clone())
-            .or_insert_with(|| PoolAdmissionState::new(ceiling, now, completed_total));
-        state.update_ceiling(ceiling, now, completed_total);
+        let mut inner = self.inner.lock();
+        let Some(device) = inner.pool_devices.get(pool_name).copied() else {
+            return;
+        };
+        if let Some(state) = inner.devices.get_mut(&device) {
+            state.admission.last_blocked = Some(now);
+            if let Some(pool) = state.pools.get_mut(pool_name) {
+                pool.last_demand = Some(now);
+            }
+        }
     }
 
-    /// Current dynamic claim limit. `None` means the pool uses its existing
-    /// static `maxActive`/ready-slot behavior.
-    pub fn limit(&self, pool: &ForkPoolRecord) -> Option<u32> {
+    /// Current dynamic pool and device claim limits. `None` means the pool uses
+    /// its existing static `maxActive`/ready-slot behavior.
+    pub fn limit(&self, pool: &ForkPoolRecord) -> Option<ForkPoolAdmissionLimit> {
         if !pool.auto_admission {
             return None;
         }
-        self.pools
-            .lock()
-            .get(&pool.name)
-            .map(|state| state.effective_limit)
+        let fallback = Self::ceiling(pool);
+        let Some(device) = pool.admission_device_ordinal() else {
+            return Some(ForkPoolAdmissionLimit {
+                pool: fallback,
+                device: fallback,
+            });
+        };
+        let now = Instant::now();
+        let mut inner = self.inner.lock();
+        let Some(state) = inner.devices.get_mut(&device) else {
+            return Some(ForkPoolAdmissionLimit {
+                pool: fallback,
+                device: fallback,
+            });
+        };
+        state
+            .pools
+            .entry(pool.name.clone())
+            .or_insert(DevicePoolState {
+                ceiling: fallback,
+                active: 0,
+                last_demand: None,
+            });
+        let device_limit = state.admission.effective_limit;
+        Some(ForkPoolAdmissionLimit {
+            pool: fair_pool_limit(state, &pool.name, device_limit, now, true),
+            device: device_limit,
+        })
     }
 
     /// Return the latest published telemetry and decision for an automatic pool.
@@ -457,10 +472,27 @@ impl AdmissionRegistry {
         if !pool.auto_admission {
             return None;
         }
-        self.pools
-            .lock()
-            .get(&pool.name)
-            .map(PoolAdmissionState::snapshot)
+        let device = pool.admission_device_ordinal()?;
+        let inner = self.inner.lock();
+        let state = inner.devices.get(&device)?;
+        let mut snapshot = state.admission.snapshot();
+        snapshot.device_limit = snapshot.effective_limit;
+        snapshot.device_ordinal = device;
+        let pool_limit = fair_pool_limit(
+            state,
+            &pool.name,
+            snapshot.effective_limit,
+            Instant::now(),
+            true,
+        );
+        if state.pools.len() > 1 {
+            snapshot.reason = format!(
+                "CUDA device {device} limit {}; pool fair share {pool_limit}: {}",
+                snapshot.effective_limit, snapshot.reason
+            );
+        }
+        snapshot.effective_limit = pool_limit;
+        Some(snapshot)
     }
 
     /// Feed one controller-tick observation into a pool's calibration state.
@@ -472,10 +504,6 @@ impl AdmissionRegistry {
         gpu: Option<GpuSample>,
         host_cpu_percent: Option<f64>,
     ) {
-        if !pool.auto_admission {
-            self.pools.lock().remove(&pool.name);
-            return;
-        }
         self.observe_at(
             pool,
             active,
@@ -495,19 +523,206 @@ impl AdmissionRegistry {
         host_cpu_percent: Option<f64>,
         now: Instant,
     ) {
-        let ceiling = Self::ceiling(pool);
-        let mut pools = self.pools.lock();
-        let state = pools
-            .entry(pool.name.clone())
-            .or_insert_with(|| PoolAdmissionState::new(ceiling, now, completed_total));
-        state.update_ceiling(ceiling, now, completed_total);
-        state.observe(now, active, completed_total, gpu, host_cpu_percent);
+        let samples = gpu.map(|sample| HashMap::from([(sample.device_ordinal, sample)]));
+        self.observe_pools_at(
+            &[(pool.clone(), active, completed_total)],
+            samples.as_ref(),
+            host_cpu_percent,
+            now,
+        );
     }
 
-    /// Forget runtime state for pools that no longer exist.
-    pub fn retain_pools(&self, names: &HashSet<String>) {
-        self.pools.lock().retain(|name, _| names.contains(name));
+    /// Feed a full controller tick into device-scoped calibration states.
+    pub fn observe_pools(
+        &self,
+        observations: &[(ForkPoolRecord, u32, u64)],
+        gpu: Option<&HashMap<u32, GpuSample>>,
+        host_cpu_percent: Option<f64>,
+    ) {
+        self.observe_pools_at(observations, gpu, host_cpu_percent, Instant::now());
     }
+
+    /// Synchronize pool topology, activity, and ceilings without adding a
+    /// telemetry sample. Event-driven reconciliation uses this so mutations
+    /// become immediately claimable without shortening calibration windows.
+    pub fn ensure_pools(&self, observations: &[(ForkPoolRecord, u32, u64)]) {
+        self.update_pools_at(observations, None, None, Instant::now(), false);
+    }
+
+    fn observe_pools_at(
+        &self,
+        observations: &[(ForkPoolRecord, u32, u64)],
+        gpu: Option<&HashMap<u32, GpuSample>>,
+        host_cpu_percent: Option<f64>,
+        now: Instant,
+    ) {
+        self.update_pools_at(observations, gpu, host_cpu_percent, now, true);
+    }
+
+    fn update_pools_at(
+        &self,
+        observations: &[(ForkPoolRecord, u32, u64)],
+        gpu: Option<&HashMap<u32, GpuSample>>,
+        host_cpu_percent: Option<f64>,
+        now: Instant,
+        sample: bool,
+    ) {
+        let mut grouped: HashMap<u32, Vec<&(ForkPoolRecord, u32, u64)>> = HashMap::new();
+        for observation in observations {
+            if observation.0.deleting {
+                continue;
+            }
+            if let Some(device) = observation.0.admission_device_ordinal() {
+                grouped.entry(device).or_default().push(observation);
+            }
+        }
+
+        let mut inner = self.inner.lock();
+        let live_pool_names = observations
+            .iter()
+            .filter(|(pool, _, _)| {
+                !pool.deleting && pool.auto_admission && pool.admission_device_ordinal().is_some()
+            })
+            .map(|(pool, _, _)| pool.name.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        inner
+            .pool_devices
+            .retain(|name, _| live_pool_names.contains(name.as_str()));
+
+        let live_devices = grouped
+            .iter()
+            .filter_map(|(&device, pools)| {
+                pools
+                    .iter()
+                    .any(|(pool, _, _)| pool.auto_admission)
+                    .then_some(device)
+            })
+            .collect::<std::collections::HashSet<_>>();
+        inner
+            .devices
+            .retain(|device, _| live_devices.contains(device));
+
+        for (device, pools) in grouped {
+            let auto_pools = pools
+                .iter()
+                .filter(|(pool, _, _)| pool.auto_admission)
+                .copied()
+                .collect::<Vec<_>>();
+            if auto_pools.is_empty() {
+                continue;
+            }
+            let ceiling = auto_pools.iter().fold(0_u32, |total, (pool, _, _)| {
+                total.saturating_add(Self::ceiling(pool))
+            });
+            let active = pools
+                .iter()
+                .fold(0_u32, |total, (_, active, _)| total.saturating_add(*active));
+            let completed = pools.iter().fold(0_u64, |total, (_, _, completed)| {
+                total.saturating_add(*completed)
+            });
+
+            for (pool, _, _) in &auto_pools {
+                inner.pool_devices.insert(pool.name.clone(), device);
+            }
+            let state = inner
+                .devices
+                .entry(device)
+                .or_insert_with(|| DeviceAdmissionState {
+                    admission: PoolAdmissionState::new(ceiling.max(1), now, completed),
+                    pools: HashMap::new(),
+                });
+            let names = auto_pools
+                .iter()
+                .map(|(pool, _, _)| pool.name.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            state.pools.retain(|name, _| names.contains(name.as_str()));
+            for (pool, pool_active, _) in auto_pools {
+                state
+                    .pools
+                    .entry(pool.name.clone())
+                    .and_modify(|runtime| {
+                        runtime.ceiling = Self::ceiling(pool);
+                        runtime.active = *pool_active;
+                    })
+                    .or_insert(DevicePoolState {
+                        ceiling: Self::ceiling(pool),
+                        active: *pool_active,
+                        last_demand: None,
+                    });
+            }
+            state
+                .admission
+                .update_ceiling(ceiling.max(1), now, completed);
+            if sample {
+                state.admission.observe(
+                    now,
+                    active,
+                    completed,
+                    gpu.and_then(|samples| samples.get(&device).copied()),
+                    host_cpu_percent,
+                );
+            }
+        }
+    }
+}
+
+fn fair_pool_limit(
+    device: &DeviceAdmissionState,
+    target: &str,
+    device_limit: u32,
+    now: Instant,
+    include_target: bool,
+) -> u32 {
+    let mut demanded = device
+        .pools
+        .iter()
+        .filter_map(|(name, pool)| {
+            let recent = pool
+                .last_demand
+                .is_some_and(|demand| now.saturating_duration_since(demand) <= PRESSURE_TTL);
+            (recent || (include_target && name == target)).then_some((name.as_str(), *pool))
+        })
+        .collect::<Vec<_>>();
+    demanded.sort_unstable_by_key(|(name, _)| *name);
+    if demanded.is_empty() {
+        return device
+            .pools
+            .get(target)
+            .map_or(device_limit, |pool| pool.ceiling.min(device_limit));
+    }
+
+    let demanded_names = demanded
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<std::collections::HashSet<_>>();
+    let occupied = device
+        .pools
+        .iter()
+        .filter(|(name, _)| !demanded_names.contains(name.as_str()))
+        .fold(0_u32, |total, (_, pool)| total.saturating_add(pool.active));
+    let mut remaining = device_limit.saturating_sub(occupied);
+    let mut shares = demanded
+        .iter()
+        .map(|(name, _)| (*name, 0_u32))
+        .collect::<HashMap<_, _>>();
+    while remaining > 0 {
+        let mut advanced = false;
+        for (name, pool) in &demanded {
+            if remaining == 0 {
+                break;
+            }
+            let share = shares.get_mut(name).expect("demanded pool has a share");
+            if *share < pool.ceiling {
+                *share += 1;
+                remaining -= 1;
+                advanced = true;
+            }
+        }
+        if !advanced {
+            break;
+        }
+    }
+    shares.get(target).copied().unwrap_or(0)
 }
 
 /// Samples aggregate host CPU busy time from `/proc/stat`.
@@ -557,10 +772,11 @@ impl HostCpuSampler {
 pub struct NvmlSampler {
     _library: libloading::Library,
     shutdown: unsafe extern "C" fn() -> i32,
-    device_count: unsafe extern "C" fn(*mut u32) -> i32,
-    device_handle: unsafe extern "C" fn(u32, *mut *mut std::ffi::c_void) -> i32,
+    device_by_uuid:
+        unsafe extern "C" fn(*const std::ffi::c_char, *mut *mut std::ffi::c_void) -> i32,
     memory_info: unsafe extern "C" fn(*mut std::ffi::c_void, *mut NvmlMemory) -> i32,
     utilization: unsafe extern "C" fn(*mut std::ffi::c_void, *mut NvmlUtilization) -> i32,
+    cuda_device_uuids: Vec<std::ffi::CString>,
 }
 
 #[cfg(target_os = "linux")]
@@ -581,6 +797,70 @@ struct NvmlUtilization {
 }
 
 #[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Default)]
+struct NvmlPciInfo {
+    bus_id_legacy: [std::ffi::c_char; 16],
+    domain: u32,
+    bus: u32,
+    device: u32,
+    pci_device_id: u32,
+    pci_subsystem_id: u32,
+    bus_id: [std::ffi::c_char; 32],
+}
+
+#[cfg(target_os = "linux")]
+struct NvmlDeviceIdentity {
+    uuid: std::ffi::CString,
+    domain: u32,
+    bus: u32,
+    device: u32,
+    mig_enabled: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn select_visible_devices(
+    mut devices: Vec<NvmlDeviceIdentity>,
+    visible: Option<&str>,
+) -> Result<Vec<std::ffi::CString>, String> {
+    devices.sort_unstable_by_key(|device| (device.domain, device.bus, device.device));
+    let Some(visible) = visible else {
+        return Ok(devices.into_iter().map(|device| device.uuid).collect());
+    };
+    if visible.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut selected = Vec::new();
+    for token in visible.split(',').map(str::trim) {
+        if token == "-1" {
+            break;
+        }
+        if let Ok(index) = token.parse::<usize>() {
+            let Some(device) = devices.get(index) else {
+                return Err(format!(
+                    "CUDA_VISIBLE_DEVICES index {index} is outside {} PCI-ordered devices",
+                    devices.len()
+                ));
+            };
+            selected.push(device.uuid.clone());
+            continue;
+        }
+        let matches = devices
+            .iter()
+            .filter(|device| device.uuid.to_bytes().starts_with(token.as_bytes()))
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err(format!(
+                "CUDA_VISIBLE_DEVICES token '{token}' did not uniquely identify an NVML device"
+            ));
+        }
+        selected.push(matches[0].uuid.clone());
+    }
+    Ok(selected)
+}
+
+#[cfg(target_os = "linux")]
 impl NvmlSampler {
     /// Load and initialize the host driver's NVML library.
     pub fn new() -> Result<Self, String> {
@@ -588,6 +868,12 @@ impl NvmlSampler {
         type Shutdown = unsafe extern "C" fn() -> i32;
         type DeviceCount = unsafe extern "C" fn(*mut u32) -> i32;
         type DeviceHandle = unsafe extern "C" fn(u32, *mut *mut std::ffi::c_void) -> i32;
+        type DeviceByUuid =
+            unsafe extern "C" fn(*const std::ffi::c_char, *mut *mut std::ffi::c_void) -> i32;
+        type DeviceUuid =
+            unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_char, u32) -> i32;
+        type PciInfo = unsafe extern "C" fn(*mut std::ffi::c_void, *mut NvmlPciInfo) -> i32;
+        type MigMode = unsafe extern "C" fn(*mut std::ffi::c_void, *mut u32, *mut u32) -> i32;
         type MemoryInfo = unsafe extern "C" fn(*mut std::ffi::c_void, *mut NvmlMemory) -> i32;
         type Utilization = unsafe extern "C" fn(*mut std::ffi::c_void, *mut NvmlUtilization) -> i32;
 
@@ -608,6 +894,22 @@ impl NvmlSampler {
             let device_handle = *library
                 .get::<DeviceHandle>(b"nvmlDeviceGetHandleByIndex_v2\0")
                 .map_err(|error| format!("resolve nvmlDeviceGetHandleByIndex_v2: {error}"))?;
+            let device_by_uuid = *library
+                .get::<DeviceByUuid>(b"nvmlDeviceGetHandleByUUID\0")
+                .map_err(|error| format!("resolve nvmlDeviceGetHandleByUUID: {error}"))?;
+            let device_uuid = *library
+                .get::<DeviceUuid>(b"nvmlDeviceGetUUID\0")
+                .map_err(|error| format!("resolve nvmlDeviceGetUUID: {error}"))?;
+            let pci_info = match library.get::<PciInfo>(b"nvmlDeviceGetPciInfo_v3\0") {
+                Ok(symbol) => *symbol,
+                Err(_) => *library
+                    .get::<PciInfo>(b"nvmlDeviceGetPciInfo_v2\0")
+                    .map_err(|error| format!("resolve nvmlDeviceGetPciInfo: {error}"))?,
+            };
+            let mig_mode = library
+                .get::<MigMode>(b"nvmlDeviceGetMigMode\0")
+                .ok()
+                .map(|symbol| *symbol);
             let memory_info = *library
                 .get::<MemoryInfo>(b"nvmlDeviceGetMemoryInfo\0")
                 .map_err(|error| format!("resolve nvmlDeviceGetMemoryInfo: {error}"))?;
@@ -618,30 +920,110 @@ impl NvmlSampler {
             if status != 0 {
                 return Err(format!("nvmlInit_v2 returned {status}"));
             }
+
+            let cuda_device_uuids = (|| -> Result<Vec<std::ffi::CString>, String> {
+                let mut count = 0_u32;
+                let status = device_count(&mut count);
+                if status != 0 || count == 0 {
+                    return Err(format!(
+                        "nvmlDeviceGetCount_v2 returned {status} with count {count}"
+                    ));
+                }
+                let mut identities = Vec::with_capacity(count as usize);
+                for index in 0..count {
+                    let mut device = std::ptr::null_mut();
+                    let status = device_handle(index, &mut device);
+                    if status != 0 || device.is_null() {
+                        return Err(format!(
+                            "nvmlDeviceGetHandleByIndex_v2({index}) returned {status}"
+                        ));
+                    }
+                    let mut uuid = [0 as std::ffi::c_char; 96];
+                    let status = device_uuid(device, uuid.as_mut_ptr(), uuid.len() as u32);
+                    if status != 0 {
+                        return Err(format!("nvmlDeviceGetUUID({index}) returned {status}"));
+                    }
+                    let uuid = std::ffi::CStr::from_ptr(uuid.as_ptr()).to_owned();
+                    let mut pci = NvmlPciInfo::default();
+                    let status = pci_info(device, &mut pci);
+                    if status != 0 {
+                        return Err(format!("nvmlDeviceGetPciInfo({index}) returned {status}"));
+                    }
+                    let mig_enabled = if let Some(mig_mode) = mig_mode {
+                        let mut current = 0_u32;
+                        let mut pending = 0_u32;
+                        mig_mode(device, &mut current, &mut pending) == 0 && current != 0
+                    } else {
+                        false
+                    };
+                    identities.push(NvmlDeviceIdentity {
+                        uuid,
+                        domain: pci.domain,
+                        bus: pci.bus,
+                        device: pci.device,
+                        mig_enabled,
+                    });
+                }
+                let visible = std::env::var("CUDA_VISIBLE_DEVICES").ok();
+                let selected = if identities.iter().any(|device| device.mig_enabled) {
+                    let visible = visible.as_deref().ok_or_else(|| {
+                        "MIG mode requires CUDA_VISIBLE_DEVICES with explicit MIG UUIDs for admission"
+                            .to_string()
+                    })?;
+                    let mut selected = Vec::new();
+                    for token in visible.split(',').map(str::trim) {
+                        if token == "-1" {
+                            break;
+                        }
+                        if !token.starts_with("MIG-") {
+                            return Err(
+                                "MIG mode requires full MIG UUIDs in CUDA_VISIBLE_DEVICES".into()
+                            );
+                        }
+                        let uuid = std::ffi::CString::new(token)
+                            .map_err(|_| "CUDA_VISIBLE_DEVICES contains a NUL byte".to_string())?;
+                        let mut handle = std::ptr::null_mut();
+                        if device_by_uuid(uuid.as_ptr(), &mut handle) != 0 || handle.is_null() {
+                            return Err(format!("NVML could not resolve MIG UUID '{token}'"));
+                        }
+                        selected.push(uuid);
+                    }
+                    selected
+                } else {
+                    select_visible_devices(identities, visible.as_deref())?
+                };
+                if selected.is_empty() {
+                    return Err("no CUDA-visible devices are available for admission".into());
+                }
+                Ok(selected)
+            })();
+            let cuda_device_uuids = match cuda_device_uuids {
+                Ok(uuids) => uuids,
+                Err(error) => {
+                    shutdown();
+                    return Err(error);
+                }
+            };
             Ok(Self {
                 _library: library,
                 shutdown,
-                device_count,
-                device_handle,
+                device_by_uuid,
                 memory_info,
                 utilization,
+                cuda_device_uuids,
             })
         }
     }
 
-    /// Sample aggregate utilization and per-device memory safety across NVIDIA devices.
-    pub fn sample(&mut self) -> Option<GpuSample> {
+    /// Sample utilization and memory safety independently for each CUDA device.
+    pub fn sample(&mut self) -> Option<HashMap<u32, GpuSample>> {
         // SAFETY: NVML owns device handles; all output pointers target valid,
         // initialized storage with the ABI layouts documented by NVML.
         unsafe {
-            let mut count = 0;
-            if (self.device_count)(&mut count) != 0 || count == 0 {
-                return None;
-            }
-            let mut devices = Vec::with_capacity(count as usize);
-            for index in 0..count {
+            let mut devices = HashMap::with_capacity(self.cuda_device_uuids.len());
+            for (index, uuid) in self.cuda_device_uuids.iter().enumerate() {
                 let mut device = std::ptr::null_mut();
-                if (self.device_handle)(index, &mut device) != 0 || device.is_null() {
+                if (self.device_by_uuid)(uuid.as_ptr(), &mut device) != 0 || device.is_null() {
                     return None;
                 }
                 let mut memory = NvmlMemory::default();
@@ -651,14 +1033,19 @@ impl NvmlSampler {
                 {
                     return None;
                 }
-                devices.push(GpuDeviceSample {
-                    utilization_percent: f64::from(utilization.gpu),
-                    used_memory_mib: memory.used / (1024 * 1024),
-                    free_memory_mib: memory.free / (1024 * 1024),
-                    total_memory_mib: memory.total / (1024 * 1024),
-                });
+                let index = u32::try_from(index).ok()?;
+                devices.insert(
+                    index,
+                    GpuSample::new(
+                        index,
+                        f64::from(utilization.gpu),
+                        memory.used / (1024 * 1024),
+                        memory.free / (1024 * 1024),
+                        memory.total / (1024 * 1024),
+                    ),
+                );
             }
-            GpuSample::from_devices(devices)
+            Some(devices)
         }
     }
 }
@@ -685,7 +1072,7 @@ impl NvmlSampler {
     }
 
     /// Return no GPU sample on unsupported hosts.
-    pub fn sample(&mut self) -> Option<GpuSample> {
+    pub fn sample(&mut self) -> Option<HashMap<u32, GpuSample>> {
         None
     }
 }
@@ -701,6 +1088,7 @@ mod tests {
             desired_ready: size,
             max_active: None,
             auto_admission: true,
+            cuda_device_ordinal: Some(0),
             share_weights: true,
             ready_timeout_secs: 240,
             lease_ttl_secs: 300,
@@ -710,12 +1098,13 @@ mod tests {
     }
 
     fn gpu(utilization: f64, used: u64) -> Option<GpuSample> {
-        GpuSample::from_devices([GpuDeviceSample {
-            utilization_percent: utilization,
-            used_memory_mib: used,
-            free_memory_mib: 80 * 1024 - used,
-            total_memory_mib: 80 * 1024,
-        }])
+        Some(GpuSample::new(
+            0,
+            utilization,
+            used,
+            80 * 1024 - used,
+            80 * 1024,
+        ))
     }
 
     fn stable_window(
@@ -737,45 +1126,127 @@ mod tests {
         }
     }
 
-    fn multi_gpu_sample(devices: &[(f64, u64, u64, u64)]) -> GpuSample {
-        GpuSample::from_devices(devices.iter().map(
-            |&(utilization_percent, used_memory_mib, free_memory_mib, total_memory_mib)| {
-                GpuDeviceSample {
-                    utilization_percent,
-                    used_memory_mib,
-                    free_memory_mib,
-                    total_memory_mib,
-                }
-            },
-        ))
-        .unwrap()
+    fn pool_limit(registry: &AdmissionRegistry, pool: &ForkPoolRecord) -> Option<u32> {
+        registry.limit(pool).map(|limit| limit.pool)
+    }
+
+    fn gpu_samples(samples: impl IntoIterator<Item = GpuSample>) -> HashMap<u32, GpuSample> {
+        samples
+            .into_iter()
+            .map(|sample| (sample.device_ordinal, sample))
+            .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn visible_devices_follow_pci_order_and_cuda_mask_order() {
+        let devices = || {
+            vec![
+                NvmlDeviceIdentity {
+                    uuid: std::ffi::CString::new("GPU-second").unwrap(),
+                    domain: 0,
+                    bus: 2,
+                    device: 0,
+                    mig_enabled: false,
+                },
+                NvmlDeviceIdentity {
+                    uuid: std::ffi::CString::new("GPU-first").unwrap(),
+                    domain: 0,
+                    bus: 1,
+                    device: 0,
+                    mig_enabled: false,
+                },
+            ]
+        };
+        assert_eq!(
+            select_visible_devices(devices(), None)
+                .unwrap()
+                .into_iter()
+                .map(|uuid| uuid.into_string().unwrap())
+                .collect::<Vec<_>>(),
+            ["GPU-first", "GPU-second"]
+        );
+        assert_eq!(
+            select_visible_devices(devices(), Some("1,0"))
+                .unwrap()
+                .into_iter()
+                .map(|uuid| uuid.into_string().unwrap())
+                .collect::<Vec<_>>(),
+            ["GPU-second", "GPU-first"]
+        );
     }
 
     #[test]
-    fn imbalanced_multi_gpu_memory_uses_the_limiting_device() {
-        let sample = multi_gpu_sample(&[
-            (95.0, 75 * 1024, 5 * 1024, 80 * 1024),
-            (5.0, 0, 80 * 1024, 80 * 1024),
-        ]);
-
+    fn device_sample_uses_only_its_own_headroom() {
+        let sample = GpuSample::new(0, 95.0, 75 * 1024, 5 * 1024, 80 * 1024);
         assert_eq!(sample.used_memory_mib, 75 * 1024);
-        assert_eq!(sample.total_memory_mib, 160 * 1024);
-        assert!(sample.total_memory_mib - sample.used_memory_mib > 16 * 1024);
-        assert_eq!(sample.limiting_device_free_memory_mib, 5 * 1024);
-        assert_eq!(sample.limiting_device_reserve_mib, 8 * 1024);
+        assert_eq!(sample.total_memory_mib, 80 * 1024);
+        assert_eq!(sample.free_memory_mib, 5 * 1024);
+        assert_eq!(sample.reserve_mib, 8 * 1024);
         assert!(!sample.memory_safe());
     }
 
     #[test]
     fn heterogeneous_devices_each_use_their_own_reserve() {
-        let sample = multi_gpu_sample(&[
-            (70.0, 15 * 1024, 9 * 1024, 24 * 1024),
-            (80.0, 135 * 1024, 25 * 1024, 160 * 1024),
-        ]);
+        let small = GpuSample::new(0, 70.0, 15 * 1024, 9 * 1024, 24 * 1024);
+        let large = GpuSample::new(1, 80.0, 135 * 1024, 25 * 1024, 160 * 1024);
+        assert_eq!(small.reserve_mib, 8 * 1024);
+        assert_eq!(large.reserve_mib, 16 * 1024);
+        assert!(small.memory_safe());
+        assert!(large.memory_safe());
+    }
 
-        assert_eq!(sample.limiting_device_free_memory_mib, 9 * 1024);
-        assert_eq!(sample.limiting_device_reserve_mib, 8 * 1024);
-        assert!(sample.memory_safe());
+    #[test]
+    fn same_device_pools_share_one_limit_fairly() {
+        let registry = AdmissionRegistry::default();
+        let mut first = pool(6);
+        first.name = "first".into();
+        let mut second = pool(6);
+        second.name = "second".into();
+        let start = Instant::now();
+        let samples = gpu_samples([GpuSample::new(0, 10.0, 10_000, 70_000, 80_000)]);
+        registry.observe_pools_at(
+            &[(first.clone(), 0, 0), (second.clone(), 0, 0)],
+            Some(&samples),
+            Some(10.0),
+            start,
+        );
+
+        let first_only = registry.limit(&first).unwrap();
+        assert_eq!(first_only.device, 4);
+        assert_eq!(first_only.pool, 4);
+
+        registry.note_blocked("first");
+        registry.note_blocked("second");
+        let second_share = registry.limit(&second).unwrap();
+        let first_share = registry.limit(&first).unwrap();
+        assert_eq!(first_share.device, 4);
+        assert_eq!(second_share.device, 4);
+        assert_eq!(first_share.pool, 2);
+        assert_eq!(second_share.pool, 2);
+    }
+
+    #[test]
+    fn different_device_pools_calibrate_independently() {
+        let registry = AdmissionRegistry::default();
+        let mut first = pool(6);
+        first.name = "first".into();
+        let mut second = pool(12);
+        second.name = "second".into();
+        second.cuda_device_ordinal = Some(1);
+        let samples = gpu_samples([
+            GpuSample::new(0, 10.0, 10_000, 70_000, 80_000),
+            GpuSample::new(1, 20.0, 20_000, 60_000, 80_000),
+        ]);
+        registry.observe_pools_at(
+            &[(first.clone(), 0, 0), (second.clone(), 0, 0)],
+            Some(&samples),
+            Some(10.0),
+            Instant::now(),
+        );
+
+        assert_eq!(registry.limit(&first).unwrap().device, 2);
+        assert_eq!(registry.limit(&second).unwrap().device, 4);
     }
 
     #[test]
@@ -786,24 +1257,21 @@ mod tests {
         registry.observe_at(&pool, 0, 0, gpu(0.0, 10_000), Some(10.0), start);
         registry.note_blocked("rollouts");
         stable_window(&registry, &pool, start, (4, 0, 50.0, 30_000, 50.0));
-        assert_eq!(registry.limit(&pool), Some(8));
+        assert_eq!(pool_limit(&registry, &pool), Some(8));
 
-        let imbalanced = multi_gpu_sample(&[
-            (95.0, 75 * 1024, 5 * 1024, 80 * 1024),
-            (5.0, 0, 80 * 1024, 80 * 1024),
-        ]);
+        let pressured = GpuSample::new(0, 95.0, 75 * 1024, 5 * 1024, 80 * 1024);
         for second in 0..=8 {
             registry.observe_at(
                 &pool,
                 8,
                 0,
-                Some(imbalanced),
+                Some(pressured),
                 Some(50.0),
                 start + Duration::from_secs(9 + second),
             );
         }
 
-        assert_eq!(registry.limit(&pool), Some(4));
+        assert_eq!(pool_limit(&registry, &pool), Some(4));
         let reason = registry.snapshot(&pool).unwrap().reason;
         assert!(
             reason.contains("limiting GPU has 5120 MiB free"),
@@ -816,20 +1284,34 @@ mod tests {
         let registry = AdmissionRegistry::default();
         let mut configured = pool(12);
 
-        registry.ensure(&configured, 7);
+        registry.ensure_pools(&[(configured.clone(), 0, 7)]);
         let initial = registry.snapshot(&configured).unwrap();
         assert_eq!(initial.effective_limit, 4);
         assert!(initial.calibrating);
         assert!(initial.reason.contains("waiting for GPU telemetry"));
 
         configured.desired_ready = 3;
-        registry.ensure(&configured, 7);
-        assert_eq!(registry.limit(&configured), Some(3));
+        registry.ensure_pools(&[(configured.clone(), 0, 7)]);
+        assert_eq!(registry.limit(&configured).unwrap().pool, 3);
 
         configured.auto_admission = false;
-        registry.ensure(&configured, 7);
+        registry.ensure_pools(&[(configured.clone(), 0, 7)]);
         assert_eq!(registry.limit(&configured), None);
         assert!(registry.snapshot(&configured).is_none());
+    }
+
+    #[test]
+    fn event_sync_preserves_the_periodic_calibration_sample() {
+        let registry = AdmissionRegistry::default();
+        let configured = pool(12);
+        let start = Instant::now();
+        registry.observe_at(&configured, 4, 3, gpu(50.0, 30_000), Some(40.0), start);
+        let before = registry.snapshot(&configured).unwrap();
+
+        registry.ensure_pools(&[(configured.clone(), 4, 3)]);
+
+        let after = registry.snapshot(&configured).unwrap();
+        assert_eq!(after, before);
     }
 
     #[test]
@@ -841,7 +1323,7 @@ mod tests {
         registry.note_blocked("rollouts");
 
         stable_window(&registry, &pool, start, (4, 0, 56.6, 30_828, 62.0));
-        assert_eq!(registry.limit(&pool), Some(8));
+        assert_eq!(pool_limit(&registry, &pool), Some(8));
 
         stable_window(
             &registry,
@@ -849,7 +1331,7 @@ mod tests {
             start + Duration::from_secs(9),
             (8, 0, 90.2, 51_138, 62.0),
         );
-        assert_eq!(registry.limit(&pool), Some(12));
+        assert_eq!(pool_limit(&registry, &pool), Some(12));
 
         stable_window(
             &registry,
@@ -857,7 +1339,7 @@ mod tests {
             start + Duration::from_secs(18),
             (12, 0, 88.0, 71_445, 62.0),
         );
-        assert_eq!(registry.limit(&pool), Some(8));
+        assert_eq!(pool_limit(&registry, &pool), Some(8));
         assert!(!registry.snapshot(&pool).unwrap().calibrating);
     }
 
@@ -877,7 +1359,7 @@ mod tests {
         let pool = pool(12);
         let start = Instant::now();
         registry.observe_at(&pool, 12, 0, None, None, start);
-        assert_eq!(registry.limit(&pool), Some(12));
+        assert_eq!(pool_limit(&registry, &pool), Some(12));
 
         registry.observe_at(
             &pool,
@@ -887,7 +1369,7 @@ mod tests {
             Some(50.0),
             start + Duration::from_secs(1),
         );
-        assert_eq!(registry.limit(&pool), Some(4));
+        assert_eq!(pool_limit(&registry, &pool), Some(4));
         assert!(registry
             .snapshot(&pool)
             .unwrap()
@@ -903,7 +1385,7 @@ mod tests {
             start + Duration::from_secs(2),
         );
         assert!(registry.snapshot(&pool).unwrap().reason.contains("drain"));
-        assert_eq!(registry.limit(&pool), Some(4));
+        assert_eq!(pool_limit(&registry, &pool), Some(4));
     }
 
     #[test]
@@ -914,14 +1396,14 @@ mod tests {
         registry.observe_at(&pool, 0, 0, gpu(0.0, 10_000), Some(10.0), start);
         registry.note_blocked("rollouts");
         stable_window(&registry, &pool, start, (4, 0, 50.0, 30_000, 50.0));
-        assert_eq!(registry.limit(&pool), Some(8));
+        assert_eq!(pool_limit(&registry, &pool), Some(8));
         stable_window(
             &registry,
             &pool,
             start + Duration::from_secs(9),
             (8, 0, 90.0, 50_000, 96.0),
         );
-        assert_eq!(registry.limit(&pool), Some(4));
+        assert_eq!(pool_limit(&registry, &pool), Some(4));
     }
 
     #[test]
@@ -938,21 +1420,21 @@ mod tests {
             start + Duration::from_secs(9),
             (8, 0, 75.0, 50_000, 70.0),
         );
-        assert_eq!(registry.limit(&pool), Some(12));
+        assert_eq!(pool_limit(&registry, &pool), Some(12));
         stable_window(
             &registry,
             &pool,
             start + Duration::from_secs(18),
             (12, 0, 95.0, 70_000, 80.0),
         );
-        assert_eq!(registry.limit(&pool), Some(12));
+        assert_eq!(pool_limit(&registry, &pool), Some(12));
         stable_window(
             &registry,
             &pool,
             start + Duration::from_secs(27),
             (12, 0, 95.0, 71_000, 95.0),
         );
-        assert_eq!(registry.limit(&pool), Some(8));
+        assert_eq!(pool_limit(&registry, &pool), Some(8));
         let snapshot = registry.snapshot(&pool).unwrap();
         assert!(snapshot.reason.contains("drain"), "{}", snapshot.reason);
     }

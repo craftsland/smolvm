@@ -208,6 +208,7 @@ async fn activate_claimed_lease(
 
 async fn pool_info(state: &ApiState, pool: ForkPoolRecord) -> Result<ForkPoolInfo, ApiError> {
     let admission = state.admission().snapshot(&pool);
+    let cuda_device_ordinal = pool.admission_device_ordinal();
     let db = state.db().clone();
     let pool_name = pool.name.clone();
     let slots = tokio::task::spawn_blocking(move || db.list_fork_pool_slots(&pool_name))
@@ -235,6 +236,8 @@ async fn pool_info(state: &ApiState, pool: ForkPoolRecord) -> Result<ForkPoolInf
         max_active: pool.max_active,
         auto_admission: pool.auto_admission,
         effective_active_limit: admission.as_ref().map(|state| state.effective_limit),
+        effective_device_limit: admission.as_ref().map(|state| state.device_limit),
+        cuda_device_ordinal,
         admission_reason: admission.as_ref().map(|state| state.reason.clone()),
         admission_calibrating: admission.as_ref().map(|state| state.calibrating),
         gpu_utilization_percent: admission
@@ -349,12 +352,18 @@ pub async fn create_pool(
             req.golden
         )));
     }
+    let cuda_device_ordinal = if golden.cuda {
+        Some(crate::pool::cuda_device_ordinal_from_env(&golden.env).map_err(ApiError::BadRequest)?)
+    } else {
+        None
+    };
     let pool = ForkPoolRecord {
         name: req.name,
         golden: req.golden,
         desired_ready: req.desired_ready,
         max_active: req.max_active,
         auto_admission,
+        cuda_device_ordinal,
         share_weights: req.share_weights,
         ready_timeout_secs,
         lease_ttl_secs,
@@ -552,6 +561,16 @@ pub async fn acquire_lease(
         .map_err(|e| ApiError::internal(format!("pool lookup task failed: {e}")))?
         .map_err(ApiError::database)?
         .ok_or_else(|| ApiError::NotFound(format!("fork pool '{pool_name}' not found")))?;
+    if pool.admission_device_ordinal().is_some()
+        && assignment
+            .iter()
+            .any(|(key, _)| key == "SMOLVM_CUDA_DEVICE")
+    {
+        return Err(ApiError::BadRequest(
+            "SMOLVM_CUDA_DEVICE is inherited from the pool golden and cannot be changed by a lease"
+                .into(),
+        ));
+    }
     let ttl = validate_ttl(req.ttl_secs.unwrap_or(pool.lease_ttl_secs))?;
     let lease_id = format!(
         "lease-{}{}",
@@ -602,7 +621,9 @@ pub async fn acquire_lease(
         }
         ClaimForkPoolSlot::AtCapacity => {
             state.admission().note_blocked(&pool_name);
-            let limit = admission_limit.or(pool.max_active);
+            let limit = admission_limit
+                .map(|limit| limit.pool)
+                .or(pool.max_active);
             return Err(ApiError::Conflict(format!(
                 "fork pool '{pool_name}' reached active lease limit{}",
                 limit.map(|value| format!(" ({value})")).unwrap_or_default()
