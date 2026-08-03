@@ -6,7 +6,7 @@ use axum::{
 };
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use crate::api::error::ApiError;
 use crate::api::state::ApiState;
@@ -31,6 +31,7 @@ const MAX_LEASE_PAYLOAD_FILES: usize = 32;
 const MAX_LEASE_PAYLOAD_BYTES: usize = 1024 * 1024;
 const MAX_LEASE_PAYLOAD_PATH_BYTES: usize = 512;
 const DEFAULT_LEASE_PAYLOAD_MODE: u32 = 0o644;
+const LEASE_PAYLOAD_STAGE_ATTEMPTS: usize = 2;
 
 #[derive(Clone)]
 struct StagedLeaseFile {
@@ -129,6 +130,53 @@ fn lease_info(lease: ForkLeaseRecord) -> ForkLeaseInfo {
     }
 }
 
+fn retry_transient_lease_stage(
+    mut operation: impl FnMut() -> crate::Result<()>,
+) -> crate::Result<()> {
+    for attempt in 1..=LEASE_PAYLOAD_STAGE_ATTEMPTS {
+        match operation() {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if attempt < LEASE_PAYLOAD_STAGE_ATTEMPTS
+                    && crate::util::is_transient_network_error(&error.to_string()) =>
+            {
+                tracing::warn!(
+                    attempt,
+                    max_attempts = LEASE_PAYLOAD_STAGE_ATTEMPTS,
+                    %error,
+                    "lease payload staging reply was ambiguous; retrying atomically"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("lease payload staging retry loop always returns")
+}
+
+fn stage_lease_payload(machine: &str, files: &[StagedLeaseFile]) -> crate::Result<()> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    let socket = crate::agent::vm_data_dir(machine).join("agent.sock");
+    retry_transient_lease_stage(|| {
+        // Reconnect for every attempt. FileWrite installs with an atomic rename,
+        // so repeating the same validated bytes after a lost acknowledgment is
+        // safe even when the first request committed inside the guest.
+        let mut client = crate::agent::AgentClient::connect_with_retry(&socket)
+            .map_err(|e| crate::Error::agent("stage lease payload", e.to_string()))?;
+        for file in files {
+            let path = format!("/workspace/{}", file.path);
+            client
+                .write_file(&path, &file.data, Some(file.mode))
+                .map_err(|e| {
+                    crate::Error::agent("stage lease payload", format!("write '{path}': {e}"))
+                })?;
+        }
+        Ok(())
+    })
+}
+
 async fn activate_claimed_lease(
     state: Arc<ApiState>,
     lease: ForkLeaseRecord,
@@ -155,19 +203,7 @@ async fn activate_claimed_lease(
     };
     let machine = lease.machine_name.clone();
     let activation = tokio::task::spawn_blocking(move || {
-        if !files.is_empty() {
-            let socket = crate::agent::vm_data_dir(&machine).join("agent.sock");
-            let mut client = crate::agent::AgentClient::connect_with_retry(&socket)
-                .map_err(|e| crate::Error::agent("stage lease payload", e.to_string()))?;
-            for file in files {
-                let path = format!("/workspace/{}", file.path);
-                client
-                    .write_file(&path, &file.data, Some(file.mode))
-                    .map_err(|e| {
-                        crate::Error::agent("stage lease payload", format!("write '{path}': {e}"))
-                    })?;
-            }
-        }
+        stage_lease_payload(&machine, &files)?;
         crate::agent::fork::activate_held_fork(&machine, &record, &assignment)
     })
     .await
@@ -827,6 +863,36 @@ mod tests {
             ApiError::BadRequest(message) => message,
             other => panic!("expected bad request, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn lease_payload_stage_retries_an_ambiguous_agent_reply() {
+        let mut attempts = 0;
+        retry_transient_lease_stage(|| {
+            attempts += 1;
+            if attempts == 1 {
+                Err(crate::Error::agent(
+                    "write file",
+                    "Resource temporarily unavailable (os error 11)",
+                ))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn lease_payload_stage_does_not_retry_a_guest_rejection() {
+        let mut attempts = 0;
+        let error = retry_transient_lease_stage(|| {
+            attempts += 1;
+            Err(crate::Error::agent("write file", "permission denied"))
+        })
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        assert!(error.to_string().contains("permission denied"));
     }
 
     #[test]
